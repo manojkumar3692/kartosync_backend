@@ -200,6 +200,18 @@ ingest.post(
         console.log('[INGEST][SKIP] no_items', { orgId: org.id, text });
         return res.json({ ok: true, stored: false, reason: 'no_items' });
       }
+      
+      // Only accept AI parses; drop rule-based/greeting
+      const allowAI = parsed.used === 'ai' && /^ai:/i.test(parsed.reason || '');
+      if (!allowAI) {
+        console.log('[INGEST][SKIP] non_ai_parse', {
+          orgId: org.id,
+          used: parsed.used,
+          reason: parsed.reason,
+        });
+        return res.json({ ok: true, stored: false, reason: 'non_ai_parse' });
+      }
+      
       console.log('[INGEST] parsed', { used: parsed.used, items: parsed.items.length, reason: parsed.reason });
 
       // f) Deduplicate

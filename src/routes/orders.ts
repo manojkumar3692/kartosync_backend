@@ -80,6 +80,8 @@ orders.get("/", ensureAuth, async (req: any, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helper: parse pipeline (AI → rules) with HUMAN-READABLE reason preservation
+// ─────────────────────────────────────────────────────────────────────────────
 async function parsePipeline(text: string): Promise<{
   items: any[];
   used: "ai" | "rules";
@@ -93,13 +95,19 @@ async function parsePipeline(text: string): Promise<{
     try {
       const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(raw);
       if (ai && ai.is_order_like !== false && Array.isArray(ai.items) && ai.items.length > 0) {
+        // Preserve AI's reason if present; otherwise synthesize a readable fallback.
+        const r =
+          (typeof ai.reason === "string" && ai.reason.trim().length > 0)
+            ? ai.reason
+            : "items_detected";
         return {
           items: ai.items,
           used: "ai",
           confidence: typeof ai.confidence === "number" ? ai.confidence : null,
-          reason: ai.reason ?? null,
+          reason: r,
         };
       }
+      // If AI says not order-like or no items, fall through to rules for safety (caller can decide to reject)
     } catch (e: any) {
       console.warn("[orders] AI parse failed, fallback to rules:", e?.message || e);
     }
@@ -138,7 +146,8 @@ orders.post("/", ensureAuth, async (req: any, res) => {
       const parsed = await parsePipeline(String(raw_text));
       finalItems = parsed.items;
       parse_confidence = parsed.confidence ?? null;
-      parse_reason = parsed.reason ?? (parsed.used === "ai" ? "ai" : "rules");
+      // ✅ Preserve human-readable reason, do NOT overwrite with tags.
+      parse_reason = parsed.reason ?? null;
     } else {
       finalItems = Array.isArray(items) ? items : [];
     }

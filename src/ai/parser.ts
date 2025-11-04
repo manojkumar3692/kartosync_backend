@@ -6,15 +6,21 @@ import { addSpendUSD, canSpendMoreUSD, estimateCostUSD, estimateCostUSDApprox } 
 import { supa } from "../db";                                         // ← optional logging
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Safe string helpers (avoid .trim on undefined / non-strings)
+// ─────────────────────────────────────────────────────────────────────────────
+const asStr = (v: any) => (typeof v === "string" ? v : (v == null ? "" : String(v)));
+const trimStr = (v: any) => asStr(v).trim();
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 1) Schema (your exact spec)
 // ─────────────────────────────────────────────────────────────────────────────
 export const ItemSchema = z.object({
-  name: z.string().min(1),                       // raw item text
+  name: z.string().min(1),
   qty: z.number().nullable().default(null),
-  unit: z.string().nullable().default(null),     // kg / g / l / pack / piece
-  notes: z.string().nullable().default(null),    // “curry cut”, “low fat”, etc.
-  canonical: z.string().nullable().default(null),// normalized item name
-  category: z.string().nullable().default(null), // grocery / veg / meat / dairy / etc.
+  unit: z.string().nullable().default(null),
+  notes: z.string().nullable().default(null),
+  canonical: z.string().nullable().default(null),
+  category: z.string().nullable().default(null),
 });
 
 export const ParseResultSchema = z.object({
@@ -74,44 +80,60 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
 // 3) Utilities
 // ─────────────────────────────────────────────────────────────────────────────
 function isGreetingOrNoise(text: string): boolean {
-  const t = (text || "").trim().toLowerCase();
+  const t = trimStr(text).toLowerCase();
   if (!t) return true;
   return /^(hi|hello|hlo|thanks|thank you|ok|k|👍|🙏|good (morning|night|evening)|done|received)\b/.test(t);
 }
 
-// Coerce any rule-parser shape (e.g., {raw, qty, ...}) into our ItemSchema-ish
+// Coerce any rule-parser shape into our ItemSchema-ish
 function coerceToItem(it: any): z.infer<typeof ItemSchema> {
-  const name = (typeof it?.name === "string" && it.name.trim().length > 0)
-    ? it.name.trim()
-    : (typeof it?.raw === "string" ? String(it.raw).trim() : "");
+  const nameCandidate = asStr(it?.name);
+  const fallbackRaw = asStr(it?.raw);
+  const name = trimStr(nameCandidate) || trimStr(fallbackRaw);
 
-  return {
-    name: name || "",                                   // allow "" here; zod validation happens later downstream
-    qty: typeof it?.qty === "number" ? it.qty : (Number.isFinite(it?.qty) ? Number(it.qty) : null),
-    unit: (typeof it?.unit === "string" && it.unit.trim()) ? it.unit.trim() : null,
-    notes: (typeof it?.notes === "string" && it.notes.trim()) ? it.notes.trim() : null,
-    canonical: (typeof it?.canonical === "string" && it.canonical.trim()) ? it.canonical.trim() : null,
-    category: (typeof it?.category === "string" && it.category.trim()) ? it.category.trim() : null,
-  };
+  const qty =
+    typeof it?.qty === "number"
+      ? it.qty
+      : Number.isFinite(it?.qty)
+      ? Number(it.qty)
+      : null;
+
+  const unit = (() => {
+    const u = trimStr(it?.unit);
+    return u ? u : null;
+  })();
+
+  const notes = (() => {
+    const n = trimStr(it?.notes);
+    return n ? n : null;
+  })();
+
+  const canonical = (() => {
+    const c = trimStr(it?.canonical);
+    return c ? c : null;
+  })();
+
+  const category = (() => {
+    const c = trimStr(it?.category);
+    return c ? c : null;
+  })();
+
+  return { name, qty, unit, notes, canonical, category };
 }
 
-// Null-safe micro-heuristics (works with coerced items)
+// Null-safe micro-heuristics
 function applyMicroHeuristics(items: Array<z.infer<typeof ItemSchema>>): Array<z.infer<typeof ItemSchema>> {
-  return (items || []).map((it) => {
-    // 👇 guaranteed string; avoids .trim() on undefined/null
-    const baseName = ((it?.name ?? "") as string).toString();
-
-    // Infer milk unit if missing
+  return (items || []).map((orig) => {
+    let it = { ...orig };
+    const baseName = asStr(it?.name);
     if (!it.unit && /milk/i.test(baseName)) {
-      it = { ...it, unit: "pack" };
+      it.unit = "pack";
     }
-
-    // Normalize tiny typos
-    const trimmed = baseName.trim();
+    const trimmed = trimStr(baseName);
     if (/^amul milk$/i.test(trimmed)) {
-      it = { ...it, canonical: "Milk", category: it.category ?? "dairy" };
+      it.canonical = "Milk";
+      it.category = it.category ?? "dairy";
     }
-
     return it;
   });
 }
@@ -127,25 +149,28 @@ export async function aiParseOrder(
   text: string,
   catalog?: Array<{ name: string; sku: string; aliases?: string[] }>
 ): Promise<ParseResult> {
-  const raw = (text || "").trim();
+  const raw = trimStr(text);
   if (!raw) return emptyResult("empty");
 
-  // Early exit for obvious non-orders
   if (isGreetingOrNoise(raw)) return emptyResult("greeting_or_noise");
 
-  // Baseline (free) parse first — coerce to our item shape, then heuristics
+  // Baseline (free) parse first — coerce & heuristics
   const baselineItemsRaw = ruleParse(raw) || [];
-  const baselineCoerced = (baselineItemsRaw as any[]).map(coerceToItem);
-  const baselineHeur = applyMicroHeuristics(baselineCoerced);
+  let baselineHeur: Array<z.infer<typeof ItemSchema>> = [];
+  try {
+    const baselineCoerced = (Array.isArray(baselineItemsRaw) ? baselineItemsRaw : []).map(coerceToItem);
+    baselineHeur = applyMicroHeuristics(baselineCoerced);
+  } catch {
+    baselineHeur = [];
+  }
 
   let baseline: ParseResult = {
     items: baselineHeur,
     confidence: baselineHeur.length ? 0.6 : 0.3,
     reason: baselineHeur.length ? "rule_based" : "rule_based_empty",
-    is_order_like: baselineHeur.length > 0
+    is_order_like: baselineHeur.length > 0,
   };
 
-  // If no AI, return baseline immediately
   if (!ENABLE_AI) return baseline;
 
   // ── Budget PRE-CHECK ───────────────────────────────────────────────────────
@@ -170,15 +195,14 @@ export async function aiParseOrder(
   try {
     const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-    const catalogHint = catalog?.length
+    const catalogHint = (Array.isArray(catalog) && catalog.length)
       ? "\nShop catalog (optional):\n" +
         catalog.slice(0, 50)
-          .map(x => `- SKU:${x.sku} name:${x.name} aliases:${(x.aliases || []).join(", ")}`)
+          .map(x => `- SKU:${asStr(x.sku)} name:${asStr(x.name)} aliases:${(Array.isArray(x.aliases) ? x.aliases : []).map(asStr).join(", ")}`)
           .join("\n") +
         "\nIf an item strongly matches, set canonical to catalog name (do NOT invent SKU in output)."
       : "";
 
-    // Build messages (few-shots included). Use `any[]` to avoid SDK type drift.
     const messages: any[] = [
       { role: "system", content: SYSTEM + catalogHint },
       ...FEWSHOTS.flatMap(s => ([
@@ -191,12 +215,11 @@ export async function aiParseOrder(
     const resp = await client.chat.completions.create({
       model: MODEL,
       messages,
-      response_format: { type: "json_object" }, // force JSON
+      response_format: { type: "json_object" },
       temperature: 0.1,
       max_tokens: 400
     });
 
-    // Record the *actual* spend for this call
     const usage = (resp as any).usage as {
       prompt_tokens?: number; completion_tokens?: number; total_tokens?: number
     } | undefined;
@@ -222,9 +245,9 @@ export async function aiParseOrder(
         const { error } = await supa.from("ai_usage_log").insert({
           org_id: null,
           model: MODEL,
-          prompt_tokens: usage.prompt_tokens ?? 0,
-          completion_tokens: usage.completion_tokens ?? 0,
-          total_tokens: usage.total_tokens ?? ((usage?.prompt_tokens || 0) + (usage?.completion_tokens || 0)),
+          prompt_tokens: usage?.prompt_tokens ?? 0,
+          completion_tokens: usage?.completion_tokens ?? 0,
+          total_tokens: usage?.total_tokens ?? ((usage?.prompt_tokens || 0) + (usage?.completion_tokens || 0)),
           cost_usd: cost,
           created_at: new Date().toISOString(),
         });
@@ -244,22 +267,27 @@ export async function aiParseOrder(
       return baseline;
     }
 
-    // Safety: normalize items a bit more (already schema-coerced for baseline; AI outputs should match schema)
+    // Normalize items further (null-safe)
     parsed.items = applyMicroHeuristics(parsed.items);
 
-    // Ensure a clear parse_reason when AI path succeeded
-    if (!parsed.reason) parsed.reason = `ai:${MODEL}`;
+    // ✅ Preserve model-provided reason; only add fallback if missing/blank
+    const aiReason = trimStr(parsed.reason);
+    if (!aiReason) {
+      parsed.reason = baselineHeur.length ? "refined_from_rules" : "items_detected";
+    } else {
+      parsed.reason = aiReason;
+    }
 
     // If model says it's not an order, keep that decision
     if (!parsed.is_order_like || parsed.items.length === 0) {
       return { ...parsed, items: [], is_order_like: false };
     }
-    console.log("[AI used]", MODEL, "items:", parsed.items?.length ?? 0);
+
+    console.log("[AI used]", MODEL, "items:", parsed.items?.length ?? 0, "reason:", parsed.reason);
     return parsed;
   } catch (e: any) {
     console.error("[AI parse] error:", e?.message || e);
     console.log("[AI SKIPPED → RULES]", { reason: baseline.reason });
-    // Fall back gracefully
     return baseline;
   }
 }
