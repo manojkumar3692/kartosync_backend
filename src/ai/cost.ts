@@ -1,101 +1,170 @@
 // src/ai/cost.ts
 import { supa } from "../db";
 
-const CAP_USD = Number(
-  process.env.AI_DAILY_USD ||
-  process.env.AI_MAX_DAILY_USD || // fallback env you used earlier
-  5
-);
+/**
+ * ENV knobs (with sane defaults)
+ * --------------------------------------------------------------------
+ * AI_DAILY_USD           -> hard daily cap (USD), default 5
+ * AI_PER_CALL_USD_MAX    -> max allowed per single call (USD), default 1
+ * AI_PRICE_IN_USD_PER_1M -> $ per 1M prompt tokens, default 0.60
+ * AI_PRICE_OUT_USD_PER_1M-> $ per 1M completion tokens, default 2.40
+ * AI_BUDGET_TABLE        -> table name to store daily spend (default ai_daily_spend)
+ *
+ * Optional Postgres RPC (if created):
+ *   create or replace function public.bincrement_ai_daily_spend(p_dt date, p_amount numeric) returns void ...
+ */
+// no change
 
-// pricing (per 1M tokens). You can override via env.
-const PRICE_IN  = Number(process.env.AI_PRICE_IN_USD_PER_1M  || 0.60); // gpt-4o-mini input
-const PRICE_OUT = Number(process.env.AI_PRICE_OUT_USD_PER_1M || 2.40); // gpt-4o-mini output
+const DAILY_CAP = Number(process.env.AI_DAILY_USD ?? 5);
+const PER_CALL_CAP = Number(process.env.AI_PER_CALL_USD_MAX ?? 1);
 
-// table name (optional). If missing, we fall back to in-memory counter.
-const BUDGET_TABLE = (process.env.AI_BUDGET_TABLE || "ai_daily_spend").trim();
+const PRICE_IN_PER_1M  = Number(process.env.AI_PRICE_IN_USD_PER_1M  ?? 0.60);
+const PRICE_OUT_PER_1M = Number(process.env.AI_PRICE_OUT_USD_PER_1M ?? 2.40);
 
-let inMemoryToday = new Date().toISOString().slice(0,10); // UTC yyyy-mm-dd
-let inMemorySpent = 0;
+const PRIMARY_TABLE = (process.env.AI_BUDGET_TABLE || "ai_daily_spend").trim();
+const FALLBACK_TABLE = "ai_daily_spend"; // used if PRIMARY_TABLE errors
+const IS_DEV_LOG = process.env.NODE_ENV !== "production";
 
-// Estimate cost in USD from token usage + model. If usage missing, use a tiny safe floor.
+// Track which table worked last to avoid spamming fallbacks
+let resolvedTable: string | null = null;
+
+// Choose a table, preferring PRIMARY_TABLE but falling back if it errors
+async function pickTable(): Promise<string> {
+  if (resolvedTable) return resolvedTable;
+  // probe PRIMARY_TABLE by a harmless select
+  const today = new Date().toISOString().slice(0, 10);
+  const probe = await supa.from(PRIMARY_TABLE).select("dt").eq("dt", today).limit(1);
+  if (!probe.error) {
+    resolvedTable = PRIMARY_TABLE;
+    return resolvedTable;
+  }
+  // fallback
+  if (IS_DEV_LOG) console.warn(`[AI$] Falling back to ${FALLBACK_TABLE}:`, probe.error.message);
+  resolvedTable = FALLBACK_TABLE;
+  return resolvedTable;
+}
+
+/** Convert token usage to USD using per-1M pricing. */
 export function estimateCostUSD(
   usage?: { prompt_tokens?: number; completion_tokens?: number } | null,
   _model?: string
 ): number {
-  const inT  = Math.max(0, usage?.prompt_tokens ?? 0);
-  const outT = Math.max(0, usage?.completion_tokens ?? 0);
-  const costIn  = (inT  / 1_000_000) * PRICE_IN;
-  const costOut = (outT / 1_000_000) * PRICE_OUT;
+  if (!usage) return 0;
+  const inT  = usage.prompt_tokens ?? 0;
+  const outT = usage.completion_tokens ?? 0;
+  const costIn  = (inT  / 1_000_000) * PRICE_IN_PER_1M;
+  const costOut = (outT / 1_000_000) * PRICE_OUT_PER_1M;
   const total = costIn + costOut;
-  return total > 0 ? total : 0.0002; // tiny default so pre-checks have a value
+  return Number.isFinite(total) ? Number(total.toFixed(6)) : 0;
 }
 
-// Query or create today's row and return spent so far. If table missing, use in-memory.
-async function getTodaySpentUSD(): Promise<number> {
+/** Pre-flight estimate when you only have approx tokens. */
+export function estimateCostUSDApprox(
+  approx: { prompt_tokens: number; completion_tokens: number },
+  _model?: string
+): number {
+  return estimateCostUSD(approx);
+}
+
+/** Read today’s spend (UTC date bucket). */
+export async function getTodaySpendUSD(): Promise<number> {
   try {
-    const today = new Date().toISOString().slice(0,10); // UTC date
+    const table = await pickTable();
     const { data, error } = await supa
-      .from(BUDGET_TABLE)
-      .select("usd_spent, dt")
-      .eq("dt", today)
-      .limit(1);
-    if (error) throw error;
-    if (data && data[0]) return Number(data[0].usd_spent) || 0;
-
-    // create the row for today
-    const ins = await supa.from(BUDGET_TABLE).insert({ dt: today, usd_spent: 0 });
-    if (ins.error) throw ins.error;
-    return 0;
-  } catch (_e) {
-    // fallback in-memory
-    const today = new Date().toISOString().slice(0,10);
-    if (today !== inMemoryToday) { inMemoryToday = today; inMemorySpent = 0; }
-    return inMemorySpent;
-  }
-}
-
-// Increment spend for today (DB if available, else in-memory)
-export async function addSpendUSD(delta: number): Promise<void> {
-  if (!delta || delta <= 0) return;
-  try {
-    const today = new Date().toISOString().slice(0,10);
-    const { error } = await supa.rpc("ai_daily_spend_add", { p_dt: today, p_delta: delta });
-    if (error) {
-      // if rpc not present, do naive upsert
-      const { data, error: selErr } = await supa
-        .from(BUDGET_TABLE)
-        .select("usd_spent")
-        .eq("dt", today)
-        .limit(1);
-      if (selErr) throw selErr;
-
-      if (data && data[0]) {
-        const spent = Number(data[0].usd_spent) || 0;
-        const { error: updErr } = await supa
-          .from(BUDGET_TABLE)
-          .update({ usd_spent: spent + delta })
-          .eq("dt", today);
-        if (updErr) throw updErr;
-      } else {
-        const { error: insErr } = await supa
-          .from(BUDGET_TABLE)
-          .insert({ dt: today, usd_spent: delta });
-        if (insErr) throw insErr;
-      }
+      .from(table)
+      .select("usd_spent")
+      .eq("dt", new Date().toISOString().slice(0, 10))
+      .maybeSingle();
+    if (error && error.code !== "PGRST116") {
+      if (IS_DEV_LOG) console.warn("[AI$] read error:", error.message);
     }
-  } catch (_e) {
-    // fallback in-memory
-    const today = new Date().toISOString().slice(0,10);
-    if (today !== inMemoryToday) { inMemoryToday = today; inMemorySpent = 0; }
-    inMemorySpent += delta;
+    return Number(data?.usd_spent ?? 0);
+  } catch (e: any) {
+    if (IS_DEV_LOG) console.warn("[AI$] getTodaySpendUSD exception:", e?.message || e);
+    return 0;
   }
 }
 
-// Budget gate: can we spend (approx) more?
-export async function canSpendMoreUSD(approx: number): Promise<boolean> {
-  if (CAP_USD <= 0) return false;
-  const spent = await getTodaySpentUSD();
-  const ok = (spent + (approx || 0)) <= CAP_USD;
-  console.log(`[AI$] canSpend? spent=${spent.toFixed(4)} + approx=${(approx||0).toFixed(4)} <= cap=${CAP_USD.toFixed(2)} → ${ok}`);
-  return ok;
+/**
+ * Enforce budgets before calling the LLM.
+ * Returns { ok:false, reason, today, cap } if blocked.
+ */
+export async function canSpendMoreUSD(
+  approxUSD: number
+): Promise<{ ok: boolean; reason?: string; today?: number; cap?: number }> {
+  if (!isFinite(approxUSD) || approxUSD < 0) approxUSD = 0;
+
+  if (PER_CALL_CAP > 0 && approxUSD > PER_CALL_CAP) {
+    const reason = `[AI$ BLOCK] single-call est $${approxUSD.toFixed(4)} > per-call cap $${PER_CALL_CAP.toFixed(2)}`;
+    console.warn(reason);
+    return { ok: false, reason, today: await getTodaySpendUSD(), cap: DAILY_CAP };
+  }
+
+  if (DAILY_CAP <= 0) {
+    const reason = "[AI$ BLOCK] daily cap is 0";
+    console.warn(reason);
+    return { ok: false, reason, today: await getTodaySpendUSD(), cap: 0 };
+  }
+
+  const today = await getTodaySpendUSD();
+  if (today + approxUSD > DAILY_CAP) {
+    const reason = `[AI$ BLOCK] daily $${today.toFixed(4)} + est $${approxUSD.toFixed(4)} > cap $${DAILY_CAP.toFixed(2)}`;
+    console.warn(reason);
+    return { ok: false, reason, today, cap: DAILY_CAP };
+  }
+
+  if (IS_DEV_LOG) {
+    console.log(`[AI$ OK pre] +$${approxUSD.toFixed(4)} → ${ (today + approxUSD).toFixed(4) } / $${DAILY_CAP.toFixed(2) }`);
+  }
+  return { ok: true, today, cap: DAILY_CAP };
+}
+
+/** Log a nice line when spend is approved (optional cosmetic). */
+export function logSpendApproved(approx: number, todayBefore: number, cap = DAILY_CAP) {
+  const after = todayBefore + approx;
+  console.log(`[AI$ OK] +$${approx.toFixed(4)} → $${after.toFixed(4)} / $${cap.toFixed(2)}`);
+}
+
+/**
+ * Add actual spend after the call. Tries your RPC first:
+ *   increment_ai_daily_spend(p_dt date, p_amount numeric)
+ * Falls back to upsert/increment in the resolved table.
+ */
+export async function addSpendUSD(usd: number) {
+  if (!(usd > 0) || !isFinite(usd)) return;
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Try RPC if you created it (safe to fail)
+  try {
+    const { error } = await supa.rpc("increment_ai_daily_spend", { p_dt: today, p_amount: usd });
+    if (!error) return;
+    if (IS_DEV_LOG) console.warn("[AI$] RPC increment_ai_daily_spend error:", error.message);
+  } catch (_) {
+    // ignore if missing
+  }
+
+  // Fallback: upsert/increment in table
+  try {
+    const table = await pickTable();
+
+    // Read current
+    const cur = await supa
+      .from(table)
+      .select("usd_spent")
+      .eq("dt", today)
+      .maybeSingle();
+
+    const prev = Number(cur.data?.usd_spent ?? 0);
+    const next = Number((prev + usd).toFixed(6));
+
+    const up = await supa
+      .from(table)
+      .upsert({ dt: today as any, usd_spent: next }, { onConflict: "dt" });
+
+    if (up.error) {
+      console.warn("[AI$] upsert error:", up.error.message);
+    }
+  } catch (e: any) {
+    if (IS_DEV_LOG) console.warn("[AI$] addSpendUSD exception:", e?.message || e);
+  }
 }
