@@ -2,7 +2,7 @@
 import OpenAI from "openai";
 import { z } from "zod";
 import { parseOrder as ruleParse } from "../parser";                  // ← free rules parser
-import { addSpendUSD, canSpendMoreUSD, estimateCostUSD } from "./cost"; // ← budget guard
+import { addSpendUSD, canSpendMoreUSD, estimateCostUSD, estimateCostUSDApprox } from "./cost"; // ← budget guard
 import { supa } from "../db";                                         // ← optional logging
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -29,6 +29,7 @@ export type ParseResult = z.infer<typeof ParseResultSchema>;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const MODEL = process.env.AI_MODEL || "gpt-4o-mini";
 const ENABLE_AI = !!OPENAI_API_KEY;
+const PER_CALL_CAP = Number(process.env.AI_PER_CALL_USD_MAX || 0) || undefined; // e.g. 1.00
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 2) Prompt (system + few-shots)
@@ -78,25 +79,36 @@ function isGreetingOrNoise(text: string): boolean {
   return /^(hi|hello|hlo|thanks|thank you|ok|k|👍|🙏|good (morning|night|evening)|done|received)\b/.test(t);
 }
 
-function applyMicroHeuristics(items: ParseResult["items"]): ParseResult["items"] {
+// Coerce any rule-parser shape (e.g., {raw, qty, ...}) into our ItemSchema-ish
+function coerceToItem(it: any): z.infer<typeof ItemSchema> {
+  const name = (typeof it?.name === "string" && it.name.trim().length > 0)
+    ? it.name.trim()
+    : (typeof it?.raw === "string" ? String(it.raw).trim() : "");
+
+  return {
+    name: name || "",                                   // allow "" here; zod validation happens later downstream
+    qty: typeof it?.qty === "number" ? it.qty : (Number.isFinite(it?.qty) ? Number(it.qty) : null),
+    unit: (typeof it?.unit === "string" && it.unit.trim()) ? it.unit.trim() : null,
+    notes: (typeof it?.notes === "string" && it.notes.trim()) ? it.notes.trim() : null,
+    canonical: (typeof it?.canonical === "string" && it.canonical.trim()) ? it.canonical.trim() : null,
+    category: (typeof it?.category === "string" && it.category.trim()) ? it.category.trim() : null,
+  };
+}
+
+// Null-safe micro-heuristics (works with coerced items)
+function applyMicroHeuristics(items: Array<z.infer<typeof ItemSchema>>): Array<z.infer<typeof ItemSchema>> {
   return (items || []).map((it) => {
-    const safeName = (it as any).name ?? (it as any).canonical ?? (it as any).raw ?? "";
-    const nameLC = String(safeName).toLowerCase();
+    const baseName = (it?.name ?? "").toString();
 
     // Infer milk unit if missing
-    if (!it.unit && (/\bmilk\b/.test(nameLC) || /\bபால்\b/.test(nameLC))) {
+    if (!it.unit && /milk/i.test(baseName)) {
       it = { ...it, unit: "pack" };
     }
 
     // Normalize tiny typos
-    const trimmed = String(safeName || "").trim();
+    const trimmed = baseName.trim();
     if (/^amul milk$/i.test(trimmed)) {
-      it = { ...it, canonical: it.canonical ?? "Milk", category: it.category ?? "dairy" };
-    }
-
-    // Ensure 'name' is always present in our schema
-    if (!(it as any).name || typeof (it as any).name !== "string") {
-      it = { ...it, name: trimmed || (it.canonical ?? "item") };
+      it = { ...it, canonical: "Milk", category: it.category ?? "dairy" };
     }
 
     return it;
@@ -120,35 +132,38 @@ export async function aiParseOrder(
   // Early exit for obvious non-orders
   if (isGreetingOrNoise(raw)) return emptyResult("greeting_or_noise");
 
-  // Baseline (free) parse first — and NORMALIZE to include `name`
-  const rawBaseline: any[] = (ruleParse(raw) || []) as any[];
-  const baselineItems = rawBaseline.map((r) => {
-    const name = String(r.raw ?? r.canonical ?? "").trim();
-    return {
-      // ensure ItemSchema fields exist
-      name: name || "item",
-      qty: typeof r.qty === "number" ? r.qty : (Number.isFinite(+r.qty) ? Number(r.qty) : 1),
-      unit: r.unit ?? null,
-      notes: r.meta?.cut ? String(r.meta.cut) : null,
-      canonical: r.canonical ?? null,
-      category: r.category ?? null,
-    };
-  });
+  // Baseline (free) parse first — coerce to our item shape, then heuristics
+  const baselineItemsRaw = ruleParse(raw) || [];
+  const baselineCoerced = (baselineItemsRaw as any[]).map(coerceToItem);
+  const baselineHeur = applyMicroHeuristics(baselineCoerced);
 
   let baseline: ParseResult = {
-    items: applyMicroHeuristics(baselineItems as any),
-    confidence: baselineItems.length ? 0.6 : 0.3,
-    reason: baselineItems.length ? "rule_based" : "rule_based_empty",
-    is_order_like: baselineItems.length > 0,
+    items: baselineHeur,
+    confidence: baselineHeur.length ? 0.6 : 0.3,
+    reason: baselineHeur.length ? "rule_based" : "rule_based_empty",
+    is_order_like: baselineHeur.length > 0
   };
 
   // If no AI, return baseline immediately
   if (!ENABLE_AI) return baseline;
 
-  // Pre-check budget (quick approximation to avoid calling if already over cap)
-  const approxCost = estimateCostUSD({ prompt_tokens: 150, completion_tokens: 200 }, MODEL);
-  if (!(await canSpendMoreUSD(approxCost))) {
-    return baseline; // budget exceeded → fallback silently
+  // ── Budget PRE-CHECK ───────────────────────────────────────────────────────
+  const approxUSD = estimateCostUSDApprox({ prompt_tokens: 150, completion_tokens: 200 }, MODEL);
+  if (PER_CALL_CAP && approxUSD > PER_CALL_CAP) {
+    console.warn("[AI$ BLOCK pre] approxUSD exceeds per-call cap", { approxUSD, PER_CALL_CAP, model: MODEL });
+    return baseline;
+  }
+  const canSpend = await canSpendMoreUSD(approxUSD as any);
+  const gateOk = typeof canSpend === "object" ? (canSpend as any).ok : !!canSpend;
+  if (!gateOk) {
+    const reason = typeof canSpend === "object" ? (canSpend as any).reason : "daily_cap_exceeded";
+    console.warn("[AI$ BLOCK pre] daily cap gate", { reason, approxUSD, model: MODEL });
+    return baseline;
+  }
+  if (typeof canSpend === "object" && (canSpend as any).today !== undefined) {
+    console.log(
+      `[AI$ PRE ok] today=$${(canSpend as any).today.toFixed(4)} + ~${approxUSD.toFixed(4)} <= cap=$${((canSpend as any).cap ?? 0).toFixed(2)}`
+    );
   }
 
   try {
@@ -156,9 +171,8 @@ export async function aiParseOrder(
 
     const catalogHint = catalog?.length
       ? "\nShop catalog (optional):\n" +
-        catalog
-          .slice(0, 50)
-          .map((x) => `- SKU:${x.sku} name:${x.name} aliases:${(x.aliases || []).join(", ")}`)
+        catalog.slice(0, 50)
+          .map(x => `- SKU:${x.sku} name:${x.name} aliases:${(x.aliases || []).join(", ")}`)
           .join("\n") +
         "\nIf an item strongly matches, set canonical to catalog name (do NOT invent SKU in output)."
       : "";
@@ -166,11 +180,11 @@ export async function aiParseOrder(
     // Build messages (few-shots included). Use `any[]` to avoid SDK type drift.
     const messages: any[] = [
       { role: "system", content: SYSTEM + catalogHint },
-      ...FEWSHOTS.flatMap((s) => [
+      ...FEWSHOTS.flatMap(s => ([
         { role: "user", content: s.user },
-        { role: "assistant", content: JSON.stringify(s.assistant) },
-      ]),
-      { role: "user", content: JSON.stringify({ raw, baseline }) },
+        { role: "assistant", content: JSON.stringify(s.assistant) }
+      ])),
+      { role: "user", content: JSON.stringify({ raw, baseline }) }
     ];
 
     const resp = await client.chat.completions.create({
@@ -178,30 +192,38 @@ export async function aiParseOrder(
       messages,
       response_format: { type: "json_object" }, // force JSON
       temperature: 0.1,
-      max_tokens: 400,
+      max_tokens: 400
     });
 
     // Record the *actual* spend for this call
     const usage = (resp as any).usage as {
-      prompt_tokens?: number;
-      completion_tokens?: number;
-      total_tokens?: number;
+      prompt_tokens?: number; completion_tokens?: number; total_tokens?: number
     } | undefined;
 
     const cost = estimateCostUSD(usage, MODEL);
-    if (cost > 0) await addSpendUSD(cost);
+    if (PER_CALL_CAP && cost > PER_CALL_CAP) {
+      console.warn("[AI$ POST over cap]", { cost: Number(cost.toFixed(6)), PER_CALL_CAP, model: MODEL });
+    }
+    if (cost > 0) {
+      await addSpendUSD(cost);
+      console.log(
+        "[AI] tokens in/out:",
+        usage?.prompt_tokens ?? 0,
+        usage?.completion_tokens ?? 0,
+        "≈$",
+        cost.toFixed(4)
+      );
+    }
 
+    // Optional DB log (safe-noop if table not present)
     if (usage) {
-      console.log("[AI] tokens in/out:", usage.prompt_tokens, usage.completion_tokens, "≈$", cost.toFixed(4));
-      // Optional DB log (safe-noop if table not present)
       try {
         const { error } = await supa.from("ai_usage_log").insert({
-          org_id: null, // you can pass org_id when calling if you have it in scope
+          org_id: null,
           model: MODEL,
           prompt_tokens: usage.prompt_tokens ?? 0,
           completion_tokens: usage.completion_tokens ?? 0,
-          total_tokens:
-            usage.total_tokens ?? (usage?.prompt_tokens || 0) + (usage?.completion_tokens || 0),
+          total_tokens: usage.total_tokens ?? ((usage?.prompt_tokens || 0) + (usage?.completion_tokens || 0)),
           cost_usd: cost,
           created_at: new Date().toISOString(),
         });
@@ -221,7 +243,7 @@ export async function aiParseOrder(
       return baseline;
     }
 
-    // Safety: normalize items a bit more
+    // Safety: normalize items a bit more (already schema-coerced for baseline; AI outputs should match schema)
     parsed.items = applyMicroHeuristics(parsed.items);
 
     // Ensure a clear parse_reason when AI path succeeded
@@ -235,6 +257,7 @@ export async function aiParseOrder(
     return parsed;
   } catch (e: any) {
     console.error("[AI parse] error:", e?.message || e);
+    console.log("[AI SKIPPED → RULES]", { reason: baseline.reason });
     // Fall back gracefully
     return baseline;
   }

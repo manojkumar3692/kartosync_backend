@@ -11,9 +11,8 @@ import { supa } from "../db";
  * AI_BUDGET_TABLE        -> table name to store daily spend (default ai_daily_spend)
  *
  * Optional Postgres RPC (if created):
- *   create or replace function public.bincrement_ai_daily_spend(p_dt date, p_amount numeric) returns void ...
+ *   create or replace function public.increment_ai_daily_spend(p_dt date, p_amount numeric) returns void ...
  */
-// no change
 
 const DAILY_CAP = Number(process.env.AI_DAILY_USD ?? 5);
 const PER_CALL_CAP = Number(process.env.AI_PER_CALL_USD_MAX ?? 1);
