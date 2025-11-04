@@ -7,11 +7,20 @@ import { parseOrder } from '../parser';
 // ⬇️ Optional AI parser (safe to keep even if you don't use AI yet)
 let aiParseOrder:
   | undefined
-  | ((text: string) => Promise<{ items: any[]; confidence?: number; reason?: string | null; is_order_like?: boolean }>);
+  | ((text: string) => Promise<{
+      items: any[];
+      confidence?: number;
+      reason?: string | null;
+      is_order_like?: boolean;
+      used?: 'ai' | 'rules';
+    }>);
 try {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  aiParseOrder = require('../ai/parser').aiParseOrder;
-} catch {
+  const mod = require('../ai/parser');
+  aiParseOrder = mod.aiParseOrder || mod.default?.aiParseOrder;
+  console.log('[AI][wire] aiParseOrder loaded?', typeof aiParseOrder === 'function');
+} catch (e) {
+  console.warn('[AI][wire] load fail:', (e as any)?.message || e);
   aiParseOrder = undefined;
 }
 
@@ -27,7 +36,6 @@ function timingSafeEq(a: Buffer, b: Buffer) {
   }
 }
 
-
 /** Verify HMAC over the RAW request body */
 function verifyHmac(req: any, rawBuf: Buffer) {
   const secret = process.env.MOBILE_INGEST_SECRET || '';
@@ -38,7 +46,7 @@ function verifyHmac(req: any, rawBuf: Buffer) {
 
   // Debug logs (keep on while testing)
   console.log(
-    '[INGEST] hmac recv=',
+    '[INGEST] HMAC recv=',
     sig.slice(0, 8),
     '…',
     sig.slice(-6),
@@ -62,25 +70,87 @@ function makeDedupeKey(orgId: string, text: string, ts?: number) {
 
 /** Try AI first (if configured), else fallback to rules */
 async function parsePipeline(text: string) {
-  const useAI = !!(aiParseOrder && process.env.OPENAI_API_KEY);
+  const hasKey = !!process.env.OPENAI_API_KEY;
+  const hasFn = typeof aiParseOrder === 'function';
+  const useAI = !!(hasFn && hasKey);
+  console.log('[INGEST][AI gate]', { hasFn, hasKey, useAI, model: process.env.AI_MODEL });
+
   if (useAI) {
     try {
+      console.log('[INGEST][AI call] invoking aiParseOrder…');
       const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(String(text));
+      console.log('[INGEST][AI result]', {
+        is_order_like: ai?.is_order_like,
+        items: Array.isArray(ai?.items) ? ai.items.length : null,
+        reason: ai?.reason,
+      });
       if (ai && ai.is_order_like !== false && Array.isArray(ai.items) && ai.items.length > 0) {
-        return { items: ai.items, confidence: ai.confidence, reason: ai.reason ?? null, used: 'ai' as const };
+        return {
+          items: ai.items,
+          confidence: typeof ai.confidence === 'number' ? ai.confidence : undefined,
+          reason: ai.reason ?? `ai:${process.env.AI_MODEL || 'unknown'}`,
+          used: 'ai' as const,
+        };
+      } else {
+        console.log('[INGEST][AI skip] Model returned empty or not order-like → falling back to rules.');
       }
-    } catch (e) {
-      console.warn('[INGEST] AI parse failed, falling back to rules:', (e as any)?.message || e);
+    } catch (e: any) {
+      console.warn('[INGEST] AI parse failed, falling back to rules:', e?.message || e);
     }
+  } else {
+    console.log('[INGEST][AI skip] useAI=false (hasFn=%s, hasKey=%s)', hasFn, hasKey);
   }
+
+  // Fallback: your rule parser
   const items = parseOrder(String(text));
-  return { items, confidence: undefined, reason: 'rule_fallback', used: 'rules' as const };
+  console.log('[INGEST][RULES] items:', items?.length || 0);
+  return {
+    items,
+    confidence: undefined,
+    reason: 'rule_fallback',
+    used: 'rules' as const,
+  };
 }
 
 /** ───────────────── ROUTES ───────────────── **/
 
-// 1) DIAGNOSTIC: notification-listener ping (called when the Android listener binds)
-//    No auth/HMAC needed — it’s only a heartbeat.
+// (A) Simple health (handy for the Connect screen button)
+ingest.get('/health', (_req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString() });
+});
+
+// (B) Test route to directly exercise AI (no HMAC) — dev only
+ingest.post('/test-ai', express.json(), async (req, res) => {
+  try {
+    const { text } = req.body || {};
+    if (!text) return res.status(400).json({ ok: false, error: 'text required' });
+
+    const hasFn = typeof aiParseOrder === 'function';
+    const hasKey = !!process.env.OPENAI_API_KEY;
+    const useAI = !!(hasFn && hasKey);
+    console.log('[TEST-AI][gate]', { hasFn, hasKey, useAI, model: process.env.AI_MODEL });
+
+    if (!useAI) {
+      return res.json({
+        ok: true,
+        used: !hasFn ? 'rules-only (ai function not found)' : 'rules-only (no OPENAI key)',
+      });
+    }
+
+    const out = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(String(text));
+    console.log('[TEST-AI][result]', {
+      is_order_like: out?.is_order_like,
+      items: out?.items?.length,
+      reason: out?.reason,
+    });
+    return res.json({ ok: true, used: `ai:${process.env.AI_MODEL || 'unknown'}`, out });
+  } catch (e: any) {
+    console.error('[TEST-AI]', e?.message || e);
+    return res.status(500).json({ ok: false, error: e?.message || 'ai error' });
+  }
+});
+
+// (C) DIAGNOSTIC: notification-listener ping (called when the Android listener binds)
 ingest.post('/nl-ping', express.json(), async (req, res) => {
   const { org_phone, device, state, pkg, ts } = req.body || {};
   const when = ts ? new Date(ts).toISOString() : new Date().toISOString();
@@ -88,7 +158,7 @@ ingest.post('/nl-ping', express.json(), async (req, res) => {
   return res.json({ ok: true });
 });
 
-// 2) Primary ingest (HMAC-verified, RAW body required)
+// (D) Primary ingest (HMAC-verified, RAW body required)
 ingest.post(
   '/local',
   express.raw({ type: 'application/json', limit: '256kb' }),
@@ -117,15 +187,20 @@ ingest.post(
 
       if (orgErr) throw orgErr;
       const org = orgs?.[0];
-      // in src/routes/ingest.ts, just before "return res.json({ ok: true, stored: false, reason: '...' })"
-      console.log('[INGEST][SKIP]', { reason: 'no_items/org_not_found/duplicate', orgId: org?.id, text });
-      if (!org) return res.json({ ok: true, stored: false, reason: 'org_not_found' });
+
+      if (!org) {
+        console.log('[INGEST][SKIP] org_not_found', { org_phone, text });
+        return res.json({ ok: true, stored: false, reason: 'org_not_found' });
+      }
+      console.log('[INGEST] org_ok', { orgId: org.id });
 
       // e) Parse items
       const parsed = await parsePipeline(String(text));
       if (!parsed.items || parsed.items.length === 0) {
+        console.log('[INGEST][SKIP] no_items', { orgId: org.id, text });
         return res.json({ ok: true, stored: false, reason: 'no_items' });
       }
+      console.log('[INGEST] parsed', { used: parsed.used, items: parsed.items.length, reason: parsed.reason });
 
       // f) Deduplicate
       const dedupeKey = makeDedupeKey(org.id, String(text), typeof ts === 'number' ? ts : undefined);
@@ -137,8 +212,7 @@ ingest.post(
         .limit(1);
       if (exErr) throw exErr;
       if (existing && existing[0]) {
-        // in src/routes/ingest.ts, just before "return res.json({ ok: true, stored: false, reason: '...' })"
-        console.log('[INGEST][SKIP]', { reason: 'no_items/org_not_found/duplicate', orgId: org?.id, text });
+        console.log('[INGEST][SKIP] duplicate', { orgId: org.id, dedupeKey });
         return res.json({ ok: true, stored: false, reason: 'duplicate' });
       }
 
@@ -157,6 +231,7 @@ ingest.post(
       });
       if (insErr) throw insErr;
 
+      console.log('[INGEST] stored', { orgId: org.id, dedupeKey });
       return res.json({ ok: true, stored: true, used: parsed.used });
     } catch (e: any) {
       console.error('[INGEST]', e?.message || e);
@@ -165,3 +240,5 @@ ingest.post(
     }
   }
 );
+
+export default ingest;

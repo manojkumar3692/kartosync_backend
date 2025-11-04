@@ -79,12 +79,26 @@ function isGreetingOrNoise(text: string): boolean {
 }
 
 function applyMicroHeuristics(items: ParseResult["items"]): ParseResult["items"] {
-  return (items || []).map(it => {
+  return (items || []).map((it) => {
+    const safeName = (it as any).name ?? (it as any).canonical ?? (it as any).raw ?? "";
+    const nameLC = String(safeName).toLowerCase();
+
     // Infer milk unit if missing
-    if (!it.unit && /milk/i.test(it.name)) return { ...it, unit: "pack" };
+    if (!it.unit && (/\bmilk\b/.test(nameLC) || /\bபால்\b/.test(nameLC))) {
+      it = { ...it, unit: "pack" };
+    }
+
     // Normalize tiny typos
-    const name = it.name.trim();
-    if (/^amul milk$/i.test(name)) return { ...it, canonical: "Milk", category: it.category ?? "dairy" };
+    const trimmed = String(safeName || "").trim();
+    if (/^amul milk$/i.test(trimmed)) {
+      it = { ...it, canonical: it.canonical ?? "Milk", category: it.category ?? "dairy" };
+    }
+
+    // Ensure 'name' is always present in our schema
+    if (!(it as any).name || typeof (it as any).name !== "string") {
+      it = { ...it, name: trimmed || (it.canonical ?? "item") };
+    }
+
     return it;
   });
 }
@@ -95,9 +109,6 @@ function emptyResult(reason: string): ParseResult {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 4) MAIN: aiParseOrder
-//    - Uses your rule parser first (free).
-//    - If OPENAI key is set *and* you’re under the daily cap, refines with LLM.
-//    - Always returns valid ParseResult.
 // ─────────────────────────────────────────────────────────────────────────────
 export async function aiParseOrder(
   text: string,
@@ -109,20 +120,32 @@ export async function aiParseOrder(
   // Early exit for obvious non-orders
   if (isGreetingOrNoise(raw)) return emptyResult("greeting_or_noise");
 
-  // Baseline (free) parse first
-  const baselineItems = ruleParse(raw) || [];
+  // Baseline (free) parse first — and NORMALIZE to include `name`
+  const rawBaseline: any[] = (ruleParse(raw) || []) as any[];
+  const baselineItems = rawBaseline.map((r) => {
+    const name = String(r.raw ?? r.canonical ?? "").trim();
+    return {
+      // ensure ItemSchema fields exist
+      name: name || "item",
+      qty: typeof r.qty === "number" ? r.qty : (Number.isFinite(+r.qty) ? Number(r.qty) : 1),
+      unit: r.unit ?? null,
+      notes: r.meta?.cut ? String(r.meta.cut) : null,
+      canonical: r.canonical ?? null,
+      category: r.category ?? null,
+    };
+  });
+
   let baseline: ParseResult = {
     items: applyMicroHeuristics(baselineItems as any),
     confidence: baselineItems.length ? 0.6 : 0.3,
     reason: baselineItems.length ? "rule_based" : "rule_based_empty",
-    is_order_like: baselineItems.length > 0
+    is_order_like: baselineItems.length > 0,
   };
 
   // If no AI, return baseline immediately
   if (!ENABLE_AI) return baseline;
 
   // Pre-check budget (quick approximation to avoid calling if already over cap)
-  // Adjust these numbers if you change max_tokens, few-shots, etc.
   const approxCost = estimateCostUSD({ prompt_tokens: 150, completion_tokens: 200 }, MODEL);
   if (!(await canSpendMoreUSD(approxCost))) {
     return baseline; // budget exceeded → fallback silently
@@ -133,8 +156,9 @@ export async function aiParseOrder(
 
     const catalogHint = catalog?.length
       ? "\nShop catalog (optional):\n" +
-        catalog.slice(0, 50)
-          .map(x => `- SKU:${x.sku} name:${x.name} aliases:${(x.aliases || []).join(", ")}`)
+        catalog
+          .slice(0, 50)
+          .map((x) => `- SKU:${x.sku} name:${x.name} aliases:${(x.aliases || []).join(", ")}`)
           .join("\n") +
         "\nIf an item strongly matches, set canonical to catalog name (do NOT invent SKU in output)."
       : "";
@@ -142,11 +166,11 @@ export async function aiParseOrder(
     // Build messages (few-shots included). Use `any[]` to avoid SDK type drift.
     const messages: any[] = [
       { role: "system", content: SYSTEM + catalogHint },
-      ...FEWSHOTS.flatMap(s => ([
+      ...FEWSHOTS.flatMap((s) => [
         { role: "user", content: s.user },
-        { role: "assistant", content: JSON.stringify(s.assistant) }
-      ])),
-      { role: "user", content: JSON.stringify({ raw, baseline }) }
+        { role: "assistant", content: JSON.stringify(s.assistant) },
+      ]),
+      { role: "user", content: JSON.stringify({ raw, baseline }) },
     ];
 
     const resp = await client.chat.completions.create({
@@ -154,26 +178,21 @@ export async function aiParseOrder(
       messages,
       response_format: { type: "json_object" }, // force JSON
       temperature: 0.1,
-      max_tokens: 400
+      max_tokens: 400,
     });
 
     // Record the *actual* spend for this call
     const usage = (resp as any).usage as {
-      prompt_tokens?: number; completion_tokens?: number; total_tokens?: number
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      total_tokens?: number;
     } | undefined;
 
     const cost = estimateCostUSD(usage, MODEL);
     if (cost > 0) await addSpendUSD(cost);
 
     if (usage) {
-      console.log(
-        "[AI] tokens in/out:",
-        usage.prompt_tokens,
-        usage.completion_tokens,
-        "≈$",
-        cost.toFixed(4)
-      );
-
+      console.log("[AI] tokens in/out:", usage.prompt_tokens, usage.completion_tokens, "≈$", cost.toFixed(4));
       // Optional DB log (safe-noop if table not present)
       try {
         const { error } = await supa.from("ai_usage_log").insert({
@@ -181,7 +200,8 @@ export async function aiParseOrder(
           model: MODEL,
           prompt_tokens: usage.prompt_tokens ?? 0,
           completion_tokens: usage.completion_tokens ?? 0,
-          total_tokens: usage.total_tokens ?? ((usage?.prompt_tokens || 0) + (usage?.completion_tokens || 0)),
+          total_tokens:
+            usage.total_tokens ?? (usage?.prompt_tokens || 0) + (usage?.completion_tokens || 0),
           cost_usd: cost,
           created_at: new Date().toISOString(),
         });
@@ -215,7 +235,6 @@ export async function aiParseOrder(
     return parsed;
   } catch (e: any) {
     console.error("[AI parse] error:", e?.message || e);
-    console.log("[AI SKIPPED → RULES]", { reason: baseline.reason });
     // Fall back gracefully
     return baseline;
   }
