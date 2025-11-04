@@ -98,7 +98,8 @@ function coerceToItem(it: any): z.infer<typeof ItemSchema> {
 // Null-safe micro-heuristics (works with coerced items)
 function applyMicroHeuristics(items: Array<z.infer<typeof ItemSchema>>): Array<z.infer<typeof ItemSchema>> {
   return (items || []).map((it) => {
-    const baseName = (it?.name ?? "").toString();
+    // 👇 guaranteed string; avoids .trim() on undefined/null
+    const baseName = ((it?.name ?? "") as string).toString();
 
     // Infer milk unit if missing
     if (!it.unit && /milk/i.test(baseName)) {

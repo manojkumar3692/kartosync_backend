@@ -7,6 +7,18 @@ import { parseOrder as ruleParse } from "../parser";
 export const orders = express.Router();
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Status constants (store lowercase in DB; accept any case from client)
+// ─────────────────────────────────────────────────────────────────────────────
+const STATUS_LIST = ["pending", "shipped", "paid"] as const;
+type OrderStatus = (typeof STATUS_LIST)[number];
+const STATUS_SET = new Set<string>(STATUS_LIST);
+
+function normStatus(s?: string | null): OrderStatus | null {
+  const v = String(s ?? "").trim().toLowerCase();
+  return STATUS_SET.has(v) ? (v as OrderStatus) : null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Optional AI parser (graceful fallback if not present or no OPENAI_API_KEY)
 // ─────────────────────────────────────────────────────────────────────────────
 let aiParseOrder:
@@ -23,7 +35,6 @@ try {
 } catch {
   aiParseOrder = undefined;
 }
-
 const ENABLE_AI = !!process.env.OPENAI_API_KEY && !!aiParseOrder;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -44,7 +55,7 @@ function ensureAuth(req: any, res: any, next: any) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/orders  → list recent orders for this org
-// Supports optional query params: ?status=pending&limit=100&offset=0
+// Optional: ?status=pending|shipped|paid&limit=100&offset=0 (case-insensitive)
 // ─────────────────────────────────────────────────────────────────────────────
 orders.get("/", ensureAuth, async (req: any, res) => {
   try {
@@ -56,7 +67,8 @@ orders.get("/", ensureAuth, async (req: any, res) => {
       .order("created_at", { ascending: false })
       .range(Number(offset), Number(offset) + Number(limit) - 1);
 
-    if (status) q = q.eq("status", String(status));
+    const ns = normStatus(status as string | undefined);
+    if (ns) q = q.eq("status", ns);
 
     const { data, error } = await q;
     if (error) throw error;
@@ -67,8 +79,6 @@ orders.get("/", ensureAuth, async (req: any, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: parse pipeline (AI → rules)
 // ─────────────────────────────────────────────────────────────────────────────
 async function parsePipeline(text: string): Promise<{
   items: any[];
@@ -114,6 +124,7 @@ async function parsePipeline(text: string): Promise<{
 //     customer_name?: string | null,
 //     created_at?: string | Date   // optional (ISO) for backfill
 //   }
+// Status defaults to "pending".
 // ─────────────────────────────────────────────────────────────────────────────
 orders.post("/", ensureAuth, async (req: any, res) => {
   try {
@@ -129,7 +140,6 @@ orders.post("/", ensureAuth, async (req: any, res) => {
       parse_confidence = parsed.confidence ?? null;
       parse_reason = parsed.reason ?? (parsed.used === "ai" ? "ai" : "rules");
     } else {
-      // Accept caller-provided items (validate a little)
       finalItems = Array.isArray(items) ? items : [];
     }
 
@@ -138,15 +148,14 @@ orders.post("/", ensureAuth, async (req: any, res) => {
     }
 
     const insert = {
-      org_id: req.org_id, // ← always from JWT
+      org_id: req.org_id,
       source_phone: source_phone || null,
       customer_name: customer_name || null,
       raw_text: raw_text || null,
       items: finalItems,
-      status: "pending",
+      status: "pending" as OrderStatus,
       parse_confidence,
       parse_reason,
-      // created_at: optional backfill
       ...(created_at ? { created_at: new Date(created_at).toISOString() } : {}),
     };
 
@@ -162,19 +171,25 @@ orders.post("/", ensureAuth, async (req: any, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/orders/:id/status  → update status for an order in this org
-// Body: { status: 'pending' | 'delivered' | 'paid' }
+// Body: { status: 'pending' | 'shipped' | 'paid' }  // case-insensitive
 // ─────────────────────────────────────────────────────────────────────────────
 orders.post("/:id/status", ensureAuth, async (req: any, res) => {
   const { id } = req.params;
-  const { status } = req.body || {};
+  const next = normStatus(req.body?.status);
+  if (!next) {
+    return res
+      .status(400)
+      .json({ error: "invalid_status", allowed: Array.from(STATUS_LIST) });
+  }
+
   try {
     const { error } = await supa
       .from("orders")
-      .update({ status })
+      .update({ status: next })
       .eq("id", id)
       .eq("org_id", req.org_id);
     if (error) throw error;
-    res.json({ ok: true });
+    res.json({ ok: true, status: next });
   } catch (err: any) {
     console.error("Order update error:", err);
     res.status(500).json({ error: err.message });
