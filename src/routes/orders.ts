@@ -216,12 +216,11 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
 //   1) Logs into ai_corrections (for future learning)
 //   2) Updates orders.items + parse_reason = 'human_fix' (immediate UI reflect)
 // ─────────────────────────────────────────────────────────────────────────────
+// orders.post("/:id/ai-fix", ensureAuth, …)
 orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
   const { id } = req.params;
 
-  // Accept either:
-  //  A) { human_fixed: { items: [...], reason?: string } }
-  //  B) { items: [...], reason?: string } or { items: [...], note?: string }
+  // Accept either { human_fixed } or loose { items, reason/note }
   let human_fixed = req.body?.human_fixed;
   if (!human_fixed) {
     const items = req.body?.items;
@@ -231,18 +230,24 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
     }
   }
 
-  // Normalize + validate items
-  function asStr(v: any) { return typeof v === "string" ? v : (v == null ? "" : String(v)); }
-  function trim(v: any) { return asStr(v).trim(); }
+  const asStr = (v: any) => (typeof v === "string" ? v : v == null ? "" : String(v));
+  const trim = (v: any) => asStr(v).trim();
+
+  // Normalize (incl brand/variant/notes/category)
   const normalizedItems = Array.isArray(human_fixed?.items)
     ? human_fixed.items
         .map((it: any) => ({
-          qty: (it?.qty === null || it?.qty === undefined || Number.isNaN(Number(it?.qty)))
-            ? null
-            : Number(it.qty),
-          unit: (trim(it?.unit) || null),
+          qty:
+            it?.qty === null || it?.qty === undefined || Number.isNaN(Number(it?.qty))
+              ? null
+              : Number(it.qty),
+          unit: trim(it?.unit) || null,
           name: trim(it?.name || it?.canonical || ""),
-          canonical: (trim(it?.canonical) || null),
+          canonical: trim(it?.canonical) || null,
+          brand: trim(it?.brand) || null,      // NEW
+          variant: trim(it?.variant) || null,  // NEW
+          notes: trim(it?.notes) || null,      // NEW
+          category: trim(it?.category) || null,
         }))
         .filter((it: any) => it.name && it.name.length > 0)
     : [];
@@ -254,7 +259,7 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
   const reason = trim(human_fixed?.reason) || "human_fix";
 
   try {
-    // Load current order
+    // Load order (ensure org ownership)
     const { data: cur, error: e1 } = await supa
       .from("orders")
       .select("*")
@@ -266,7 +271,7 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
     const order = cur?.[0];
     if (!order) return res.status(404).json({ error: "order_not_found" });
 
-    // 1) Store correction for learning
+    // 1) Persist learning row
     const message_text =
       (order.raw_text && String(order.raw_text)) ||
       ((order.items || []).map((i: any) => i?.name || i?.canonical || "").join(", ")) ||
@@ -282,7 +287,60 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
     });
     if (e2) throw e2;
 
-    // 2) Update the order immediately with the corrected items
+    // 1.5) OPTIONAL auto-catalog growth from fixes (per org)
+    // Enable via env (default ON)
+    const enableAutoCatalog =
+      String(process.env.AI_AUTOCATALOG || "true").toLowerCase() !== "false";
+
+    if (enableAutoCatalog) {
+      // For each fixed item that has at least canonical or non-empty name, add alias terms
+      // Strategy:
+      //  - canonical = item.canonical || Title Case(item.name)
+      //  - term = user-facing phrase built from [brand, variant, unit] if present else name
+      //  - upsert (org_id, term, canonical, brand, variant)
+      for (const it of normalizedItems) {
+        const canonical =
+          it.canonical ||
+          (it.name ? it.name.charAt(0).toUpperCase() + it.name.slice(1) : null);
+
+        if (!canonical) continue;
+
+        const parts = [
+          it.brand || undefined,
+          it.variant || undefined,
+          it.unit || undefined,
+          it.name || undefined,
+        ].filter(Boolean) as string[];
+
+        const term = parts.join(" ").trim();
+        const safeTerm = term || it.name;
+
+        if (!safeTerm) continue;
+
+        // You can also link to products table if you maintain SKUs/categories.
+        // For now, we just upsert alias → canonical.
+        try {
+          await supa
+            .from("product_aliases")
+            .upsert(
+              {
+                org_id: req.org_id,
+                term: safeTerm.toLowerCase(), // store normalized
+                canonical,                    // display canonical
+                brand: it.brand || null,
+                variant: it.variant || null,
+              },
+              {
+                onConflict: "org_id,term", // ensure a composite unique constraint exists
+              }
+            );
+        } catch (aliasErr: any) {
+          console.warn("alias upsert warn:", aliasErr?.message || aliasErr);
+        }
+      }
+    }
+
+    // 2) Update the order immediately so UI reflects the fix
     const { data: upd, error: e3 } = await supa
       .from("orders")
       .update({

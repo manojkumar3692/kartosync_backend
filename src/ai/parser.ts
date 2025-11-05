@@ -17,7 +17,7 @@ const asStr = (v: any) => (typeof v === "string" ? v : v == null ? "" : String(v
 const trimStr = (v: any) => asStr(v).trim();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1) Schema (your exact spec)
+// 1) Schema (your exact spec)  + brand/variant support
 // ─────────────────────────────────────────────────────────────────────────────
 export const ItemSchema = z.object({
   name: z.string().min(1),
@@ -26,6 +26,10 @@ export const ItemSchema = z.object({
   notes: z.string().nullable().default(null),
   canonical: z.string().nullable().default(null),
   category: z.string().nullable().default(null),
+
+  // NEW:
+  brand: z.string().nullable().default(null),
+  variant: z.string().nullable().default(null),
 });
 
 export const ParseResultSchema = z.object({
@@ -52,6 +56,7 @@ const SYSTEM = [
   "Be conservative: greetings like 'hi/thanks/ok' → is_order_like=false and items=[].",
   "Infer sensible units when implied (e.g., '2 milk' → unit:'pack' in India).",
   "Normalize canonical names when obvious (e.g., 'tata salt' → 'Salt').",
+  "Extract brand and variant if user mentions them (e.g., 'Almarai' or 'Full Fat'/'1L'). If absent, leave null—do not invent.",
   "Do not invent items. Keep outputs minimal and consistent.",
 ].join(" ");
 
@@ -67,6 +72,8 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
           notes: "curry cut",
           canonical: "Chicken",
           category: "meat",
+          brand: null,
+          variant: null,
         },
         {
           name: "milk",
@@ -75,6 +82,8 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
           notes: null,
           canonical: "Milk",
           category: "dairy",
+          brand: null,
+          variant: null,
         },
       ],
       confidence: 0.92,
@@ -93,6 +102,8 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
           notes: "ta: பால்",
           canonical: "Milk",
           category: "dairy",
+          brand: null,
+          variant: null,
         },
       ],
       confidence: 0.85,
@@ -110,6 +121,49 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
     },
   },
 ];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Brand / Variant micro-helpers (cheap heuristics before/after AI)
+// ─────────────────────────────────────────────────────────────────────────────
+const BRAND_HINTS: Record<string, string[]> = {
+  // canonical -> likely brands (UAE-first for dairy)
+  milk: ["almarai", "al rawabi", "al ain", "amul"],
+  coke: ["coca cola", "coke", "coca-cola"],
+  pepsi: ["pepsi"],
+  salt: ["tata", "aashirvaad", "catch"],
+};
+
+const VARIANT_PATTERNS: Array<{ re: RegExp; norm: string | ((m: RegExpExecArray) => string) }> = [
+  { re: /(full\s*fat)/i, norm: "Full Fat" },
+  { re: /(low\s*fat|lite|light)/i, norm: "Low Fat" },
+  { re: /(skim|double\s*toned)/i, norm: "Skim" },
+  { re: /\b(\d+(?:\.\d+)?)\s*(l|ltr|litre|liter)\b/i, norm: (m) => `${m[1]}L` },
+  { re: /\b(\d+)\s*ml\b/i, norm: (m) => `${m[1]}ml` },
+  { re: /\b(\d+)\s*(g|kg)\b/i, norm: (m) => `${m[1]}${String(m[2]).toUpperCase()}` },
+];
+
+function detectBrand(base: string, canonical?: string | null): string | null {
+  const t = base.toLowerCase();
+  const key = (canonical || "").toLowerCase();
+  const pool = [
+    ...(BRAND_HINTS[key] || []),
+    ...(BRAND_HINTS["milk"] || []), // fallback common category
+  ];
+  for (const b of pool) {
+    if (t.includes(b)) {
+      return b.replace(/\b\w/g, (c) => c.toUpperCase()); // naive title case
+    }
+  }
+  return null;
+}
+
+function detectVariant(base: string): string | null {
+  for (const p of VARIANT_PATTERNS) {
+    const m = p.re.exec(base);
+    if (m) return typeof p.norm === "function" ? p.norm(m) : p.norm;
+  }
+  return null;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 function isGreetingOrNoise(text: string): boolean {
@@ -153,24 +207,45 @@ function coerceToItem(it: any): z.infer<typeof ItemSchema> {
     return c ? c : null;
   })();
 
-  return { name, qty, unit, notes, canonical, category };
+  // NEW:
+  const brand = (() => {
+    const b = trimStr(it?.brand);
+    return b ? b : null;
+  })();
+
+  const variant = (() => {
+    const v = trimStr(it?.variant);
+    return v ? v : null;
+  })();
+
+  return { name, qty, unit, notes, canonical, category, brand, variant };
 }
 
-// Null-safe micro-heuristics
+// Null-safe micro-heuristics (now with brand/variant)
 function applyMicroHeuristics(
   items: Array<z.infer<typeof ItemSchema>>
 ): Array<z.infer<typeof ItemSchema>> {
   return (items || []).map((orig) => {
     let it = { ...orig };
-    const baseName = asStr(it?.name);
+    const baseName = asStr(it?.name || it?.canonical || "");
     if (!it.unit && /milk/i.test(baseName)) {
+      // keep your earlier default behavior
       it.unit = "pack";
     }
     const trimmed = trimStr(baseName);
     if (/^amul milk$/i.test(trimmed)) {
       it.canonical = "Milk";
       it.category = it.category ?? "dairy";
+      it.brand = it.brand ?? "Amul";
     }
+
+    // NEW: cheap brand + variant detection from raw text
+    if (!it.brand) it.brand = detectBrand(baseName, it.canonical);
+    if (!it.variant) {
+      const v = detectVariant(baseName);
+      if (v) it.variant = v;
+    }
+
     return it;
   });
 }
@@ -180,7 +255,7 @@ function emptyResult(reason: string): ParseResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4) MAIN: aiParseOrder  (now supports org-scoped dynamic few-shots)
+// 4) MAIN: aiParseOrder  (supports org-scoped dynamic few-shots)
 // ─────────────────────────────────────────────────────────────────────────────
 export async function aiParseOrder(
   text: string,
@@ -284,6 +359,9 @@ export async function aiParseOrder(
                   notes: trimStr(x?.notes) || null,
                   canonical: trimStr(x?.canonical) || null,
                   category: trimStr(x?.category) || null,
+                  // NEW: include brand/variant in few-shot assistant
+                  brand: trimStr(x?.brand) || null,
+                  variant: trimStr(x?.variant) || null,
                 }))
                 .filter((x) => !!x.name);
 

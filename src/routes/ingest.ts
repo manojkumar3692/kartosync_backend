@@ -44,7 +44,7 @@ function verifyHmac(req: any, rawBuf: Buffer) {
 
   const computed = crypto.createHmac('sha256', secret).update(rawBuf).digest('hex');
 
-  // Debug logs (keep on while testing)
+  // Debug logs (keep while testing)
   console.log(
     '[INGEST] HMAC recv=',
     sig.slice(0, 8),
@@ -58,6 +58,7 @@ function verifyHmac(req: any, rawBuf: Buffer) {
     rawBuf.length
   );
 
+  // Compare as buffers
   return timingSafeEq(Buffer.from(computed), Buffer.from(sig));
 }
 
@@ -79,21 +80,37 @@ async function parsePipeline(text: string) {
     try {
       console.log('[INGEST][AI call] invoking aiParseOrder…');
       const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(String(text));
+
+      // Pretty “reason” for logs (don’t force any prefix)
+      const reason = ai?.reason || null;
+      const itemCount = Array.isArray(ai?.items) ? ai!.items.length : 0;
+
+      // Your preferred logs:
+      console.log(`[AI used] ${process.env.AI_MODEL || 'ai'} items: ${itemCount} reason: ${reason || '—'}`);
       console.log('[INGEST][AI result]', {
         is_order_like: ai?.is_order_like,
-        items: Array.isArray(ai?.items) ? ai.items.length : null,
-        reason: ai?.reason,
+        items: itemCount,
+        reason,
       });
-      if (ai && ai.is_order_like !== false && Array.isArray(ai.items) && ai.items.length > 0) {
+
+      // Only accept if AI says this *looks like an order* AND has items
+      if (ai && ai.is_order_like !== false && itemCount > 0) {
         return {
+          used: 'ai' as const,
           items: ai.items,
           confidence: typeof ai.confidence === 'number' ? ai.confidence : undefined,
-          reason: ai.reason ?? `ai:${process.env.AI_MODEL || 'unknown'}`,
-          used: 'ai' as const,
+          reason, // keep natural human-readable text (e.g. "Clear list with units")
+          is_order_like: true,
         };
-      } else {
-        console.log('[INGEST][AI skip] Model returned empty or not order-like → falling back to rules.');
       }
+
+      // AI said not order-like OR empty items → treat as no-order
+      return {
+        used: 'ai' as const,
+        items: [],
+        reason: reason || 'ai_decided_not_order',
+        is_order_like: false,
+      };
     } catch (e: any) {
       console.warn('[INGEST] AI parse failed, falling back to rules:', e?.message || e);
     }
@@ -101,14 +118,15 @@ async function parsePipeline(text: string) {
     console.log('[INGEST][AI skip] useAI=false (hasFn=%s, hasKey=%s)', hasFn, hasKey);
   }
 
-  // Fallback: your rule parser
+  // Fallback: rules (we will NOT store these unless you later change the gate)
   const items = parseOrder(String(text));
   console.log('[INGEST][RULES] items:', items?.length || 0);
   return {
+    used: 'rules' as const,
     items,
     confidence: undefined,
     reason: 'rule_fallback',
-    used: 'rules' as const,
+    is_order_like: items && items.length > 0 ? true : false,
   };
 }
 
@@ -194,25 +212,32 @@ ingest.post(
       }
       console.log('[INGEST] org_ok', { orgId: org.id });
 
-      // e) Parse items
+      // e) Parse items via pipeline (AI preferred)
       const parsed = await parsePipeline(String(text));
-      if (!parsed.items || parsed.items.length === 0) {
-        console.log('[INGEST][SKIP] no_items', { orgId: org.id, text });
-        return res.json({ ok: true, stored: false, reason: 'no_items' });
-      }
-      
-      // Only accept AI parses; drop rule-based/greeting
-      const allowAI = parsed.used === 'ai' && /^ai:/i.test(parsed.reason || '');
-      if (!allowAI) {
-        console.log('[INGEST][SKIP] non_ai_parse', {
-          orgId: org.id,
+
+      // ───────────────
+      // STRICT STORE GATE (your requirement):
+      // ONLY store when:
+      //   1) used === 'ai'
+      //   2) is_order_like !== false
+      //   3) items.length > 0
+      // No prefix requirements on reason; keep it human-readable.
+      // ───────────────
+      if (parsed.used !== 'ai' || parsed.is_order_like === false || !parsed.items || parsed.items.length === 0) {
+        console.log('[INGEST][SKIP] not_ai_or_not_order_like', {
           used: parsed.used,
+          is_order_like: parsed.is_order_like,
+          items: parsed.items?.length || 0,
           reason: parsed.reason,
         });
-        return res.json({ ok: true, stored: false, reason: 'non_ai_parse' });
+        return res.json({ ok: true, stored: false, reason: 'skipped_by_gate' });
       }
-      
-      console.log('[INGEST] parsed', { used: parsed.used, items: parsed.items.length, reason: parsed.reason });
+
+      console.log('[INGEST] parsed', {
+        used: parsed.used,
+        items: parsed.items.length,
+        reason: parsed.reason || '—',
+      });
 
       // f) Deduplicate
       const dedupeKey = makeDedupeKey(org.id, String(text), typeof ts === 'number' ? ts : undefined);
@@ -239,7 +264,7 @@ ingest.post(
         created_at: ts ? new Date(ts).toISOString() : undefined,
         dedupe_key: dedupeKey,
         parse_confidence: parsed.confidence ?? null,
-        parse_reason: parsed.reason ?? null,
+        parse_reason: parsed.reason ?? null, // keep natural string e.g. "Clear list with units"
       });
       if (insErr) throw insErr;
 
@@ -247,7 +272,7 @@ ingest.post(
       return res.json({ ok: true, stored: true, used: parsed.used });
     } catch (e: any) {
       console.error('[INGEST]', e?.message || e);
-      // Don’t cause retries/noise — respond 200 with ok:false
+      // Don’t cause client retries — respond 200 with ok:false
       return res.status(200).json({ ok: false });
     }
   }
