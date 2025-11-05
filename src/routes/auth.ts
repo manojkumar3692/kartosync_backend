@@ -52,8 +52,10 @@ auth.post('/login', async (req, res) => {
     if (!phone || !password) return res.status(400).json({ error: 'phone_password_required' });
 
     const { data, error } = await supa.from('orgs').select('*').eq('phone', String(phone)).limit(1);
+    
     if (error) throw error;
     const org = data?.[0];
+    if (org.is_disabled) return res.status(403).json({ error: 'org_disabled' });
     if (!org) return res.status(404).json({ error: 'org_not_found' });
 
     if (!org.password_hash) return res.status(401).json({ error: 'password_not_set' });

@@ -23,7 +23,11 @@ function normStatus(s?: string | null): OrderStatus | null {
 // ─────────────────────────────────────────────────────────────────────────────
 let aiParseOrder:
   | undefined
-  | ((text: string) => Promise<{
+  | ((
+      text: string,
+      catalog?: Array<{ name: string; sku: string; aliases?: string[] }>,
+      opts?: { org_id?: string }
+    ) => Promise<{
       items: any[];
       confidence?: number;
       reason?: string | null;
@@ -82,7 +86,7 @@ orders.get("/", ensureAuth, async (req: any, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: parse pipeline (AI → rules) with HUMAN-READABLE reason preservation
 // ─────────────────────────────────────────────────────────────────────────────
-async function parsePipeline(text: string): Promise<{
+async function parsePipeline(text: string, org_id?: string): Promise<{
   items: any[];
   used: "ai" | "rules";
   confidence?: number | null;
@@ -93,11 +97,11 @@ async function parsePipeline(text: string): Promise<{
 
   if (ENABLE_AI) {
     try {
-      const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(raw);
+      // pass org_id so parser can load org-scoped dynamic few-shots
+      const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(raw, undefined, { org_id });
       if (ai && ai.is_order_like !== false && Array.isArray(ai.items) && ai.items.length > 0) {
-        // Preserve AI's reason if present; otherwise synthesize a readable fallback.
         const r =
-          (typeof ai.reason === "string" && ai.reason.trim().length > 0)
+          typeof ai.reason === "string" && ai.reason.trim().length > 0
             ? ai.reason
             : "items_detected";
         return {
@@ -107,7 +111,7 @@ async function parsePipeline(text: string): Promise<{
           reason: r,
         };
       }
-      // If AI says not order-like or no items, fall through to rules for safety (caller can decide to reject)
+      // If AI says not order-like or no items, fall through to rules (caller still may reject)
     } catch (e: any) {
       console.warn("[orders] AI parse failed, fallback to rules:", e?.message || e);
     }
@@ -143,7 +147,7 @@ orders.post("/", ensureAuth, async (req: any, res) => {
     let parse_reason: string | null = null;
 
     if (raw_text && String(raw_text).trim()) {
-      const parsed = await parsePipeline(String(raw_text));
+      const parsed = await parsePipeline(String(raw_text), req.org_id);
       finalItems = parsed.items;
       parse_confidence = parsed.confidence ?? null;
       // ✅ Preserve human-readable reason, do NOT overwrite with tags.
@@ -202,6 +206,101 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
   } catch (err: any) {
     console.error("Order update error:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/orders/:id/ai-fix
+// Body: { human_fixed: { items: Item[], reason?: string } }
+// Effect:
+//   1) Logs into ai_corrections (for future learning)
+//   2) Updates orders.items + parse_reason = 'human_fix' (immediate UI reflect)
+// ─────────────────────────────────────────────────────────────────────────────
+orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
+  const { id } = req.params;
+
+  // Accept either:
+  //  A) { human_fixed: { items: [...], reason?: string } }
+  //  B) { items: [...], reason?: string } or { items: [...], note?: string }
+  let human_fixed = req.body?.human_fixed;
+  if (!human_fixed) {
+    const items = req.body?.items;
+    const reason = (req.body?.reason || req.body?.note || "human_fix") as string;
+    if (Array.isArray(items)) {
+      human_fixed = { items, reason };
+    }
+  }
+
+  // Normalize + validate items
+  function asStr(v: any) { return typeof v === "string" ? v : (v == null ? "" : String(v)); }
+  function trim(v: any) { return asStr(v).trim(); }
+  const normalizedItems = Array.isArray(human_fixed?.items)
+    ? human_fixed.items
+        .map((it: any) => ({
+          qty: (it?.qty === null || it?.qty === undefined || Number.isNaN(Number(it?.qty)))
+            ? null
+            : Number(it.qty),
+          unit: (trim(it?.unit) || null),
+          name: trim(it?.name || it?.canonical || ""),
+          canonical: (trim(it?.canonical) || null),
+        }))
+        .filter((it: any) => it.name && it.name.length > 0)
+    : [];
+
+  if (!normalizedItems.length) {
+    return res.status(400).json({ error: "human_fixed_items_required" });
+  }
+
+  const reason = trim(human_fixed?.reason) || "human_fix";
+
+  try {
+    // Load current order
+    const { data: cur, error: e1 } = await supa
+      .from("orders")
+      .select("*")
+      .eq("id", id)
+      .eq("org_id", req.org_id)
+      .limit(1);
+
+    if (e1) throw e1;
+    const order = cur?.[0];
+    if (!order) return res.status(404).json({ error: "order_not_found" });
+
+    // 1) Store correction for learning
+    const message_text =
+      (order.raw_text && String(order.raw_text)) ||
+      ((order.items || []).map((i: any) => i?.name || i?.canonical || "").join(", ")) ||
+      "";
+
+    const model_output = order.items || [];
+
+    const { error: e2 } = await supa.from("ai_corrections").insert({
+      org_id: req.org_id,
+      message_text,
+      model_output,
+      human_fixed: { items: normalizedItems, reason },
+    });
+    if (e2) throw e2;
+
+    // 2) Update the order immediately with the corrected items
+    const { data: upd, error: e3 } = await supa
+      .from("orders")
+      .update({
+        items: normalizedItems,
+        parse_confidence: null,
+        parse_reason: reason,
+      })
+      .eq("id", id)
+      .eq("org_id", req.org_id)
+      .select("*")
+      .single();
+
+    if (e3) throw e3;
+
+    res.json({ ok: true, order: upd });
+  } catch (err: any) {
+    console.error("ai-fix error:", err);
+    res.status(500).json({ error: err.message || "ai_fix_failed" });
   }
 });
 

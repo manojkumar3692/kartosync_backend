@@ -1,14 +1,19 @@
 // src/ai/parser.ts
 import OpenAI from "openai";
 import { z } from "zod";
-import { parseOrder as ruleParse } from "../parser";                  // ← free rules parser
-import { addSpendUSD, canSpendMoreUSD, estimateCostUSD, estimateCostUSDApprox } from "./cost"; // ← budget guard
-import { supa } from "../db";                                         // ← optional logging
+import { parseOrder as ruleParse } from "../parser"; // ← free rules parser
+import {
+  addSpendUSD,
+  canSpendMoreUSD,
+  estimateCostUSD,
+  estimateCostUSDApprox,
+} from "./cost"; // ← budget guard
+import { supa } from "../db"; // ← optional logging
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Safe string helpers (avoid .trim on undefined / non-strings)
 // ─────────────────────────────────────────────────────────────────────────────
-const asStr = (v: any) => (typeof v === "string" ? v : (v == null ? "" : String(v)));
+const asStr = (v: any) => (typeof v === "string" ? v : v == null ? "" : String(v));
 const trimStr = (v: any) => asStr(v).trim();
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,7 +52,7 @@ const SYSTEM = [
   "Be conservative: greetings like 'hi/thanks/ok' → is_order_like=false and items=[].",
   "Infer sensible units when implied (e.g., '2 milk' → unit:'pack' in India).",
   "Normalize canonical names when obvious (e.g., 'tata salt' → 'Salt').",
-  "Do not invent items. Keep outputs minimal and consistent."
+  "Do not invent items. Keep outputs minimal and consistent.",
 ].join(" ");
 
 const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
@@ -55,34 +60,64 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
     user: "2kg chicken curry cut, 1 packet milk",
     assistant: {
       items: [
-        { name: "chicken curry cut", qty: 2, unit: "kg", notes: "curry cut", canonical: "Chicken", category: "meat" },
-        { name: "milk", qty: 1, unit: "pack", notes: null, canonical: "Milk", category: "dairy" },
+        {
+          name: "chicken curry cut",
+          qty: 2,
+          unit: "kg",
+          notes: "curry cut",
+          canonical: "Chicken",
+          category: "meat",
+        },
+        {
+          name: "milk",
+          qty: 1,
+          unit: "pack",
+          notes: null,
+          canonical: "Milk",
+          category: "dairy",
+        },
       ],
-      confidence: 0.92, reason: "Clear list with units", is_order_like: true,
-    }
+      confidence: 0.92,
+      reason: "Clear list with units",
+      is_order_like: true,
+    },
   },
   {
     user: "pls send 3 பால் பாக்கெட்",
     assistant: {
       items: [
-        { name: "பால் (milk)", qty: 3, unit: "pack", notes: "ta: பால்", canonical: "Milk", category: "dairy" },
+        {
+          name: "பால் (milk)",
+          qty: 3,
+          unit: "pack",
+          notes: "ta: பால்",
+          canonical: "Milk",
+          category: "dairy",
+        },
       ],
-      confidence: 0.85, reason: "Tamil request recognized", is_order_like: true,
-    }
+      confidence: 0.85,
+      reason: "Tamil request recognized",
+      is_order_like: true,
+    },
   },
   {
     user: "hi",
-    assistant: { items: [], confidence: 0.2, reason: "greeting", is_order_like: false }
+    assistant: {
+      items: [],
+      confidence: 0.2,
+      reason: "greeting",
+      is_order_like: false,
+    },
   },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3) Utilities
-// ─────────────────────────────────────────────────────────────────────────────
 function isGreetingOrNoise(text: string): boolean {
   const t = trimStr(text).toLowerCase();
   if (!t) return true;
-  return /^(hi|hello|hlo|thanks|thank you|ok|k|👍|🙏|good (morning|night|evening)|done|received)\b/.test(t);
+  return /^(hi|hello|hlo|thanks|thank you|ok|k|👍|🙏|good (morning|night|evening)|done|received)\b/.test(
+    t
+  );
 }
 
 // Coerce any rule-parser shape into our ItemSchema-ish
@@ -122,7 +157,9 @@ function coerceToItem(it: any): z.infer<typeof ItemSchema> {
 }
 
 // Null-safe micro-heuristics
-function applyMicroHeuristics(items: Array<z.infer<typeof ItemSchema>>): Array<z.infer<typeof ItemSchema>> {
+function applyMicroHeuristics(
+  items: Array<z.infer<typeof ItemSchema>>
+): Array<z.infer<typeof ItemSchema>> {
   return (items || []).map((orig) => {
     let it = { ...orig };
     const baseName = asStr(it?.name);
@@ -143,11 +180,12 @@ function emptyResult(reason: string): ParseResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4) MAIN: aiParseOrder
+// 4) MAIN: aiParseOrder  (now supports org-scoped dynamic few-shots)
 // ─────────────────────────────────────────────────────────────────────────────
 export async function aiParseOrder(
   text: string,
-  catalog?: Array<{ name: string; sku: string; aliases?: string[] }>
+  catalog?: Array<{ name: string; sku: string; aliases?: string[] }>,
+  opts?: { org_id?: string }
 ): Promise<ParseResult> {
   const raw = trimStr(text);
   if (!raw) return emptyResult("empty");
@@ -158,7 +196,10 @@ export async function aiParseOrder(
   const baselineItemsRaw = ruleParse(raw) || [];
   let baselineHeur: Array<z.infer<typeof ItemSchema>> = [];
   try {
-    const baselineCoerced = (Array.isArray(baselineItemsRaw) ? baselineItemsRaw : []).map(coerceToItem);
+    const baselineCoerced = (Array.isArray(baselineItemsRaw)
+      ? baselineItemsRaw
+      : []
+    ).map(coerceToItem);
     baselineHeur = applyMicroHeuristics(baselineCoerced);
   } catch {
     baselineHeur = [];
@@ -174,42 +215,121 @@ export async function aiParseOrder(
   if (!ENABLE_AI) return baseline;
 
   // ── Budget PRE-CHECK ───────────────────────────────────────────────────────
-  const approxUSD = estimateCostUSDApprox({ prompt_tokens: 150, completion_tokens: 200 }, MODEL);
+  const approxUSD = estimateCostUSDApprox(
+    { prompt_tokens: 150, completion_tokens: 200 },
+    MODEL
+  );
   if (PER_CALL_CAP && approxUSD > PER_CALL_CAP) {
-    console.warn("[AI$ BLOCK pre] approxUSD exceeds per-call cap", { approxUSD, PER_CALL_CAP, model: MODEL });
+    console.warn("[AI$ BLOCK pre] approxUSD exceeds per-call cap", {
+      approxUSD,
+      PER_CALL_CAP,
+      model: MODEL,
+    });
     return baseline;
   }
   const canSpend = await canSpendMoreUSD(approxUSD as any);
   const gateOk = typeof canSpend === "object" ? (canSpend as any).ok : !!canSpend;
   if (!gateOk) {
-    const reason = typeof canSpend === "object" ? (canSpend as any).reason : "daily_cap_exceeded";
-    console.warn("[AI$ BLOCK pre] daily cap gate", { reason, approxUSD, model: MODEL });
+    const reason =
+      typeof canSpend === "object"
+        ? (canSpend as any).reason
+        : "daily_cap_exceeded";
+    console.warn("[AI$ BLOCK pre] daily cap gate", {
+      reason,
+      approxUSD,
+      model: MODEL,
+    });
     return baseline;
   }
   if (typeof canSpend === "object" && (canSpend as any).today !== undefined) {
     console.log(
-      `[AI$ PRE ok] today=$${(canSpend as any).today.toFixed(4)} + ~${approxUSD.toFixed(4)} <= cap=$${((canSpend as any).cap ?? 0).toFixed(2)}`
+      `[AI$ PRE ok] today=$${(canSpend as any).today.toFixed(4)} + ~${approxUSD.toFixed(
+        4
+      )} <= cap=$${((canSpend as any).cap ?? 0).toFixed(2)}`
     );
   }
 
   try {
     const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-    const catalogHint = (Array.isArray(catalog) && catalog.length)
-      ? "\nShop catalog (optional):\n" +
-        catalog.slice(0, 50)
-          .map(x => `- SKU:${asStr(x.sku)} name:${asStr(x.name)} aliases:${(Array.isArray(x.aliases) ? x.aliases : []).map(asStr).join(", ")}`)
-          .join("\n") +
-        "\nIf an item strongly matches, set canonical to catalog name (do NOT invent SKU in output)."
-      : "";
+    // ── Pull dynamic few-shots from recent human fixes for this org (if any)
+    let dynamicShots: Array<{ user: string; assistant: ParseResult }> = [];
+    try {
+      if (opts?.org_id) {
+        const { data: shots, error: shotsErr } = await supa
+          .from("ai_corrections")
+          .select("message_text, human_fixed")
+          .eq("org_id", opts.org_id)
+          .order("created_at", { ascending: false })
+          .limit(8);
+
+        if (!shotsErr && Array.isArray(shots)) {
+          for (const row of shots) {
+            const msg = trimStr(row?.message_text);
+            const items: any[] = Array.isArray(row?.human_fixed?.items)
+              ? row.human_fixed.items
+              : [];
+            if (msg && items.length) {
+              // ensure items satisfy our schema shape minimally
+              const safeItems = items
+                .map((x) => ({
+                  name: trimStr(x?.name || x?.canonical || ""),
+                  qty:
+                    typeof x?.qty === "number"
+                      ? x.qty
+                      : Number.isFinite(x?.qty)
+                      ? Number(x.qty)
+                      : null,
+                  unit: trimStr(x?.unit) || null,
+                  notes: trimStr(x?.notes) || null,
+                  canonical: trimStr(x?.canonical) || null,
+                  category: trimStr(x?.category) || null,
+                }))
+                .filter((x) => !!x.name);
+
+              if (safeItems.length) {
+                dynamicShots.push({
+                  user: msg,
+                  assistant: {
+                    items: safeItems,
+                    confidence: 0.95,
+                    reason: "human_fixed_fewshot",
+                    is_order_like: true,
+                  },
+                });
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore dynamic few-shot errors
+    }
+
+    const catalogHint =
+      Array.isArray(catalog) && catalog.length
+        ? "\nShop catalog (optional):\n" +
+          catalog
+            .slice(0, 50)
+            .map(
+              (x) =>
+                `- SKU:${asStr(x.sku)} name:${asStr(x.name)} aliases:${(
+                  Array.isArray(x.aliases) ? x.aliases : []
+                )
+                  .map(asStr)
+                  .join(", ")}`
+            )
+            .join("\n") +
+          "\nIf an item strongly matches, set canonical to catalog name (do NOT invent SKU in output)."
+        : "";
 
     const messages: any[] = [
       { role: "system", content: SYSTEM + catalogHint },
-      ...FEWSHOTS.flatMap(s => ([
+      ...[...FEWSHOTS, ...dynamicShots].flatMap((s) => [
         { role: "user", content: s.user },
-        { role: "assistant", content: JSON.stringify(s.assistant) }
-      ])),
-      { role: "user", content: JSON.stringify({ raw, baseline }) }
+        { role: "assistant", content: JSON.stringify(s.assistant) },
+      ]),
+      { role: "user", content: JSON.stringify({ raw, baseline }) },
     ];
 
     const resp = await client.chat.completions.create({
@@ -217,16 +337,24 @@ export async function aiParseOrder(
       messages,
       response_format: { type: "json_object" },
       temperature: 0.1,
-      max_tokens: 400
+      max_tokens: 400,
     });
 
-    const usage = (resp as any).usage as {
-      prompt_tokens?: number; completion_tokens?: number; total_tokens?: number
-    } | undefined;
+    const usage = (resp as any).usage as
+      | {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          total_tokens?: number;
+        }
+      | undefined;
 
     const cost = estimateCostUSD(usage, MODEL);
     if (PER_CALL_CAP && cost > PER_CALL_CAP) {
-      console.warn("[AI$ POST over cap]", { cost: Number(cost.toFixed(6)), PER_CALL_CAP, model: MODEL });
+      console.warn("[AI$ POST over cap]", {
+        cost: Number(cost.toFixed(6)),
+        PER_CALL_CAP,
+        model: MODEL,
+      });
     }
     if (cost > 0) {
       await addSpendUSD(cost);
@@ -247,7 +375,9 @@ export async function aiParseOrder(
           model: MODEL,
           prompt_tokens: usage?.prompt_tokens ?? 0,
           completion_tokens: usage?.completion_tokens ?? 0,
-          total_tokens: usage?.total_tokens ?? ((usage?.prompt_tokens || 0) + (usage?.completion_tokens || 0)),
+          total_tokens:
+            usage?.total_tokens ??
+            (usage?.prompt_tokens || 0) + (usage?.completion_tokens || 0),
           cost_usd: cost,
           created_at: new Date().toISOString(),
         });
@@ -283,7 +413,14 @@ export async function aiParseOrder(
       return { ...parsed, items: [], is_order_like: false };
     }
 
-    console.log("[AI used]", MODEL, "items:", parsed.items?.length ?? 0, "reason:", parsed.reason);
+    console.log(
+      "[AI used]",
+      MODEL,
+      "items:",
+      parsed.items?.length ?? 0,
+      "reason:",
+      parsed.reason
+    );
     return parsed;
   } catch (e: any) {
     console.error("[AI parse] error:", e?.message || e);

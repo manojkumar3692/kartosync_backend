@@ -12,6 +12,7 @@ import { ingest } from './routes/ingest';
 import { ordersFeedback } from './routes/orders_feedback';
 import { aiCorrections } from "./routes/ai-corrections";
 import aiDebug from './routes/aiDebug';
+import { admin } from './routes/admin';
 
 console.log('[BOOT] JWT_SECRET present?', !!process.env.JWT_SECRET, 'value:', process.env.JWT_SECRET);
 console.log('✅ MOBILE_INGEST_SECRET =', process.env.MOBILE_INGEST_SECRET);
@@ -42,6 +43,7 @@ app.use('/api/ai', aiDebug);
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // routes
+app.use('/api/admin', admin);
 app.use('/api/auth', auth);
 app.use('/api/org', org);
 app.use('/api/orders', orders);
