@@ -391,4 +391,31 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
   }
 });
 
+// DELETE ORDER
+
+orders.delete("/:id", async (req, res) => {
+  try {
+    const orderId = req.params.id;
+
+    if (!orderId) {
+      return res.status(400).json({ ok: false, error: "order_id_required" });
+    }
+
+    const { error } = await supa
+      .from("orders")
+      .delete()
+      .eq("id", orderId);
+
+    if (error) {
+      console.error("[DELETE ORDER]", error.message);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+
+    return res.json({ ok: true, deleted: orderId });
+  } catch (e: any) {
+    console.error("[DELETE ORDER]", e?.message || e);
+    return res.status(500).json({ ok: false, error: e?.message || "delete_failed" });
+  }
+});
+
 export default orders;

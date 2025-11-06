@@ -16,6 +16,8 @@ import { admin } from './routes/admin';
 import adminProducts from './routes/admin_products';
 import clarify from './routes/clarify';
 import { clarifyLink } from "./routes/clarifyLink";
+import suggestReply from './routes/suggestReply';
+import availability from './routes/availability';
 
 console.log('[BOOT] JWT_SECRET present?', !!process.env.JWT_SECRET, 'value:', process.env.JWT_SECRET);
 console.log('✅ MOBILE_INGEST_SECRET =', process.env.MOBILE_INGEST_SECRET);
@@ -34,8 +36,17 @@ app.use(cors({
   credentials: false,
 }));
 app.options('*', cors());
-// HMAC route MUST run raw, so mount it BEFORE bodyParser.json()
-app.use('/api/ingest', ingest);  // ✅ put this FIRST
+
+
+const ingestCors = cors({
+  origin: (process.env.CORS_ORIGIN || 'http://localhost:5173').split(','),
+  methods: ['POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Signature','ngrok-skip-browser-warning'],
+});
+
+
+app.options('/api/ingest/local', ingestCors);
+app.use('/api/ingest', ingestCors, ingest); 
 
 // JSON for normal routes
 app.use(bodyParser.json());
@@ -46,6 +57,8 @@ app.use('/api/ai', aiDebug);
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // routes
+app.use('/api/availability', availability);
+app.use('/api/suggest-reply', suggestReply);
 app.use('/api/admin', admin);
 app.use('/api/clarify-link', clarifyLink);
 app.use("/api/admin/products", adminProducts);
