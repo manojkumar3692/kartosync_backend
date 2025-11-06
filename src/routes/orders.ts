@@ -220,7 +220,6 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
 orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
   const { id } = req.params;
 
-  // Accept either { human_fixed } or loose { items, reason/note }
   let human_fixed = req.body?.human_fixed;
   if (!human_fixed) {
     const items = req.body?.items;
@@ -233,7 +232,6 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
   const asStr = (v: any) => (typeof v === "string" ? v : v == null ? "" : String(v));
   const trim = (v: any) => asStr(v).trim();
 
-  // Normalize (incl brand/variant/notes/category)
   const normalizedItems = Array.isArray(human_fixed?.items)
     ? human_fixed.items
         .map((it: any) => ({
@@ -244,9 +242,9 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
           unit: trim(it?.unit) || null,
           name: trim(it?.name || it?.canonical || ""),
           canonical: trim(it?.canonical) || null,
-          brand: trim(it?.brand) || null,      // NEW
-          variant: trim(it?.variant) || null,  // NEW
-          notes: trim(it?.notes) || null,      // NEW
+          brand: trim(it?.brand) || null,
+          variant: trim(it?.variant) || null,
+          notes: trim(it?.notes) || null,
           category: trim(it?.category) || null,
         }))
         .filter((it: any) => it.name && it.name.length > 0)
@@ -259,10 +257,9 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
   const reason = trim(human_fixed?.reason) || "human_fix";
 
   try {
-    // Load order (ensure org ownership)
     const { data: cur, error: e1 } = await supa
       .from("orders")
-      .select("*")
+      .select("*, source_phone")
       .eq("id", id)
       .eq("org_id", req.org_id)
       .limit(1);
@@ -271,7 +268,7 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
     const order = cur?.[0];
     if (!order) return res.status(404).json({ error: "order_not_found" });
 
-    // 1) Persist learning row
+    // 1) Log correction event for future re-training
     const message_text =
       (order.raw_text && String(order.raw_text)) ||
       ((order.items || []).map((i: any) => i?.name || i?.canonical || "").join(", ")) ||
@@ -287,22 +284,15 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
     });
     if (e2) throw e2;
 
-    // 1.5) OPTIONAL auto-catalog growth from fixes (per org)
-    // Enable via env (default ON)
+    // 1.5) Automatic catalog learning (optional)
     const enableAutoCatalog =
       String(process.env.AI_AUTOCATALOG || "true").toLowerCase() !== "false";
 
     if (enableAutoCatalog) {
-      // For each fixed item that has at least canonical or non-empty name, add alias terms
-      // Strategy:
-      //  - canonical = item.canonical || Title Case(item.name)
-      //  - term = user-facing phrase built from [brand, variant, unit] if present else name
-      //  - upsert (org_id, term, canonical, brand, variant)
       for (const it of normalizedItems) {
         const canonical =
           it.canonical ||
           (it.name ? it.name.charAt(0).toUpperCase() + it.name.slice(1) : null);
-
         if (!canonical) continue;
 
         const parts = [
@@ -314,24 +304,21 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
 
         const term = parts.join(" ").trim();
         const safeTerm = term || it.name;
-
         if (!safeTerm) continue;
 
-        // You can also link to products table if you maintain SKUs/categories.
-        // For now, we just upsert alias → canonical.
         try {
           await supa
             .from("product_aliases")
             .upsert(
               {
                 org_id: req.org_id,
-                term: safeTerm.toLowerCase(), // store normalized
-                canonical,                    // display canonical
+                term: safeTerm.toLowerCase(),
+                canonical,
                 brand: it.brand || null,
                 variant: it.variant || null,
               },
               {
-                onConflict: "org_id,term", // ensure a composite unique constraint exists
+                onConflict: "org_id,term",
               }
             );
         } catch (aliasErr: any) {
@@ -340,7 +327,7 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
       }
     }
 
-    // 2) Update the order immediately so UI reflects the fix
+    // 2) ✅ UPDATE ORDER (final updated structure)
     const { data: upd, error: e3 } = await supa
       .from("orders")
       .update({
@@ -352,9 +339,40 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
       .eq("org_id", req.org_id)
       .select("*")
       .single();
-
     if (e3) throw e3;
 
+    // 3) ✅ **LEARNING FROM HUMAN FIX** (your requested logic)
+    try {
+      const phone = order.source_phone || null;
+
+      for (const it of normalizedItems) {
+        const canon = (it.canonical || it.name || '').trim();
+        if (!canon) continue;
+
+        await supa.rpc('upsert_bvs', {
+          p_org_id: order.org_id,
+          p_canonical: canon,
+          p_brand: it.brand ?? null,
+          p_variant: it.variant ?? null,
+          p_inc: 1
+        });
+
+        if (phone) {
+          await supa.rpc('upsert_customer_pref', {
+            p_org_id: order.org_id,
+            p_phone: phone,
+            p_canonical: canon,
+            p_brand: it.brand ?? null,
+            p_variant: it.variant ?? null,
+            p_inc: 1
+          });
+        }
+      }
+    } catch (e) {
+      console.warn("[ai-fix][learn-write] non-fatal:", (e as any)?.message || e);
+    }
+
+    // Response
     res.json({ ok: true, order: upd });
   } catch (err: any) {
     console.error("ai-fix error:", err);

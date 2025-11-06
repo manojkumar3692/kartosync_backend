@@ -5,9 +5,10 @@ import { supa } from '../db';
 import { parseOrder } from '../parser';
 
 // ⬇️ Optional AI parser (safe to keep even if you don't use AI yet)
+//    We keep a very loose type so we can pass (text, undefined, { org_id, customer_phone })
 let aiParseOrder:
   | undefined
-  | ((text: string) => Promise<{
+  | ((text: string, catalog?: any, opts?: { org_id?: string; customer_phone?: string }) => Promise<{
       items: any[];
       confidence?: number;
       reason?: string | null;
@@ -17,7 +18,7 @@ let aiParseOrder:
 try {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const mod = require('../ai/parser');
-  aiParseOrder = mod.aiParseOrder || mod.default?.aiParseOrder;
+  aiParseOrder = (mod.aiParseOrder || mod.default?.aiParseOrder) as typeof aiParseOrder;
   console.log('[AI][wire] aiParseOrder loaded?', typeof aiParseOrder === 'function');
 } catch (e) {
   console.warn('[AI][wire] load fail:', (e as any)?.message || e);
@@ -70,22 +71,35 @@ function makeDedupeKey(orgId: string, text: string, ts?: number) {
 }
 
 /** Try AI first (if configured), else fallback to rules */
-async function parsePipeline(text: string) {
+async function parsePipeline(
+  text: string,
+  opts?: { org_id?: string; customer_phone?: string }
+) {
   const hasKey = !!process.env.OPENAI_API_KEY;
   const hasFn = typeof aiParseOrder === 'function';
   const useAI = !!(hasFn && hasKey);
-  console.log('[INGEST][AI gate]', { hasFn, hasKey, useAI, model: process.env.AI_MODEL });
+  console.log('[INGEST][AI gate]', {
+    hasFn,
+    hasKey,
+    useAI,
+    model: process.env.AI_MODEL,
+    org_id: opts?.org_id || null,
+    customer_phone: opts?.customer_phone || null,
+  });
 
   if (useAI) {
     try {
       console.log('[INGEST][AI call] invoking aiParseOrder…');
-      const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(String(text));
+      // ⬇️ Pass org_id & customer_phone so parser can use customer/org learnings + log AI cost with context
+      const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(String(text), undefined, {
+        org_id: opts?.org_id,
+        customer_phone: opts?.customer_phone,
+      });
 
       // Pretty “reason” for logs (don’t force any prefix)
       const reason = ai?.reason || null;
       const itemCount = Array.isArray(ai?.items) ? ai!.items.length : 0;
 
-      // Your preferred logs:
       console.log(`[AI used] ${process.env.AI_MODEL || 'ai'} items: ${itemCount} reason: ${reason || '—'}`);
       console.log('[INGEST][AI result]', {
         is_order_like: ai?.is_order_like,
@@ -99,7 +113,7 @@ async function parsePipeline(text: string) {
           used: 'ai' as const,
           items: ai.items,
           confidence: typeof ai.confidence === 'number' ? ai.confidence : undefined,
-          reason, // keep natural human-readable text (e.g. "Clear list with units")
+          reason,
           is_order_like: true,
         };
       }
@@ -140,7 +154,7 @@ ingest.get('/health', (_req, res) => {
 // (B) Test route to directly exercise AI (no HMAC) — dev only
 ingest.post('/test-ai', express.json(), async (req, res) => {
   try {
-    const { text } = req.body || {};
+    const { text, org_id, customer_phone } = req.body || {};
     if (!text) return res.status(400).json({ ok: false, error: 'text required' });
 
     const hasFn = typeof aiParseOrder === 'function';
@@ -155,7 +169,12 @@ ingest.post('/test-ai', express.json(), async (req, res) => {
       });
     }
 
-    const out = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(String(text));
+    // ⬇️ Thread through provided org_id / customer_phone for testing
+    const out = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(String(text), undefined, {
+      org_id: org_id || undefined,
+      customer_phone: customer_phone || undefined,
+    });
+
     console.log('[TEST-AI][result]', {
       is_order_like: out?.is_order_like,
       items: out?.items?.length,
@@ -212,8 +231,11 @@ ingest.post(
       }
       console.log('[INGEST] org_ok', { orgId: org.id });
 
-      // e) Parse items via pipeline (AI preferred)
-      const parsed = await parsePipeline(String(text));
+      // e) Parse items via pipeline (AI preferred) — pass org_id & customer_phone
+      const parsed = await parsePipeline(String(text), {
+        org_id: org.id,
+        customer_phone: from || undefined,
+      });
 
       // ───────────────
       // STRICT STORE GATE (your requirement):
@@ -221,7 +243,6 @@ ingest.post(
       //   1) used === 'ai'
       //   2) is_order_like !== false
       //   3) items.length > 0
-      // No prefix requirements on reason; keep it human-readable.
       // ───────────────
       if (parsed.used !== 'ai' || parsed.is_order_like === false || !parsed.items || parsed.items.length === 0) {
         console.log('[INGEST][SKIP] not_ai_or_not_order_like', {

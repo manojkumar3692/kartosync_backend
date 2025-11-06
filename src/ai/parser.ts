@@ -126,7 +126,7 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
 // Brand / Variant micro-helpers (cheap heuristics before/after AI)
 // ─────────────────────────────────────────────────────────────────────────────
 const BRAND_HINTS: Record<string, string[]> = {
-  // canonical -> likely brands (UAE-first for dairy)
+  // canonical -> likely brands
   milk: ["almarai", "al rawabi", "al ain", "amul"],
   coke: ["coca cola", "coke", "coca-cola"],
   pepsi: ["pepsi"],
@@ -147,7 +147,7 @@ function detectBrand(base: string, canonical?: string | null): string | null {
   const key = (canonical || "").toLowerCase();
   const pool = [
     ...(BRAND_HINTS[key] || []),
-    ...(BRAND_HINTS["milk"] || []), // fallback common category
+    ...(BRAND_HINTS["milk"] || []),
   ];
   for (const b of pool) {
     if (t.includes(b)) {
@@ -229,7 +229,6 @@ function applyMicroHeuristics(
     let it = { ...orig };
     const baseName = asStr(it?.name || it?.canonical || "");
     if (!it.unit && /milk/i.test(baseName)) {
-      // keep your earlier default behavior
       it.unit = "pack";
     }
     const trimmed = trimStr(baseName);
@@ -255,12 +254,126 @@ function emptyResult(reason: string): ParseResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4) MAIN: aiParseOrder  (supports org-scoped dynamic few-shots)
+// 3) Learning-boost helper (customer_prefs + brand_variant_stats)
+// ─────────────────────────────────────────────────────────────────────────────
+async function buildLearningsBoost(args: {
+  org_id?: string;
+  customer_phone?: string;
+  baselineCanonicals: string[];
+}) {
+  const { org_id, customer_phone, baselineCanonicals } = args;
+  if (!org_id) return "";
+
+  const canonList = (baselineCanonicals || [])
+    .map((c) => (c || "").trim())
+    .filter(Boolean);
+  const uniqueCanon = Array.from(new Set(canonList)).slice(0, 12);
+
+  let customerRows: any[] = [];
+  let orgPopularRows: any[] = [];
+
+  try {
+    if (customer_phone) {
+      const { data, error } = await supa
+        .from("customer_prefs")
+        .select("canonical,brand,variant,cnt,last_seen")
+        .eq("org_id", org_id)
+        .eq("customer_phone", customer_phone)
+        .order("cnt", { ascending: false })
+        .limit(50);
+      if (!error && Array.isArray(data)) customerRows = data;
+    }
+  } catch {
+    // no-op
+  }
+
+  try {
+    const { data, error } = await supa
+      .from("brand_variant_stats")
+      .select("canonical,brand,variant,cnt,last_seen")
+      .eq("org_id", org_id)
+      .order("cnt", { ascending: false })
+      .limit(100);
+    if (!error && Array.isArray(data)) orgPopularRows = data;
+  } catch {
+    // no-op
+  }
+
+  const filterByCanon =
+    uniqueCanon.length > 0
+      ? (r: any) => uniqueCanon.includes(String(r?.canonical || ""))
+      : (_r: any) => true;
+
+  const cust = customerRows.filter(filterByCanon);
+  const pop = orgPopularRows.filter(filterByCanon);
+
+  if (!cust.length && !pop.length) return "";
+
+  const lines: string[] = [];
+  if (cust.length) {
+    lines.push("Customer preferences (from past orders):");
+    const byCanon: Record<string, any[]> = {};
+    for (const r of cust) {
+      const key = String(r.canonical || "");
+      (byCanon[key] ||= []).push(r);
+    }
+    for (const [canon, arr] of Object.entries(byCanon)) {
+      const top = arr
+        .slice()
+        .sort((a, b) => (b?.cnt || 0) - (a?.cnt || 0))
+        .slice(0, 3);
+      const choices = top
+        .map((r) => {
+          const b = r.brand ? `brand:${r.brand}` : null;
+          const v = r.variant ? `variant:${r.variant}` : null;
+          const cv = [b, v].filter(Boolean).join(", ");
+          return `${cv || "generic"} (×${r.cnt ?? 0})`;
+        })
+        .join(" | ");
+      lines.push(`- ${canon}: ${choices}`);
+    }
+  }
+
+  if (pop.length) {
+    lines.push("Shop-wide popular combinations:");
+    const byCanon2: Record<string, any[]> = {};
+    for (const r of pop) {
+      const key = String(r.canonical || "");
+      (byCanon2[key] ||= []).push(r);
+    }
+    for (const [canon, arr] of Object.entries(byCanon2)) {
+      const top = arr
+        .slice()
+        .sort((a, b) => (b?.cnt || 0) - (a?.cnt || 0))
+        .slice(0, 3);
+      const choices = top
+        .map((r) => {
+          const b = r.brand ? `brand:${r.brand}` : null;
+          const v = r.variant ? `variant:${r.variant}` : null;
+          const cv = [b, v].filter(Boolean).join(", ");
+          return `${cv || "generic"} (×${r.cnt ?? 0})`;
+        })
+        .join(" | ");
+      lines.push(`- ${canon}: ${choices}`);
+    }
+  }
+
+  lines.push(
+    "Rules: Use these ONLY for gentle disambiguation.",
+    "- If one brand/variant clearly dominates (strong majority) AND the text implies it, you MAY set it.",
+    "- Otherwise, leave brand/variant as null and explain in `reason` what was ambiguous."
+  );
+
+  return `\nLEARNING HINTS\n${lines.join("\n")}\n`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4) MAIN: aiParseOrder  (supports org-scoped dynamic few-shots + learnings)
 // ─────────────────────────────────────────────────────────────────────────────
 export async function aiParseOrder(
   text: string,
   catalog?: Array<{ name: string; sku: string; aliases?: string[] }>,
-  opts?: { org_id?: string }
+  opts?: { org_id?: string; customer_phone?: string } // ← extended
 ): Promise<ParseResult> {
   const raw = trimStr(text);
   if (!raw) return emptyResult("empty");
@@ -287,38 +400,56 @@ export async function aiParseOrder(
     is_order_like: baselineHeur.length > 0,
   };
 
-  if (!ENABLE_AI) return baseline;
+  if (!ENABLE_AI) {
+    console.warn("[AI$ DISABLED] OPENAI_API_KEY not set; returning baseline only.", {
+      model: MODEL,
+      org_id: opts?.org_id || null,
+      customer_phone: opts?.customer_phone || null,
+    });
+    return baseline;
+  }
 
   // ── Budget PRE-CHECK ───────────────────────────────────────────────────────
   const approxUSD = estimateCostUSDApprox(
     { prompt_tokens: 150, completion_tokens: 200 },
     MODEL
   );
+
   if (PER_CALL_CAP && approxUSD > PER_CALL_CAP) {
     console.warn("[AI$ BLOCK pre] approxUSD exceeds per-call cap", {
       approxUSD,
       PER_CALL_CAP,
       model: MODEL,
+      org_id: opts?.org_id || null,
+      customer_phone: opts?.customer_phone || null,
     });
     return baseline;
   }
+  // Visibility: planned cost
+  console.log("[AI$ PLAN]", {
+    model: MODEL,
+    approxUSD: Number((approxUSD as any).toFixed ? (approxUSD as any).toFixed(4) : approxUSD),
+    org_id: opts?.org_id || null,
+    customer_phone: opts?.customer_phone || null,
+  });
+
   const canSpend = await canSpendMoreUSD(approxUSD as any);
   const gateOk = typeof canSpend === "object" ? (canSpend as any).ok : !!canSpend;
   if (!gateOk) {
     const reason =
-      typeof canSpend === "object"
-        ? (canSpend as any).reason
-        : "daily_cap_exceeded";
+      typeof canSpend === "object" ? (canSpend as any).reason : "daily_cap_exceeded";
     console.warn("[AI$ BLOCK pre] daily cap gate", {
       reason,
       approxUSD,
       model: MODEL,
+      org_id: opts?.org_id || null,
+      customer_phone: opts?.customer_phone || null,
     });
     return baseline;
   }
   if (typeof canSpend === "object" && (canSpend as any).today !== undefined) {
     console.log(
-      `[AI$ PRE ok] today=$${(canSpend as any).today.toFixed(4)} + ~${approxUSD.toFixed(
+      `[AI$ PRE ok] today=$${(canSpend as any).today.toFixed(4)} + ~${(approxUSD as any).toFixed(
         4
       )} <= cap=$${((canSpend as any).cap ?? 0).toFixed(2)}`
     );
@@ -345,7 +476,6 @@ export async function aiParseOrder(
               ? row.human_fixed.items
               : [];
             if (msg && items.length) {
-              // ensure items satisfy our schema shape minimally
               const safeItems = items
                 .map((x) => ({
                   name: trimStr(x?.name || x?.canonical || ""),
@@ -359,7 +489,6 @@ export async function aiParseOrder(
                   notes: trimStr(x?.notes) || null,
                   canonical: trimStr(x?.canonical) || null,
                   category: trimStr(x?.category) || null,
-                  // NEW: include brand/variant in few-shot assistant
                   brand: trimStr(x?.brand) || null,
                   variant: trimStr(x?.variant) || null,
                 }))
@@ -382,6 +511,21 @@ export async function aiParseOrder(
       }
     } catch {
       // ignore dynamic few-shot errors
+    }
+
+    // Build a short learnings booster (per-customer + org-popular)
+    let learningBoost = "";
+    try {
+      const baselineCanonicals = (baselineHeur || [])
+        .map((it) => (it?.canonical || it?.name || "").trim())
+        .filter(Boolean);
+      learningBoost = await buildLearningsBoost({
+        org_id: opts?.org_id,
+        customer_phone: opts?.customer_phone,
+        baselineCanonicals,
+      });
+    } catch {
+      // ignore learnings failures
     }
 
     const catalogHint =
@@ -407,6 +551,7 @@ export async function aiParseOrder(
         { role: "user", content: s.user },
         { role: "assistant", content: JSON.stringify(s.assistant) },
       ]),
+      ...(learningBoost ? [{ role: "system", content: learningBoost }] : []),
       { role: "user", content: JSON.stringify({ raw, baseline }) },
     ];
 
@@ -426,14 +571,17 @@ export async function aiParseOrder(
         }
       | undefined;
 
-    const cost = estimateCostUSD(usage, MODEL);
-    if (PER_CALL_CAP && cost > PER_CALL_CAP) {
-      console.warn("[AI$ POST over cap]", {
-        cost: Number(cost.toFixed(6)),
-        PER_CALL_CAP,
+    if (!usage) {
+      console.warn("[AI$ WARN] OpenAI returned no usage; cost cannot be computed.", {
         model: MODEL,
+        org_id: opts?.org_id || null,
+        customer_phone: opts?.customer_phone || null,
       });
     }
+
+    const cost = estimateCostUSD(usage, MODEL);
+
+    // Store spend + print precise cost
     if (cost > 0) {
       await addSpendUSD(cost);
       console.log(
@@ -444,12 +592,21 @@ export async function aiParseOrder(
         cost.toFixed(4)
       );
     }
+    // Always emit a compact summary line (even if cost is 0 / usage missing)
+    console.log("[AI$ USED]", {
+      model: MODEL,
+      prompt_tokens: usage?.prompt_tokens ?? 0,
+      completion_tokens: usage?.completion_tokens ?? 0,
+      cost_usd: Number((cost || 0).toFixed(4)),
+      org_id: opts?.org_id || null,
+      customer_phone: opts?.customer_phone || null,
+    });
 
-    // Optional DB log (safe-noop if table not present)
+    // Optional DB log (safe-noop if table not present) — include org_id
     if (usage) {
       try {
         const { error } = await supa.from("ai_usage_log").insert({
-          org_id: null,
+          org_id: opts?.org_id ?? null,
           model: MODEL,
           prompt_tokens: usage?.prompt_tokens ?? 0,
           completion_tokens: usage?.completion_tokens ?? 0,
@@ -471,7 +628,7 @@ export async function aiParseOrder(
     try {
       parsed = ParseResultSchema.parse(JSON.parse(content));
     } catch {
-      // If model returns something odd, stick to baseline
+      console.warn("[AI$ SKIP post] model returned non-JSON → using baseline. reason:", baseline.reason);
       return baseline;
     }
 
@@ -488,6 +645,7 @@ export async function aiParseOrder(
 
     // If model says it's not an order, keep that decision
     if (!parsed.is_order_like || parsed.items.length === 0) {
+      console.log("[AI$ RESULT] is_order_like=false or no items → not storing; reason:", parsed.reason);
       return { ...parsed, items: [], is_order_like: false };
     }
 

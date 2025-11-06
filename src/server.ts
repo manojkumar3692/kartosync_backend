@@ -14,6 +14,8 @@ import { aiCorrections } from "./routes/ai-corrections";
 import aiDebug from './routes/aiDebug';
 import { admin } from './routes/admin';
 import adminProducts from './routes/admin_products';
+import clarify from './routes/clarify';
+import { clarifyLink } from "./routes/clarifyLink";
 
 console.log('[BOOT] JWT_SECRET present?', !!process.env.JWT_SECRET, 'value:', process.env.JWT_SECRET);
 console.log('✅ MOBILE_INGEST_SECRET =', process.env.MOBILE_INGEST_SECRET);
@@ -38,13 +40,14 @@ app.use('/api/ingest', ingest);  // ✅ put this FIRST
 // JSON for normal routes
 app.use(bodyParser.json());
 
-
+app.use(clarify);
 app.use('/api/ai', aiDebug); 
 // health
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // routes
 app.use('/api/admin', admin);
+app.use('/api/clarify-link', clarifyLink);
 app.use("/api/admin/products", adminProducts);
 app.use('/api/auth', auth);
 app.use('/api/org', org);
