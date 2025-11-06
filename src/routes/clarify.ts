@@ -2,11 +2,20 @@
 import express from 'express';
 import { supa } from '../db';
 import { verifyClarifyToken, sha256 } from '../util/clarifyToken';
+import resolvePhoneForOrder, { normalizePhone } from '../util/normalizePhone';
 
 export const clarify = express.Router();
 
 const SECRET = process.env.CLARIFY_SECRET || '';
-const HTML_CSP = "default-src 'self' https://cdn.tailwindcss.com; style-src 'unsafe-inline' https://cdn.tailwindcss.com;";
+const HTML_CSP =
+  "default-src 'self' https://cdn.tailwindcss.com; style-src 'unsafe-inline' https://cdn.tailwindcss.com;";
+
+const escapeHtml = (s: string) =>
+  s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+const plainMsg = (msg: string) =>
+  `<!doctype html><meta charset="utf-8"><div style="font:14px system-ui;padding:24px">${escapeHtml(msg)}</div>`;
+const trim = (v: any) => (typeof v === 'string' ? v.trim() : v == null ? '' : String(v).trim());
+const nz = (v: any) => (v == null ? '' : String(v)); // '' allowed for generic
 
 // -------------- HTML page --------------
 clarify.get('/c/:token', async (req, res) => {
@@ -15,7 +24,9 @@ clarify.get('/c/:token', async (req, res) => {
   if (!payload) {
     return res
       .status(400)
-      .send(`<!doctype html><meta charset="utf-8"><title>Link expired</title><div style="font:14px system-ui;padding:24px">Link expired or invalid. Please request a new link.</div>`);
+      .send(
+        `<!doctype html><meta charset="utf-8"><title>Link expired</title><div style="font:14px system-ui;padding:24px">Link expired or invalid. Please request a new link.</div>`
+      );
   }
 
   const askBrand = !!payload.ask?.brand;
@@ -35,23 +46,28 @@ clarify.get('/c/:token', async (req, res) => {
       <div class="text-lg font-semibold">Help us confirm your item</div>
       <p class="text-sm text-gray-600 mt-1">Please tap the exact option below:</p>
       <div class="mt-4 grid gap-2">
-        ${payload.options.map((opt:any, i) => `
+        ${payload.options
+          .map(
+            (opt: any, i: number) => `
           <form method="post" action="/api/clarify" class="contents">
             <input type="hidden" name="token" value="${token}" />
             <input type="hidden" name="choice" value="${i}" />
             <button class="w-full text-left rounded-lg border border-gray-200 px-3 py-2 hover:bg-gray-50">
               <div class="font-medium flex items-center gap-2">
-  ${escapeHtml(opt.label)}
-  ${opt.rec ? '<span class="text-[10px] rounded-full bg-emerald-100 text-emerald-700 px-2 py-0.5">Recommended</span>' : ''}
-</div>
+                ${escapeHtml(opt.label)}
+                ${opt.rec ? '<span class="text-[10px] rounded-full bg-emerald-100 text-emerald-700 px-2 py-0.5">Recommended</span>' : ''}
+              </div>
               <div class="text-xs text-gray-500">${escapeHtml(
                 [opt.canonical, opt.brand, opt.variant].filter(Boolean).join(' · ')
               )}</div>
             </button>
-          </form>`).join('')}
+          </form>`
+          )
+          .join('')}
       </div>
 
-      ${allowOther ? `
+      ${allowOther
+        ? `
       <div class="mt-5 pt-4 border-t border-gray-100">
         <div class="text-sm font-medium text-gray-900">Or tell us exactly:</div>
         <form method="post" action="/api/clarify" class="mt-2 grid gap-2">
@@ -61,14 +77,12 @@ clarify.get('/c/:token', async (req, res) => {
             <div>
               <label class="block text-xs text-gray-500 mb-1">Brand</label>
               <input name="other_brand" class="w-full rounded-md border border-gray-200 px-3 py-2" placeholder="e.g., Maggi" />
-            </div>
-          ` : ``}
+            </div>` : ``}
           ${askVariant ? `
             <div>
               <label class="block text-xs text-gray-500 mb-1">Variant</label>
               <input name="other_variant" class="w-full rounded-md border border-gray-200 px-3 py-2" placeholder="e.g., Masala 70g" />
-            </div>
-          ` : ``}
+            </div>` : ``}
           <button class="rounded-lg bg-black text-white px-3 py-2 text-sm hover:bg-black/90">Submit</button>
         </form>
       </div>` : ``}
@@ -79,9 +93,6 @@ clarify.get('/c/:token', async (req, res) => {
 </body>
 </html>`);
 });
-function escapeHtml(s: string) {
-  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
-}
 
 // -------------- POST /api/clarify --------------
 clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req, res) => {
@@ -102,10 +113,24 @@ clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req
       line_index: number;
       options: Array<{ label: string; canonical: string; brand?: string | null; variant?: string | null }>;
       ask?: { brand?: boolean; variant?: boolean };
+      source_phone?: string | null;   // ← may be present from token
+      customer_name?: string | null;  // ← optional
     };
 
     const askBrand = !!payload.ask?.brand;
     const askVariant = !!payload.ask?.variant;
+
+    // Idempotency hint
+    try {
+      const { data: prev } = await supa
+        .from('clarifications')
+        .select('id, created_at')
+        .eq('token_hash', sha256(token))
+        .limit(1);
+      if (prev && prev[0]) {
+        console.warn('[clarify] token reused; continuing', { order_id, line_index });
+      }
+    } catch (_) {}
 
     // Resolve selection
     let selected: { label: string; canonical: string; brand?: string | null; variant?: string | null } | null = null;
@@ -113,11 +138,8 @@ clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req
     if (!Number.isNaN(choice) && choice >= 0 && choice < options.length) {
       selected = options[choice];
     } else if (choice === -1) {
-      // "Other" path (free-text submitted from the form)
-      const ob = (String(req.body?.other_brand || '').trim()) || null;
-      const ov = (String(req.body?.other_variant || '').trim()) || null;
-
-      // If we explicitly asked for a field, require it
+      const ob = trim(req.body?.other_brand || '') || null;
+      const ov = trim(req.body?.other_variant || '') || null;
       if ((askBrand && !ob) || (askVariant && !ov)) {
         return res.status(400).send(plainMsg('Please fill the required field(s).'));
       }
@@ -131,10 +153,10 @@ clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req
       return res.status(400).send(plainMsg('Invalid choice.'));
     }
 
-    // Load & update order line  (NOTE: include source_phone for learn-writes)
+    // Load order
     const { data: rows, error: e1 } = await supa
       .from('orders')
-      .select('id, org_id, items, status, source_phone')
+      .select('id, org_id, items, status, source_phone, customer_name')
       .eq('id', order_id)
       .eq('org_id', org_id)
       .limit(1);
@@ -148,9 +170,10 @@ clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req
       return res.status(400).send(plainMsg('Line index out of range.'));
     }
 
+    // Apply line updates
     const line = { ...items[line_index] };
-    line.canonical = selected!.canonical || line.canonical || line.name || '';
-    if (askBrand)   line.brand   = selected!.brand ?? null;
+    line.canonical = trim(selected!.canonical || line.canonical || line.name || '');
+    if (askBrand) line.brand = selected!.brand ?? null;
     if (askVariant) line.variant = selected!.variant ?? null;
 
     const newItems = items.slice();
@@ -166,7 +189,7 @@ clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req
       .eq('org_id', org_id);
     if (e2) throw e2;
 
-    // Log the clarification event
+    // Log the clarification
     await supa.from('clarifications').insert({
       org_id,
       order_id,
@@ -178,12 +201,18 @@ clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req
       ip: ip as any,
     });
 
-    // ── B1: Write learnings (non-fatal if they fail)
+    // ── Learning writes
     try {
-      const phone = order.source_phone || null;
-      const canon = String(selected!.canonical || line.canonical || line.name || '').trim();
-      const brand = selected!.brand ?? null;
-      const variant = selected!.variant ?? null;
+      // Prefer phone embedded in token, else resolver fallback
+      const tokenPhone = normalizePhone((payload as any)?.source_phone || "");
+      const phone =
+        tokenPhone ||
+        (await resolvePhoneForOrder(org_id, order_id, order.customer_name)) ||
+        "";
+
+      const canon = trim(selected!.canonical || line.canonical || line.name || '');
+      const brand = nz(selected!.brand ?? (askBrand ? '' : line.brand ?? ''));
+      const variant = nz(selected!.variant ?? (askVariant ? '' : line.variant ?? ''));
 
       if (phone && canon) {
         const { error: ecp } = await supa.rpc('upsert_customer_pref', {
@@ -199,6 +228,8 @@ clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req
         } else {
           console.log('[LEARN][customer_pref][OK]', { org_id, phone, canon, brand, variant });
         }
+      } else {
+        console.warn('[LEARN][customer_pref][SKIP] missing phone or canonical', { phone: !!phone, canon: !!canon });
       }
 
       if (canon) {
@@ -237,9 +268,5 @@ clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req
     return res.status(500).send(plainMsg('Something went wrong. Please try again later.'));
   }
 });
-
-function plainMsg(msg: string) {
-  return `<!doctype html><meta charset="utf-8"><div style="font:14px system-ui;padding:24px">${escapeHtml(msg)}</div>`;
-}
 
 export default clarify;

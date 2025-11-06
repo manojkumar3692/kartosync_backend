@@ -3,9 +3,9 @@ import express from 'express';
 import crypto from 'crypto';
 import { supa } from '../db';
 import { parseOrder } from '../parser';
+import { normalizePhone } from '../util/normalizePhone';
 
 // ⬇️ Optional AI parser (safe to keep even if you don't use AI yet)
-//    We keep a very loose type so we can pass (text, undefined, { org_id, customer_phone })
 let aiParseOrder:
   | undefined
   | ((text: string, catalog?: any, opts?: { org_id?: string; customer_phone?: string }) => Promise<{
@@ -90,13 +90,11 @@ async function parsePipeline(
   if (useAI) {
     try {
       console.log('[INGEST][AI call] invoking aiParseOrder…');
-      // ⬇️ Pass org_id & customer_phone so parser can use customer/org learnings + log AI cost with context
       const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(String(text), undefined, {
         org_id: opts?.org_id,
-        customer_phone: opts?.customer_phone,
+        customer_phone: opts?.customer_phone, // ← normalized phone (if available)
       });
 
-      // Pretty “reason” for logs (don’t force any prefix)
       const reason = ai?.reason || null;
       const itemCount = Array.isArray(ai?.items) ? ai!.items.length : 0;
 
@@ -107,7 +105,6 @@ async function parsePipeline(
         reason,
       });
 
-      // Only accept if AI says this *looks like an order* AND has items
       if (ai && ai.is_order_like !== false && itemCount > 0) {
         return {
           used: 'ai' as const,
@@ -118,7 +115,6 @@ async function parsePipeline(
         };
       }
 
-      // AI said not order-like OR empty items → treat as no-order
       return {
         used: 'ai' as const,
         items: [],
@@ -132,8 +128,7 @@ async function parsePipeline(
     console.log('[INGEST][AI skip] useAI=false (hasFn=%s, hasKey=%s)', hasFn, hasKey);
   }
 
-  // Fallback: rules (we will NOT store these unless you later change the gate)
-  const items = parseOrder(String(text));
+  const items = parseOrder(String(text)) || [];
   console.log('[INGEST][RULES] items:', items?.length || 0);
   return {
     used: 'rules' as const,
@@ -146,12 +141,12 @@ async function parsePipeline(
 
 /** ───────────────── ROUTES ───────────────── **/
 
-// (A) Simple health (handy for the Connect screen button)
+// (A) Simple health
 ingest.get('/health', (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// (B) Test route to directly exercise AI (no HMAC) — dev only
+// (B) Test route to directly exercise AI (no HMAC)
 ingest.post('/test-ai', express.json(), async (req, res) => {
   try {
     const { text, org_id, customer_phone } = req.body || {};
@@ -169,10 +164,9 @@ ingest.post('/test-ai', express.json(), async (req, res) => {
       });
     }
 
-    // ⬇️ Thread through provided org_id / customer_phone for testing
     const out = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(String(text), undefined, {
       org_id: org_id || undefined,
-      customer_phone: customer_phone || undefined,
+      customer_phone: normalizePhone(customer_phone || '') || undefined,
     });
 
     console.log('[TEST-AI][result]', {
@@ -187,7 +181,7 @@ ingest.post('/test-ai', express.json(), async (req, res) => {
   }
 });
 
-// (C) DIAGNOSTIC: notification-listener ping (called when the Android listener binds)
+// (C) DIAGNOSTIC: notification-listener ping
 ingest.post('/nl-ping', express.json(), async (req, res) => {
   const { org_phone, device, state, pkg, ts } = req.body || {};
   const when = ts ? new Date(ts).toISOString() : new Date().toISOString();
@@ -201,7 +195,7 @@ ingest.post(
   express.raw({ type: 'application/json', limit: '256kb' }),
   async (req: any, res: any) => {
     try {
-      // a) Get raw body bytes (stable for HMAC)
+      // a) Raw body bytes
       let rawBuf: Buffer;
       if (Buffer.isBuffer(req.body)) rawBuf = req.body as Buffer;
       else if (typeof req.body === 'string') rawBuf = Buffer.from(req.body, 'utf8');
@@ -215,7 +209,7 @@ ingest.post(
       const { org_phone, from, text, ts } = JSON.parse(rawBuf.toString('utf8') || '{}');
       if (!org_phone || !text) return res.status(400).json({ error: 'org_phone_and_text_required' });
 
-      // d) Find org by wa_phone_number_id (mapped to login phone at signup)
+      // d) Find org
       const { data: orgs, error: orgErr } = await supa
         .from('orgs')
         .select('*')
@@ -231,19 +225,19 @@ ingest.post(
       }
       console.log('[INGEST] org_ok', { orgId: org.id });
 
-      // e) Parse items via pipeline (AI preferred) — pass org_id & customer_phone
+      // e) Normalize the "from" into a phone (if possible)
+      //    Many senders arrive as contact names; this ensures orders.source_phone never stores a name.
+      const phoneNorm = normalizePhone(from || '') || null;
+      const customerName = phoneNorm ? null : (String(from || '').trim() || null);
+      console.log('[INGEST][phone]', { raw_from: from, phoneNorm, customerName });
+
+      // f) Parse via pipeline (AI preferred) — pass org_id & normalized customer_phone
       const parsed = await parsePipeline(String(text), {
         org_id: org.id,
-        customer_phone: from || undefined,
+        customer_phone: phoneNorm || undefined,
       });
 
-      // ───────────────
-      // STRICT STORE GATE (your requirement):
-      // ONLY store when:
-      //   1) used === 'ai'
-      //   2) is_order_like !== false
-      //   3) items.length > 0
-      // ───────────────
+      // Strict store gate
       if (parsed.used !== 'ai' || parsed.is_order_like === false || !parsed.items || parsed.items.length === 0) {
         console.log('[INGEST][SKIP] not_ai_or_not_order_like', {
           used: parsed.used,
@@ -260,7 +254,7 @@ ingest.post(
         reason: parsed.reason || '—',
       });
 
-      // f) Deduplicate
+      // g) Deduplicate
       const dedupeKey = makeDedupeKey(org.id, String(text), typeof ts === 'number' ? ts : undefined);
       const { data: existing, error: exErr } = await supa
         .from('orders')
@@ -274,18 +268,18 @@ ingest.post(
         return res.json({ ok: true, stored: false, reason: 'duplicate' });
       }
 
-      // g) Insert
+      // h) Insert order with normalized phone
       const { error: insErr } = await supa.from('orders').insert({
         org_id: org.id,
-        source_phone: from || null,
-        customer_name: null,
+        source_phone: phoneNorm,            // ✅ store only normalized phone (or null)
+        customer_name: customerName,        // ✅ if from was a name, store it here
         raw_text: text,
         items: parsed.items,
         status: 'pending',
         created_at: ts ? new Date(ts).toISOString() : undefined,
         dedupe_key: dedupeKey,
         parse_confidence: parsed.confidence ?? null,
-        parse_reason: parsed.reason ?? null, // keep natural string e.g. "Clear list with units"
+        parse_reason: parsed.reason ?? null,
       });
       if (insErr) throw insErr;
 
@@ -293,7 +287,6 @@ ingest.post(
       return res.json({ ok: true, stored: true, used: parsed.used });
     } catch (e: any) {
       console.error('[INGEST]', e?.message || e);
-      // Don’t cause client retries — respond 200 with ok:false
       return res.status(200).json({ ok: false });
     }
   }

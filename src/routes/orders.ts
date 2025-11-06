@@ -3,6 +3,7 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import { supa } from "../db";
 import { parseOrder as ruleParse } from "../parser";
+import resolvePhoneForOrder, { normalizePhone } from '../util/normalizePhone';
 
 export const orders = express.Router();
 
@@ -18,6 +19,10 @@ function normStatus(s?: string | null): OrderStatus | null {
   return STATUS_SET.has(v) ? (v as OrderStatus) : null;
 }
 
+const asStr = (v: any) => (typeof v === "string" ? v : v == null ? "" : String(v));
+const trim = (v: any) => asStr(v).trim();
+const nz = (v: any) => (v == null ? "" : String(v)); // not-null string ('' allowed for generic)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Optional AI parser (graceful fallback if not present or no OPENAI_API_KEY)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -26,7 +31,7 @@ let aiParseOrder:
   | ((
       text: string,
       catalog?: Array<{ name: string; sku: string; aliases?: string[] }>,
-      opts?: { org_id?: string }
+      opts?: { org_id?: string; customer_phone?: string }
     ) => Promise<{
       items: any[];
       confidence?: number;
@@ -85,8 +90,9 @@ orders.get("/", ensureAuth, async (req: any, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: parse pipeline (AI → rules) with HUMAN-READABLE reason preservation
+// Passes customer_phone so the parser can use customer-specific learnings.
 // ─────────────────────────────────────────────────────────────────────────────
-async function parsePipeline(text: string, org_id?: string): Promise<{
+async function parsePipeline(text: string, org_id?: string, customer_phone?: string): Promise<{
   items: any[];
   used: "ai" | "rules";
   confidence?: number | null;
@@ -97,8 +103,10 @@ async function parsePipeline(text: string, org_id?: string): Promise<{
 
   if (ENABLE_AI) {
     try {
-      // pass org_id so parser can load org-scoped dynamic few-shots
-      const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(raw, undefined, { org_id });
+      const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(raw, undefined, {
+        org_id,
+        customer_phone, // ← critical: enables per-customer learning at parse time
+      });
       if (ai && ai.is_order_like !== false && Array.isArray(ai.items) && ai.items.length > 0) {
         const r =
           typeof ai.reason === "string" && ai.reason.trim().length > 0
@@ -112,6 +120,7 @@ async function parsePipeline(text: string, org_id?: string): Promise<{
         };
       }
       // If AI says not order-like or no items, fall through to rules (caller still may reject)
+      console.log("[orders][parsePipeline] AI returned no items or not order-like; using rules.");
     } catch (e: any) {
       console.warn("[orders] AI parse failed, fallback to rules:", e?.message || e);
     }
@@ -146,11 +155,12 @@ orders.post("/", ensureAuth, async (req: any, res) => {
     let parse_confidence: number | null = null;
     let parse_reason: string | null = null;
 
+    const phoneNorm = normalizePhone(source_phone || "") || "";
+
     if (raw_text && String(raw_text).trim()) {
-      const parsed = await parsePipeline(String(raw_text), req.org_id);
+      const parsed = await parsePipeline(String(raw_text), req.org_id, phoneNorm);
       finalItems = parsed.items;
       parse_confidence = parsed.confidence ?? null;
-      // ✅ Preserve human-readable reason, do NOT overwrite with tags.
       parse_reason = parsed.reason ?? null;
     } else {
       finalItems = Array.isArray(items) ? items : [];
@@ -162,7 +172,7 @@ orders.post("/", ensureAuth, async (req: any, res) => {
 
     const insert = {
       org_id: req.org_id,
-      source_phone: source_phone || null,
+      source_phone: phoneNorm || null,   // ✅ never store a display name here
       customer_name: customer_name || null,
       raw_text: raw_text || null,
       items: finalItems,
@@ -215,8 +225,8 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
 // Effect:
 //   1) Logs into ai_corrections (for future learning)
 //   2) Updates orders.items + parse_reason = 'human_fix' (immediate UI reflect)
+//   3) Writes learnings to brand_variant_stats + customer_prefs (phone-based)
 // ─────────────────────────────────────────────────────────────────────────────
-// orders.post("/:id/ai-fix", ensureAuth, …)
 orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
   const { id } = req.params;
 
@@ -229,9 +239,6 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
     }
   }
 
-  const asStr = (v: any) => (typeof v === "string" ? v : v == null ? "" : String(v));
-  const trim = (v: any) => asStr(v).trim();
-
   const normalizedItems = Array.isArray(human_fixed?.items)
     ? human_fixed.items
         .map((it: any) => ({
@@ -242,6 +249,7 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
           unit: trim(it?.unit) || null,
           name: trim(it?.name || it?.canonical || ""),
           canonical: trim(it?.canonical) || null,
+          // keep nulls here for order storage; we'll normalize to '' only for learning writes
           brand: trim(it?.brand) || null,
           variant: trim(it?.variant) || null,
           notes: trim(it?.notes) || null,
@@ -273,7 +281,6 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
       (order.raw_text && String(order.raw_text)) ||
       ((order.items || []).map((i: any) => i?.name || i?.canonical || "").join(", ")) ||
       "";
-
     const model_output = order.items || [];
 
     const { error: e2 } = await supa.from("ai_corrections").insert({
@@ -317,9 +324,7 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
                 brand: it.brand || null,
                 variant: it.variant || null,
               },
-              {
-                onConflict: "org_id,term",
-              }
+              { onConflict: "org_id,term" }
             );
         } catch (aliasErr: any) {
           console.warn("alias upsert warn:", aliasErr?.message || aliasErr);
@@ -341,31 +346,37 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
       .single();
     if (e3) throw e3;
 
-    // 3) ✅ **LEARNING FROM HUMAN FIX** (your requested logic)
+    // 3) ✅ **LEARNING FROM HUMAN FIX** (phone-based; '' for generic)
     try {
-      const phone = order.source_phone || null;
-
+      const phone = trim(order.source_phone || "");
       for (const it of normalizedItems) {
-        const canon = (it.canonical || it.name || '').trim();
+        const canon = trim(it.canonical || it.name || "");
         if (!canon) continue;
 
-        await supa.rpc('upsert_bvs', {
+        const brand = nz(it.brand);     // '' allowed (generic)
+        const variant = nz(it.variant); // '' allowed (generic)
+
+        const { error: ebvs } = await supa.rpc("upsert_bvs", {
           p_org_id: order.org_id,
           p_canonical: canon,
-          p_brand: it.brand ?? null,
-          p_variant: it.variant ?? null,
-          p_inc: 1
+          p_brand: brand,
+          p_variant: variant,
+          p_inc: 1,
         });
+        if (ebvs) console.warn("[ai-fix][bvs][ERR]", ebvs.message);
 
         if (phone) {
-          await supa.rpc('upsert_customer_pref', {
+          const { error: ecp } = await supa.rpc("upsert_customer_pref", {
             p_org_id: order.org_id,
             p_phone: phone,
             p_canonical: canon,
-            p_brand: it.brand ?? null,
-            p_variant: it.variant ?? null,
-            p_inc: 1
+            p_brand: brand,
+            p_variant: variant,
+            p_inc: 1,
           });
+          if (ecp) console.warn("[ai-fix][customer_pref][ERR]", ecp.message);
+        } else {
+          console.warn("[ai-fix][customer_pref][SKIP] missing phone");
         }
       }
     } catch (e) {
