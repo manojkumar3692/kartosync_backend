@@ -7,6 +7,7 @@ import resolvePhoneForOrder, { normalizePhone } from '../util/normalizePhone';
 export const clarify = express.Router();
 
 const SECRET = process.env.CLARIFY_SECRET || '';
+const CLARIFY_MAX_OPTIONS = Number(process.env.CLARIFY_MAX_OPTIONS || 5);
 const HTML_CSP =
   "default-src 'self' https://cdn.tailwindcss.com; style-src 'unsafe-inline' https://cdn.tailwindcss.com;";
 
@@ -16,6 +17,52 @@ const plainMsg = (msg: string) =>
   `<!doctype html><meta charset="utf-8"><div style="font:14px system-ui;padding:24px">${escapeHtml(msg)}</div>`;
 const trim = (v: any) => (typeof v === 'string' ? v.trim() : v == null ? '' : String(v).trim());
 const nz = (v: any) => (v == null ? '' : String(v)); // '' allowed for generic
+
+type ClarifyOption = {
+  label: string;
+  canonical: string;
+  brand?: string | null;
+  variant?: string | null;
+  unit?: string | null;
+  rec?: boolean;     // recommended flag (optional in token; we normalize below)
+  score?: number;    // optional score (if upstream added one)
+};
+
+/** Normalize options for both GET and POST (dedupe, rank, cap, ensure single rec) */
+function processOptions(input: ClarifyOption[] = []): ClarifyOption[] {
+  // 1) De-dupe by canonical+brand+variant+unit (case-insensitive)
+  const seen = new Set<string>();
+  const uniq = input.filter((o) => {
+    const k = [
+      (o.canonical || '').toLowerCase(),
+      (o.brand || '').toLowerCase(),
+      (o.variant || '').toLowerCase(),
+      (o.unit || '').toLowerCase(),
+    ].join('|');
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  // 2) Sort by score desc if present, otherwise keep original order
+  const ranked = uniq.slice().sort((a, b) => {
+    const sa = typeof a.score === 'number' ? a.score! : 0;
+    const sb = typeof b.score === 'number' ? b.score! : 0;
+    return sb - sa;
+  });
+
+  // 3) Cap to max N
+  let top = ranked.slice(0, Math.max(1, CLARIFY_MAX_OPTIONS));
+
+  // 4) Ensure exactly one `rec`:
+  //    - prefer the first that already has rec=true
+  //    - else mark index 0
+  const existingIdx = top.findIndex((o) => !!o.rec);
+  const recIdx = existingIdx >= 0 ? existingIdx : 0;
+  top = top.map((o, i) => ({ ...o, rec: i === recIdx }));
+
+  return top;
+}
 
 // -------------- HTML page --------------
 clarify.get('/c/:token', async (req, res) => {
@@ -33,6 +80,9 @@ clarify.get('/c/:token', async (req, res) => {
   const askVariant = !!payload.ask?.variant;
   const allowOther = payload.allow_other !== false;
 
+  // Normalize options here for consistent rendering & indices
+  const options: ClarifyOption[] = processOptions(payload.options || []);
+
   res.setHeader('Content-Security-Policy', HTML_CSP);
   res.send(`<!doctype html>
 <html lang="en">
@@ -46,7 +96,7 @@ clarify.get('/c/:token', async (req, res) => {
       <div class="text-lg font-semibold">Help us confirm your item</div>
       <p class="text-sm text-gray-600 mt-1">Please tap the exact option below:</p>
       <div class="mt-4 grid gap-2">
-        ${payload.options
+        ${options
           .map(
             (opt: any, i: number) => `
           <form method="post" action="/api/clarify" class="contents">
@@ -58,7 +108,7 @@ clarify.get('/c/:token', async (req, res) => {
                 ${opt.rec ? '<span class="text-[10px] rounded-full bg-emerald-100 text-emerald-700 px-2 py-0.5">Recommended</span>' : ''}
               </div>
               <div class="text-xs text-gray-500">${escapeHtml(
-                [opt.canonical, opt.brand, opt.variant].filter(Boolean).join(' · ')
+                [opt.canonical, opt.brand, opt.variant, opt.unit].filter(Boolean).join(' · ')
               )}</div>
             </button>
           </form>`
@@ -107,11 +157,11 @@ clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req
       return res.status(400).send(plainMsg('Link expired or invalid. Please request a new link.'));
     }
 
-    const { org_id, order_id, line_index, options } = payload as {
+    const { org_id, order_id, line_index } = payload as {
       org_id: string;
       order_id: string;
       line_index: number;
-      options: Array<{ label: string; canonical: string; brand?: string | null; variant?: string | null }>;
+      options: ClarifyOption[];
       ask?: { brand?: boolean; variant?: boolean };
       source_phone?: string | null;   // ← may be present from token
       customer_name?: string | null;  // ← optional
@@ -119,6 +169,9 @@ clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req
 
     const askBrand = !!payload.ask?.brand;
     const askVariant = !!payload.ask?.variant;
+
+    // IMPORTANT: normalize the same way as GET to keep indices aligned
+    const options: ClarifyOption[] = processOptions((payload as any).options || []);
 
     // Idempotency hint
     try {
@@ -133,7 +186,7 @@ clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req
     } catch (_) {}
 
     // Resolve selection
-    let selected: { label: string; canonical: string; brand?: string | null; variant?: string | null } | null = null;
+    let selected: ClarifyOption | null = null;
 
     if (!Number.isNaN(choice) && choice >= 0 && choice < options.length) {
       selected = options[choice];
@@ -204,11 +257,11 @@ clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req
     // ── Learning writes
     try {
       // Prefer phone embedded in token, else resolver fallback
-      const tokenPhone = normalizePhone((payload as any)?.source_phone || "");
+      const tokenPhone = normalizePhone((payload as any)?.source_phone || '');
       const phone =
         tokenPhone ||
         (await resolvePhoneForOrder(org_id, order_id, order.customer_name)) ||
-        "";
+        '';
 
       const canon = trim(selected!.canonical || line.canonical || line.name || '');
       const brand = nz(selected!.brand ?? (askBrand ? '' : line.brand ?? ''));

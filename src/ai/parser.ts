@@ -53,8 +53,10 @@ const SYSTEM = [
   "You are a precise order parser for WhatsApp messages.",
   "Extract items and quantities from short, messy text.",
   "Always return valid JSON in the requested schema.",
-  "Be conservative: greetings like 'hi/thanks/ok' → is_order_like=false and items=[].",
-  "Infer sensible units when implied (e.g., '2 milk' → unit:'pack' in India).",
+  "If the message asks for price or availability, set is_order_like=false, extract items (if any), and explain in reason (e.g., 'inquiry:price').",
+  "Do not let greetings like 'hi/thanks/ok' suppress an item list if the text includes a multi-line list or a comma-separated list of products.",
+  "Default missing qty to 1 ONLY when a list pattern strongly implies an order (multi-line list with an order intent or comma-separated with intent).",
+  "Infer sensible units only when obvious (e.g., '2 milk' → unit:'pack' in India/UAE).",
   "Normalize canonical names when obvious (e.g., 'tata salt' → 'Salt').",
   "Extract brand and variant if user mentions them (e.g., 'Almarai' or 'Full Fat'/'1L'). If absent, leave null—do not invent.",
   "Do not invent items. Keep outputs minimal and consistent.",
@@ -112,6 +114,26 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
     },
   },
   {
+    user: "hi what's the price of onion?",
+    assistant: {
+      items: [
+        {
+          name: "onion",
+          qty: null,
+          unit: null,
+          notes: null,
+          canonical: "Onion",
+          category: "grocery",
+          brand: null,
+          variant: null,
+        },
+      ],
+      confidence: 0.8,
+      reason: "inquiry:price",
+      is_order_like: false,
+    },
+  },
+  {
     user: "hi",
     assistant: {
       items: [],
@@ -123,36 +145,106 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pre-normalization helpers (tiny synonyms to keep cost low)
+// ─────────────────────────────────────────────────────────────────────────────
+const VERB_SYNONYMS: Record<string, string> = {
+  snd: "send",
+  pls: "please",
+  plz: "please",
+  "gn aap": "please",
+  "need to": "need",
+  book: "order",
+  keep: "send",
+  bring: "send",
+};
+
+// Replace the whole UNIT_SYNONYMS block with this:
+const UNIT_SYNONYMS: Record<string, string> = {
+  litre: "l",
+  liter: "l",
+  ltr: "l",
+  lt: "l",
+  pk: "pack",
+  pkt: "pack",
+  packet: "pack",
+  piece: "pc",
+  pieces: "pc",
+  pcs: "pc",
+  gms: "g",
+  kgs: "kg",
+  kilo: "kg",
+  kilos: "kg",
+};
+
+const WORD_NORMALIZE: Array<[RegExp, string]> = [
+  [/crossaints?/gi, "croissants"],
+  [/cholatey/gi, "chocolate"],
+  [/chapathi|chapati|chappathi/gi, "chapati"],
+  [/idly/gi, "idli"],
+  [/tooth\s*brush/gi, "toothbrush"],
+  [/david\s*off/gi, "davidoff"],
+];
+
+function normalizeLight(text: string): string {
+  let s = text;
+  s = s.replace(/\bgm(s)?\b/gi, "g");
+s = s.replace(/\bkg(s)?\b/gi, "kg");
+  // verbs
+  for (const [k, v] of Object.entries(VERB_SYNONYMS)) {
+    const re = new RegExp(`\\b${k}\\b`, "gi");
+    s = s.replace(re, v);
+  }
+  // units
+  for (const [k, v] of Object.entries(UNIT_SYNONYMS)) {
+    const re = new RegExp(`\\b${k}\\b`, "gi");
+    s = s.replace(re, v);
+  }
+  // common misspellings
+  for (const [re, rep] of WORD_NORMALIZE) s = s.replace(re, rep);
+
+  // soften trailing closers that confuse intent
+  s = s.replace(/\b(that'?s it|that's all|done)\.?$/i, "").trim();
+  return s;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Brand / Variant micro-helpers (cheap heuristics before/after AI)
 // ─────────────────────────────────────────────────────────────────────────────
 const BRAND_HINTS: Record<string, string[]> = {
-  // canonical -> likely brands
   milk: ["almarai", "al rawabi", "al ain", "amul"],
   coke: ["coca cola", "coke", "coca-cola"],
   pepsi: ["pepsi"],
   salt: ["tata", "aashirvaad", "catch"],
+  coffee: ["davidoff", "nescafe", "bru", "starbucks"],
+  "coffee powder": ["davidoff", "nescafe", "bru"],
+  shampoo: ["pantene", "dove", "sunsilk", "head & shoulders", "clinic plus"],
+  "sanitary pads": ["whisper", "stayfree", "sofy"],
 };
 
 const VARIANT_PATTERNS: Array<{ re: RegExp; norm: string | ((m: RegExpExecArray) => string) }> = [
   { re: /(full\s*fat)/i, norm: "Full Fat" },
   { re: /(low\s*fat|lite|light)/i, norm: "Low Fat" },
   { re: /(skim|double\s*toned)/i, norm: "Skim" },
-  { re: /\b(\d+(?:\.\d+)?)\s*(l|ltr|litre|liter)\b/i, norm: (m) => `${m[1]}L` },
+  { re: /\b(gold|classic|espresso|hazelnut)\b/i, norm: (m) => titleCase(m[1]) },
+  { re: /\b(\d+(?:\.\d+)?)\s*(l)\b/i, norm: (m) => `${m[1]}L` },
   { re: /\b(\d+)\s*ml\b/i, norm: (m) => `${m[1]}ml` },
   { re: /\b(\d+)\s*(g|kg)\b/i, norm: (m) => `${m[1]}${String(m[2]).toUpperCase()}` },
 ];
+
+function titleCase(s: string) {
+  return (s || "").replace(/\b\w/g, (c) => c.toUpperCase());
+}
 
 function detectBrand(base: string, canonical?: string | null): string | null {
   const t = base.toLowerCase();
   const key = (canonical || "").toLowerCase();
   const pool = [
     ...(BRAND_HINTS[key] || []),
-    ...(BRAND_HINTS["milk"] || []),
+    ...(key !== "milk" ? BRAND_HINTS["milk"] || [] : []),
+    ...(BRAND_HINTS["coffee"] || []),
   ];
   for (const b of pool) {
-    if (t.includes(b)) {
-      return b.replace(/\b\w/g, (c) => c.toUpperCase()); // naive title case
-    }
+    if (t.includes(b)) return titleCase(b);
   }
   return null;
 }
@@ -166,9 +258,35 @@ function detectVariant(base: string): string | null {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// List heuristics (bias away from false 'greeting')
+// ─────────────────────────────────────────────────────────────────────────────
+function hasOrderIntentVerb(t: string): boolean {
+  return /\b(send|need|want|order|buy|deliver|give|bring|pack|take|place|can you send)\b/i.test(t);
+}
+function hasUnitOrQty(t: string): boolean {
+  return /\b(\d+(\.\d+)?)\s?(kg|g|l|ml|pack|pc|pcs|dozen)\b/i.test(t) || /\b\d+\b/.test(t);
+}
+function isMultiLineProducty(t: string): boolean {
+  const lines = t.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length < 2) return false;
+  let productish = 0;
+  for (const l of lines) {
+    // at least two word tokens or a qty/unit
+    const tokens = l.split(/[^a-z0-9+]+/i).filter(Boolean);
+    if (tokens.length >= 2 || hasUnitOrQty(l)) productish++;
+  }
+  return productish >= 2; // two producty lines → looks like a list
+}
+function isCommaListWithIntent(t: string): boolean {
+  const looksCommaList = /[,•·]/.test(t) && /[a-z]/i.test(t);
+  return looksCommaList && hasOrderIntentVerb(t);
+}
+
 function isGreetingOrNoise(text: string): boolean {
   const t = trimStr(text).toLowerCase();
   if (!t) return true;
+  // If it looks like a list, do NOT treat as noise.
+  if (isMultiLineProducty(t) || isCommaListWithIntent(t)) return false;
   return /^(hi|hello|hlo|thanks|thank you|ok|k|👍|🙏|good (morning|night|evening)|done|received)\b/.test(
     t
   );
@@ -238,6 +356,21 @@ function applyMicroHeuristics(
       it.brand = it.brand ?? "Amul";
     }
 
+    // light canonical nudges (safe)
+    if (!it.canonical) {
+      if (/ice\s*cream/i.test(baseName)) it.canonical = "Ice Cream";
+      else if (/croissants?/i.test(baseName)) it.canonical = "Croissant";
+      else if (/mustard\s*seeds?/i.test(baseName)) it.canonical = "Mustard Seeds";
+      else if (/fenugreek\s*seeds?/i.test(baseName)) it.canonical = "Fenugreek Seeds";
+      else if (/tooth\s*brush/i.test(baseName)) it.canonical = "Toothbrush";
+      else if (/sanitary\s*pads?/i.test(baseName)) it.canonical = "Sanitary Pads";
+      else if (/coffee\s*powder/i.test(baseName)) it.canonical = "Coffee Powder";
+      else if (/pop\s*corn/i.test(baseName)) it.canonical = "Popcorn";
+      else if (/shampoo/i.test(baseName)) it.canonical = "Shampoo";
+      else if (/idli|idly/i.test(baseName)) it.canonical = "Idli Batter";
+      else if (/chapati|chapati|chapathi/i.test(baseName)) it.canonical = "Chapati";
+    }
+
     // NEW: cheap brand + variant detection from raw text
     if (!it.brand) it.brand = detectBrand(baseName, it.canonical);
     if (!it.variant) {
@@ -253,8 +386,6 @@ function emptyResult(reason: string): ParseResult {
   return { items: [], confidence: 0, reason, is_order_like: false };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 3) Learning-boost helper (customer_prefs + brand_variant_stats)
 // ─────────────────────────────────────────────────────────────────────────────
 async function buildLearningsBoost(args: {
   org_id?: string;
@@ -368,17 +499,60 @@ async function buildLearningsBoost(args: {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4) MAIN: aiParseOrder  (supports org-scoped dynamic few-shots + learnings)
+// 4) Post-AI fallback: split comma lists if model fused items
+// ─────────────────────────────────────────────────────────────────────────────
+function postSplitCommaList(raw: string, parsed: ParseResult): ParseResult {
+  const t = raw.toLowerCase();
+  const looksComma = /[,•·]/.test(t);
+  const hasIntent = hasOrderIntentVerb(t);
+  if (!looksComma || !hasIntent) return parsed;
+
+  if (parsed.items.length <= 1) {
+    // naive split by comma bullets; keep small tokens
+    const parts = raw
+      .split(/[,\u2022\u00B7]/) // comma or common bullets
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (parts.length >= 2) {
+      const items = parts.map((p) => ({
+        name: p,
+        qty: 1,
+        unit: null,
+        notes: null,
+        canonical: null,
+        category: null,
+        brand: detectBrand(p, null),
+        variant: detectVariant(p),
+      }));
+      return {
+        items: applyMicroHeuristics(items as any),
+        confidence: Math.max(parsed.confidence ?? 0.5, 0.7),
+        reason: (parsed.reason ? parsed.reason + "; " : "") + "post_split_comma_list",
+        is_order_like: true,
+      };
+    }
+  }
+  return parsed;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5) MAIN: aiParseOrder  (supports org-scoped dynamic few-shots + learnings)
 // ─────────────────────────────────────────────────────────────────────────────
 export async function aiParseOrder(
   text: string,
   catalog?: Array<{ name: string; sku: string; aliases?: string[] }>,
   opts?: { org_id?: string; customer_phone?: string } // ← extended
 ): Promise<ParseResult> {
-  const raw = trimStr(text);
+  // Pre-normalize cheap synonyms (no cost)
+  const raw0 = trimStr(text);
+  const raw = normalizeLight(raw0);
   if (!raw) return emptyResult("empty");
 
+  // Nudge: only drop as greeting/noise if it does NOT look like a product list
   if (isGreetingOrNoise(raw)) return emptyResult("greeting_or_noise");
+
+  // Bias: verb-lite multi-line lists are likely orders (qty=1 default downstream if needed)
+  const listBias = isMultiLineProducty(raw) || isCommaListWithIntent(raw);
 
   // Baseline (free) parse first — coerce & heuristics
   const baselineItemsRaw = ruleParse(raw) || [];
@@ -397,8 +571,15 @@ export async function aiParseOrder(
     items: baselineHeur,
     confidence: baselineHeur.length ? 0.6 : 0.3,
     reason: baselineHeur.length ? "rule_based" : "rule_based_empty",
-    is_order_like: baselineHeur.length > 0,
+    is_order_like: baselineHeur.length > 0 || listBias, // honor list bias
   };
+
+  // If we have a strong list bias but no qty, set qty=1 for each line item (cheap default)
+  if (listBias && baseline.items.length > 0) {
+    baseline.items = baseline.items.map((it) => ({ ...it, qty: it.qty ?? 1 }));
+    baseline.reason = (baseline.reason ? baseline.reason + "; " : "") + "list_bias_qty1";
+    baseline.confidence = Math.max(baseline.confidence, 0.7);
+  }
 
   if (!ENABLE_AI) {
     console.warn("[AI$ DISABLED] OPENAI_API_KEY not set; returning baseline only.", {
@@ -406,12 +587,12 @@ export async function aiParseOrder(
       org_id: opts?.org_id || null,
       customer_phone: opts?.customer_phone || null,
     });
-    return baseline;
+    return postSplitCommaList(raw, baseline);
   }
 
   // ── Budget PRE-CHECK ───────────────────────────────────────────────────────
   const approxUSD = estimateCostUSDApprox(
-    { prompt_tokens: 150, completion_tokens: 200 },
+    { prompt_tokens: 160, completion_tokens: 220 },
     MODEL
   );
 
@@ -423,7 +604,7 @@ export async function aiParseOrder(
       org_id: opts?.org_id || null,
       customer_phone: opts?.customer_phone || null,
     });
-    return baseline;
+    return postSplitCommaList(raw, baseline);
   }
   // Visibility: planned cost
   console.log("[AI$ PLAN]", {
@@ -445,7 +626,7 @@ export async function aiParseOrder(
       org_id: opts?.org_id || null,
       customer_phone: opts?.customer_phone || null,
     });
-    return baseline;
+    return postSplitCommaList(raw, baseline);
   }
   if (typeof canSpend === "object" && (canSpend as any).today !== undefined) {
     console.log(
@@ -516,7 +697,7 @@ export async function aiParseOrder(
     // Build a short learnings booster (per-customer + org-popular)
     let learningBoost = "";
     try {
-      const baselineCanonicals = (baselineHeur || [])
+      const baselineCanonicals = (baseline.items || [])
         .map((it) => (it?.canonical || it?.name || "").trim())
         .filter(Boolean);
       learningBoost = await buildLearningsBoost({
@@ -552,7 +733,24 @@ export async function aiParseOrder(
         { role: "assistant", content: JSON.stringify(s.assistant) },
       ]),
       ...(learningBoost ? [{ role: "system", content: learningBoost }] : []),
-      { role: "user", content: JSON.stringify({ raw, baseline }) },
+      {
+        role: "user",
+        content: JSON.stringify({
+          raw,
+          baseline: {
+            ...baseline,
+            // keep compact for token cost
+            items: baseline.items.map((i) => ({
+              name: i.name,
+              qty: i.qty,
+              unit: i.unit,
+              brand: i.brand,
+              variant: i.variant,
+              canonical: i.canonical,
+            })),
+          },
+        }),
+      },
     ];
 
     const resp = await client.chat.completions.create({
@@ -592,7 +790,6 @@ export async function aiParseOrder(
         cost.toFixed(4)
       );
     }
-    // Always emit a compact summary line (even if cost is 0 / usage missing)
     console.log("[AI$ USED]", {
       model: MODEL,
       prompt_tokens: usage?.prompt_tokens ?? 0,
@@ -602,26 +799,6 @@ export async function aiParseOrder(
       customer_phone: opts?.customer_phone || null,
     });
 
-    // Optional DB log (safe-noop if table not present) — include org_id
-    if (usage) {
-      try {
-        const { error } = await supa.from("ai_usage_log").insert({
-          org_id: opts?.org_id ?? null,
-          model: MODEL,
-          prompt_tokens: usage?.prompt_tokens ?? 0,
-          completion_tokens: usage?.completion_tokens ?? 0,
-          total_tokens:
-            usage?.total_tokens ??
-            (usage?.prompt_tokens || 0) + (usage?.completion_tokens || 0),
-          cost_usd: cost,
-          created_at: new Date().toISOString(),
-        });
-        if (error) console.warn("[AI log error]", error.message);
-      } catch (e) {
-        console.warn("[AI log insert fail]", e);
-      }
-    }
-
     const content = resp.choices?.[0]?.message?.content || "{}";
     let parsed: ParseResult;
 
@@ -629,7 +806,7 @@ export async function aiParseOrder(
       parsed = ParseResultSchema.parse(JSON.parse(content));
     } catch {
       console.warn("[AI$ SKIP post] model returned non-JSON → using baseline. reason:", baseline.reason);
-      return baseline;
+      return postSplitCommaList(raw, baseline);
     }
 
     // Normalize items further (null-safe)
@@ -638,29 +815,23 @@ export async function aiParseOrder(
     // ✅ Preserve model-provided reason; only add fallback if missing/blank
     const aiReason = trimStr(parsed.reason);
     if (!aiReason) {
-      parsed.reason = baselineHeur.length ? "refined_from_rules" : "items_detected";
+      parsed.reason = baseline.items.length ? "refined_from_rules" : "items_detected";
     } else {
       parsed.reason = aiReason;
     }
 
-    // If model says it's not an order, keep that decision
+    // If model says it's not an order (or empty items), we still allow inquiry downstream.
     if (!parsed.is_order_like || parsed.items.length === 0) {
-      console.log("[AI$ RESULT] is_order_like=false or no items → not storing; reason:", parsed.reason);
       return { ...parsed, items: [], is_order_like: false };
     }
 
-    console.log(
-      "[AI used]",
-      MODEL,
-      "items:",
-      parsed.items?.length ?? 0,
-      "reason:",
-      parsed.reason
-    );
+    // Post-split comma list if the model fused them
+    parsed = postSplitCommaList(raw, parsed);
+
     return parsed;
   } catch (e: any) {
     console.error("[AI parse] error:", e?.message || e);
     console.log("[AI SKIPPED → RULES]", { reason: baseline.reason });
-    return baseline;
+    return postSplitCommaList(raw, baseline);
   }
 }
