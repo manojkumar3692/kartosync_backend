@@ -1096,12 +1096,13 @@ export async function ingestCoreFromMessage(
     // ─────────────────────────────────────────────────────────
     const phonePlain = String(phoneNorm || "").replace(/^\+/, "");
     const { data: lastRowsAny } = await supa
-      .from("orders")
-      .select("id, status, created_at")
-      .eq("org_id", orgId)
-      .or(`source_phone.eq.${phonePlain},source_phone.eq.+${phonePlain}`)
-      .order("created_at", { ascending: false })
-      .limit(1);
+    .from("orders")
+    .select("id, status, created_at")
+    .eq("org_id", orgId)
+    .or(`source_phone.eq.${phonePlain},source_phone.eq.+${phonePlain}`)
+    .not("status", "in", ["cancelled_by_customer", "archived_for_new"])
+    .order("created_at", { ascending: false })
+    .limit(1);
 
     const lastAny = lastRowsAny?.[0] || null;
 
