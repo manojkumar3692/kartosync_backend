@@ -2,7 +2,6 @@
 import { supa } from "../db";
 import { parseOrder } from "../parser";
 import { detectInquiry } from "../util/inquiry";
-import { DateTime } from "luxon";
 import {
   isObviousPromoOrSpam,
   isPureGreetingOrAck,
@@ -10,11 +9,11 @@ import {
 } from "../util/notOrder";
 
 import { IngestInput, IngestResult, IngestSource, IngestItem } from "../types";
+import { decideLinking } from "./ingestCore/linking"; // ⬅️ linking decision (append vs new)
 
-/**
- * Shared AI parser hook (optional).
- * Safe if missing: we fallback to rules-only.
- */
+// ─────────────────────────────────────────────────────────
+// Optional AI parser hook (safe if missing → rules fallback)
+// ─────────────────────────────────────────────────────────
 let aiParseOrder:
   | undefined
   | ((
@@ -42,68 +41,6 @@ try {
   console.warn("[AI][wire][core] load fail:", (e as any)?.message || e);
   aiParseOrder = undefined;
 }
-
-/** ───────────────── Types ───────────────── **/
-
-// export type IngestSource = 'local_bridge' | 'waba' | 'test' | 'other';
-
-// export type IngestInput = {
-//   org_id: string; // already resolved org.id
-//   text: string; // raw incoming text
-//   ts?: number; // ms timestamp (optional)
-//   from_phone?: string | null;
-//   from_name?: string | null;
-//   msg_id?: string | null; // stable per message if available
-//   edited_at?: number | null; // ms if edited
-//   source?: IngestSource;
-// };
-
-// export type IngestResult =
-//   | {
-//       ok: true;
-//       stored: true;
-//       kind: 'order';
-//       used: 'ai' | 'rules';
-//       order_id: string;
-//       reason?: string | null;
-//       merged_into?: string;
-//       edited_order_id?: string;
-//     }
-//   | {
-//       ok: true;
-//       stored: true;
-//       kind: 'inquiry';
-//       used: 'inquiry';
-//       order_id: string;
-//       inquiry: string;
-//       reason?: string | null;
-//     }
-//   | {
-//       ok: true;
-//       stored: false;
-//       kind: 'none';
-//       used?: 'ai' | 'rules' | 'inquiry' | 'none';
-//       reason:
-//         | 'org_not_found'
-//         | 'dropped:promo_spam'
-//         | 'dropped:greeting_ack'
-//         | 'small_talk_or_non_order'
-//         | 'skipped_by_gate'
-//         | 'duplicate'
-//         | 'duplicate_msgid'
-//         | 'awaiting_explicit_confirmation'
-//         | 'seller_money_message'
-//         | 'duplicate-inquiry-msgid'
-//         | 'duplicate-order-msgid';
-//       order_id?: string;
-//     }
-//   | {
-//       ok: false;
-//       stored: false;
-//       kind: 'none';
-//       reason?: string;
-//       error?: string;
-//     };
 
 /** ───────────────── helpers ───────────────── **/
 
@@ -292,13 +229,6 @@ function fallbackQtyItems(text: string): IngestItem[] {
 /** ───────────────── Session + gating utilities ───────────────── **/
 
 const INQUIRY_WINDOW_MIN = Number(process.env.INQUIRY_WINDOW_MIN || 1440); // 24h
-const MERGE_WINDOW_MIN = Number(process.env.MERGE_WINDOW_MIN || 90); // 90m
-const ALLOW_DAY_CLUBBING =
-  String(process.env.ALLOW_DAY_CLUBBING || "true") === "true";
-const TIMEZONE = process.env.TIMEZONE || "Asia/Dubai";
-const CUT_OFF_LOCAL = (process.env.CUT_OFF_LOCAL || "18:00")
-  .split(":")
-  .map((n) => Number(n));
 
 function isLikelyPromoOrSpam(text: string) {
   if (isObviousPromoOrSpam(text)) return true;
@@ -342,55 +272,6 @@ async function findRecentInquiry(
       .toLowerCase()
       .startsWith("inq:")
   );
-}
-
-function sameLocalDay(aISO: string, bISO: string, zone: string) {
-  const a = DateTime.fromISO(aISO, { zone });
-  const b = DateTime.fromISO(bISO, { zone });
-  return a.year === b.year && a.month === b.month && a.day === b.day;
-}
-
-async function pickMergeTarget(orgId: string, phone: string | null) {
-  if (!phone) return null;
-  const { data, error } = await supa
-    .from("orders")
-    .select("id, status, created_at")
-    .eq("org_id", orgId)
-    .eq("source_phone", phone)
-    .order("created_at", { ascending: false })
-    .limit(1);
-  if (error) {
-    console.warn("[INGEST][pickMergeTarget]", error.message);
-    return null;
-  }
-  const o = data?.[0];
-  if (!o) return null;
-  if (o.status === "shipped" || o.status === "paid") return null;
-
-  const now = new Date();
-  const created = new Date(o.created_at);
-  const deltaMin = (now.getTime() - created.getTime()) / 60000;
-
-  if (deltaMin <= MERGE_WINDOW_MIN) return o;
-
-  if (ALLOW_DAY_CLUBBING) {
-    const zone = TIMEZONE;
-    const nowL = DateTime.fromJSDate(now, { zone });
-    const cutoffL = DateTime.fromObject(
-      {
-        year: nowL.year,
-        month: nowL.month,
-        day: nowL.day,
-        hour: CUT_OFF_LOCAL[0] || 18,
-        minute: CUT_OFF_LOCAL[1] || 0,
-      },
-      { zone }
-    );
-    if (sameLocalDay(o.created_at, now.toISOString(), zone) && nowL < cutoffL)
-      return o;
-  }
-
-  return null;
 }
 
 async function findOrderByMsgId(
@@ -453,6 +334,157 @@ async function existsOrderByMsgId(msgId: string) {
   } catch (e: any) {
     console.warn("[INGEST][existsOrderByMsgId]", e?.message || e);
     return null;
+  }
+}
+
+/** ───────────────── SMART ENRICH & CLARIFY ─────────────────
+ *  1) enrichWithPrefs: BEFORE clarify — hydrate brand/variant
+ *  2) maybeAutoSendClarify: AFTER storing — only for WABA
+ *  These are small + safe. Skipped if tables/env not present.
+ *  Where to call:
+ *    - enrichWithPrefs → just after we know it's an ORDER (items exist),
+ *      before append/new decision.
+ *    - maybeAutoSendClarify → after APPEND and after NEW INSERT.
+ *  ───────────────────────────────────────────────────────── */
+
+function blank(v?: string | null) {
+  return !v || !String(v).trim();
+}
+
+function itemNeedsClarify(it: any) {
+  return blank(it?.brand) || blank(it?.variant);
+}
+
+async function enrichWithPrefs(
+  orgId: string,
+  phone: string | null,
+  items: any[]
+): Promise<{ items: any[]; applied: number }> {
+  const out: any[] = [];
+  let applied = 0;
+
+  for (const it of items || []) {
+    const base = { ...it };
+    const canon = (base.canonical || base.name || "").trim();
+    if (!canon) {
+      out.push(base);
+      continue;
+    }
+
+    let brandPref: string | null = null;
+    let variantPref: string | null = null;
+
+    // 1) per-customer pref (phone normalized w/o '+')
+    if (phone) {
+      const phonePlain = String(phone).replace(/^\+/, "");
+      try {
+        const { data: cp } = await supa
+          .from("customer_prefs")
+          .select("brand, variant, score")
+          .eq("org_id", orgId)
+          .eq("phone", phonePlain)
+          .eq("canonical", canon)
+          .order("score", { ascending: false })
+          .limit(1);
+        if (cp && cp[0]) {
+          brandPref = (cp[0].brand || "").trim() || null;
+          variantPref = (cp[0].variant || "").trim() || null;
+        }
+      } catch {}
+    }
+
+    // 2) global default (most common) if still missing
+    if (!brandPref || !variantPref) {
+      try {
+        const { data: bvs } = await supa
+          .from("brand_variant_stats")
+          .select("brand, variant, score")
+          .eq("org_id", orgId)
+          .eq("canonical", canon)
+          .order("score", { ascending: false })
+          .limit(1);
+        if (bvs && bvs[0]) {
+          brandPref = brandPref || ((bvs[0].brand || "").trim() || null);
+          variantPref = variantPref || ((bvs[0].variant || "").trim() || null);
+        }
+      } catch {}
+    }
+
+    // Apply only when missing—never override explicit inputs
+    const hadBrand = (base.brand || "").trim() || null;
+    const hadVar = (base.variant || "").trim() || null;
+    if (!hadBrand && brandPref) {
+      base.brand = brandPref;
+      applied++;
+    }
+    if (!hadVar && variantPref) {
+      base.variant = variantPref;
+      applied++;
+    }
+
+    out.push(base);
+  }
+
+  return { items: out, applied };
+}
+
+async function maybeAutoSendClarify(
+  orgId: string,
+  orderId: string,
+  source: IngestSource
+) {
+  try {
+    // Only WABA should auto-send clarify (avoid spamming via personal WA)
+    if (String(source) !== "waba") return;
+
+    // debounce in last 15m
+    const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    try {
+      const { data: already } = await supa
+        .from("outbound_logs")
+        .select("id")
+        .eq("org_id", orgId)
+        .eq("order_id", orderId)
+        .eq("kind", "clarify_bundle")
+        .gte("created_at", fifteenMinAgo)
+        .limit(1);
+      if (already && already[0]) return;
+    } catch {}
+
+    const { data: order } = await supa
+      .from("orders")
+      .select("id, items, source_phone, customer_name, status, created_at")
+      .eq("org_id", orgId)
+      .eq("id", orderId)
+      .single();
+
+    if (!order || !Array.isArray(order.items)) return;
+    if (!order.items.some(itemNeedsClarify)) return;
+    if (!order.source_phone) return;
+
+    // Build clarify text using your existing clarify-prompt endpoint (internal)
+    if (!process.env.BASE_URL || !process.env.INTERNAL_JWT) return;
+    // @ts-ignore (Node 18+ global fetch; otherwise skip)
+    const resp = await fetch(
+      `${process.env.BASE_URL}/api/orders/${orderId}/clarify-prompt`,
+      { headers: { Authorization: `Bearer ${process.env.INTERNAL_JWT}` } }
+    ).catch(() => null as any);
+
+    const data = await resp?.json().catch(() => null as any);
+    if (!data?.ok || !data?.text) return;
+
+    // Log enqueue (replace with your WABA sender if wired)
+    await supa.from("outbound_logs").insert({
+      org_id: orgId,
+      order_id: orderId,
+      kind: "clarify_bundle",
+      payload: { text: data.text, phone: order.source_phone },
+    });
+
+    // If you have a sender microservice, call it here instead of just logging.
+    // e.g., await wabaSendText({ org_id: orgId, to: order.source_phone, text: data.text });
+  } catch (e: any) {
+    console.warn("[INGEST][autosend clarify] skipped:", e?.message || e);
   }
 }
 
@@ -737,7 +769,6 @@ export async function ingestCoreFromMessage(
 
     // ─────────────────────────────────────────
     // [INBOX] Record inbound message for unified view
-    // (runs for any non-spam / non-pure-greeting message)
     // ─────────────────────────────────────────
     await upsertConversationAndInboundMessage({
       orgId,
@@ -746,10 +777,7 @@ export async function ingestCoreFromMessage(
       source,
       text: textRaw,
       msg_id,
-      raw: {
-        source,
-        ts,
-      },
+      raw: { source, ts },
     });
 
     // 4) Parse via hybrid pipeline (AI + rules) on ORIGINAL text
@@ -776,9 +804,7 @@ export async function ingestCoreFromMessage(
       }
     }
 
-    // 5b) Single-line qty fallback:
-    // If AI+rules found nothing, but text has clear "1kg X / 2kg Y" style,
-    // synthesize items instead of dropping.
+    // 5b) Single-line qty fallback
     if (!parsed.items || parsed.items.length === 0) {
       const fbItems = fallbackQtyItems(textFlat);
       if (fbItems.length) {
@@ -796,7 +822,7 @@ export async function ingestCoreFromMessage(
       }
     }
 
-    // 6) Late small-talk gate
+    // 6) Late small-talk gate (only when items still empty)
     if (!hasListShape && (!parsed.items || parsed.items.length === 0)) {
       if (parsed.is_order_like === false) {
         // let inquiry detection run next
@@ -927,15 +953,31 @@ export async function ingestCoreFromMessage(
         inquiry: inquiry.kind,
         order_id: createdInquiry!.id,
         org_id: orgId,
-        // tiny: represent the one-line "item" the user asked about
         items,
         reason: reasonTag,
       };
     }
 
-    // 8) ORDER path
+    // 8) ORDER path starts here
 
-    // Ignore seller-style money messages (heuristic; your UI can always adjust)
+    // ⬇️ NEW: BEFORE anything, hydrate brand/variant from prefs (auto-learned)
+    // WHY: If we can resolve brand/variant, we want to avoid sending clarify at all.
+    try {
+      const { items: hydrated, applied } = await enrichWithPrefs(
+        orgId,
+        phoneNorm,
+        parsed.items || []
+      );
+      if (applied > 0) {
+        parsed.items = hydrated;
+        parsed.reason = ((parsed.reason || "") + "; prefs_hydrated").trim();
+      }
+    } catch (e: any) {
+      console.warn("[INGEST][prefs_enrich warn]", e?.message || e);
+    }
+    // ⬆️ INSERTION POINT: right after items exist, before append/new decision.
+
+    // Ignore seller-style money messages (heuristic)
     if (/\b(aed|dirham|dh|dhs|price|₹|rs|\$)\b/i.test(textFlat)) {
       return {
         ok: true,
@@ -976,7 +1018,7 @@ export async function ingestCoreFromMessage(
       reason: parsed.reason || "—",
     });
 
-    // EDIT handling
+    // EDIT handling (must run BEFORE append/new decision)
     const EDIT_WINDOW_MIN = 15;
     if (msg_id && phoneNorm && edited_at) {
       const target = await findOrderByMsgId(orgId, phoneNorm, msg_id);
@@ -1049,63 +1091,71 @@ export async function ingestCoreFromMessage(
       }
     }
 
-    // Merge vs new
-    const mergeInto = phoneNorm
-      ? await pickMergeTarget(orgId, phoneNorm)
-      : null;
+    // ─────────────────────────────────────────────────────────
+    // Decide append vs new using last order snapshot
+    // ─────────────────────────────────────────────────────────
+    const phonePlain = String(phoneNorm || "").replace(/^\+/, "");
+    const { data: lastRowsAny } = await supa
+      .from("orders")
+      .select("id, status, created_at")
+      .eq("org_id", orgId)
+      .or(`source_phone.eq.${phonePlain},source_phone.eq.+${phonePlain}`)
+      .order("created_at", { ascending: false })
+      .limit(1);
 
-    if (mergeInto) {
-      const { data: cur, error: qErr } = await supa
+    const lastAny = lastRowsAny?.[0] || null;
+
+    const { action: linkAction, reason: linkReason } = decideLinking(
+      lastAny
+        ? {
+            status: lastAny.status as any,
+            last_inbound_at: lastAny.created_at,
+            created_at: lastAny.created_at,
+          }
+        : null,
+      textFlat
+    );
+
+    console.log(
+      "[INGEST][link] action=%s last=%s",
+      linkAction,
+      lastAny?.id || "none"
+    );
+
+    // ─────────────────────────────────────────────────────────
+    // Apply decision: append to last open order OR create a new one
+    // ─────────────────────────────────────────────────────────
+    if (
+      linkAction === "append" &&
+      lastAny &&
+      !["shipped", "paid"].includes(String(lastAny.status))
+    ) {
+      // Append into lastAny
+      const { data: curRow, error: curErr } = await supa
         .from("orders")
         .select("items, created_at")
-        .eq("id", mergeInto.id)
+        .eq("id", lastAny.id)
         .single();
-      if (qErr) throw qErr;
+      if (curErr) throw curErr;
 
-      const newItems = edited_at
-        ? [...parsed.items]
-        : [...(cur?.items || []), ...parsed.items];
+      const newItems = [...(curRow?.items || []), ...parsed.items];
 
       const { error: upErr } = await supa
         .from("orders")
         .update({
           items: newItems,
           parse_reason:
-            (parsed.reason ??
-              (edited_at ? "edited_replace" : "merged_append")) +
+            (parsed.reason ?? "merged_append") +
             (msg_id ? `; msgid:${msg_id}` : ""),
           parse_confidence: parsed.confidence ?? null,
           ...(msg_id ? { msg_id } : {}),
+          order_link_reason: linkReason || "merged_append",
         })
-        .eq("id", mergeInto.id);
+        .eq("id", lastAny.id);
+
       if (upErr) throw upErr;
 
-      // cleanup same-day inquiries
-      if (phoneNorm) {
-        const dayStart = DateTime.fromISO(
-          cur?.created_at || new Date().toISOString(),
-          { zone: TIMEZONE }
-        )
-          .startOf("day")
-          .toISO();
-        const { error: delInqErr } = await supa
-          .from("orders")
-          .delete()
-          .eq("org_id", orgId)
-          .eq("source_phone", phoneNorm)
-          .like("parse_reason", "inq:%")
-          .gte(
-            "created_at",
-            dayStart || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
-          );
-        if (delInqErr)
-          console.warn(
-            "[INGEST][core][merge] inquiry cleanup warn:",
-            delInqErr.message
-          );
-      }
-
-      // learning writes
+      // learning writes (non-fatal)
       try {
         for (const it of parsed.items) {
           const canon = trim(it.canonical || it.name || "");
@@ -1123,7 +1173,7 @@ export async function ingestCoreFromMessage(
           if (phoneNorm) {
             const { error: ec } = await supa.rpc("upsert_customer_pref", {
               p_org_id: orgId,
-              p_phone: phoneNorm,
+              p_phone: phoneNorm, // normalized for consistency
               p_canonical: canon,
               p_brand: brand,
               p_variant: variant,
@@ -1133,27 +1183,28 @@ export async function ingestCoreFromMessage(
           }
         }
       } catch (e: any) {
-        console.warn("[INGEST][core][merge learn warn]", e?.message || e);
+        console.warn("[INGEST][core][append learn warn]", e?.message || e);
       }
 
-      console.log(
-        "[INGEST][core] merged into",
-        mergeInto.id,
-        edited_at ? "(REPLACED)" : "(APPENDED)"
-      );
+      console.log("[INGEST][core] merged into", lastAny.id, "(APPENDED)");
+
+      // ⬇️ NEW: AFTER append, maybe auto-send clarify (WABA only)
+      await maybeAutoSendClarify(orgId, lastAny.id, source);
 
       return {
         ok: true,
         stored: true,
         kind: "order",
         used: parsed.used,
-        merged_into: mergeInto.id,
-        order_id: mergeInto.id,
+        merged_into: lastAny.id,
+        order_id: lastAny.id,
         items: newItems,
         org_id: orgId,
-        reason: edited_at ? "edited_replace" : "merged_append",
+        reason: "merged_append",
       };
     }
+
+    // Otherwise → NEW order path (falls through to dedupe + insert)
 
     // New order dedupe
     const dedupeKey = makeDedupeKey(
@@ -1217,6 +1268,7 @@ export async function ingestCoreFromMessage(
         parse_confidence: parsed.confidence ?? null,
         parse_reason: reasonTag || null,
         msg_id: msg_id || null,
+        order_link_reason: linkReason || "new",
       })
       .select("id")
       .single();
@@ -1255,6 +1307,9 @@ export async function ingestCoreFromMessage(
       console.warn("[INGEST][core][learn non-fatal]", e?.message || e);
     }
 
+    // ⬇️ NEW: AFTER new insert, maybe auto-send clarify (WABA only)
+    await maybeAutoSendClarify(orgId, created!.id, source);
+
     return {
       ok: true,
       stored: true,
@@ -1279,4 +1334,5 @@ export async function ingestCoreFromMessage(
 
 // ─────────────────────────────────────────
 // [INBOX] helpers: conversations + messages
+// (intentionally placed elsewhere in your codebase)
 // ─────────────────────────────────────────

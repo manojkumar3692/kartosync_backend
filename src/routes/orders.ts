@@ -3,7 +3,7 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import { supa } from "../db";
 import { parseOrder as ruleParse } from "../parser";
-import resolvePhoneForOrder, { normalizePhone } from '../util/normalizePhone';
+import resolvePhoneForOrder, { normalizePhone } from "../util/normalizePhone";
 
 export const orders = express.Router();
 
@@ -92,7 +92,11 @@ orders.get("/", ensureAuth, async (req: any, res) => {
 // Helper: parse pipeline (AI → rules) with HUMAN-READABLE reason preservation
 // Passes customer_phone so the parser can use customer-specific learnings.
 // ─────────────────────────────────────────────────────────────────────────────
-async function parsePipeline(text: string, org_id?: string, customer_phone?: string): Promise<{
+async function parsePipeline(
+  text: string,
+  org_id?: string,
+  customer_phone?: string
+): Promise<{
   items: any[];
   used: "ai" | "rules";
   confidence?: number | null;
@@ -105,7 +109,7 @@ async function parsePipeline(text: string, org_id?: string, customer_phone?: str
     try {
       const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(raw, undefined, {
         org_id,
-        customer_phone, // ← critical: enables per-customer learning at parse time
+        customer_phone, // ← enables per-customer learning at parse time
       });
       if (ai && ai.is_order_like !== false && Array.isArray(ai.items) && ai.items.length > 0) {
         const r =
@@ -119,20 +123,14 @@ async function parsePipeline(text: string, org_id?: string, customer_phone?: str
           reason: r,
         };
       }
-      // If AI says not order-like or no items, fall through to rules (caller still may reject)
-      console.log("[orders][parsePipeline] AI returned no items or not order-like; using rules.");
+      console.log("[orders][parsePipeline] AI returned no items/not order-like; using rules.");
     } catch (e: any) {
       console.warn("[orders] AI parse failed, fallback to rules:", e?.message || e);
     }
   }
 
   const items = ruleParse(raw) || [];
-  return {
-    items,
-    used: "rules",
-    confidence: null,
-    reason: "rule_fallback",
-  };
+  return { items, used: "rules", confidence: null, reason: "rule_fallback" };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -172,13 +170,14 @@ orders.post("/", ensureAuth, async (req: any, res) => {
 
     const insert = {
       org_id: req.org_id,
-      source_phone: phoneNorm || null,   // ✅ never store a display name here
+      source_phone: phoneNorm || null, // never store a display name here
       customer_name: customer_name || null,
       raw_text: raw_text || null,
       items: finalItems,
       status: "pending" as OrderStatus,
       parse_confidence,
       parse_reason,
+      order_link_reason: "new", // default for manual creations
       ...(created_at ? { created_at: new Date(created_at).toISOString() } : {}),
     };
 
@@ -249,7 +248,6 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
           unit: trim(it?.unit) || null,
           name: trim(it?.name || it?.canonical || ""),
           canonical: trim(it?.canonical) || null,
-          // keep nulls here for order storage; we'll normalize to '' only for learning writes
           brand: trim(it?.brand) || null,
           variant: trim(it?.variant) || null,
           notes: trim(it?.notes) || null,
@@ -276,7 +274,7 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
     const order = cur?.[0];
     if (!order) return res.status(404).json({ error: "order_not_found" });
 
-    // 1) Log correction event for future re-training
+    // 1) Log correction event
     const message_text =
       (order.raw_text && String(order.raw_text)) ||
       ((order.items || []).map((i: any) => i?.name || i?.canonical || "").join(", ")) ||
@@ -291,7 +289,7 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
     });
     if (e2) throw e2;
 
-    // 1.5) Automatic catalog learning (optional)
+    // 1.5) Optional auto-catalog learning
     const enableAutoCatalog =
       String(process.env.AI_AUTOCATALOG || "true").toLowerCase() !== "false";
 
@@ -302,13 +300,7 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
           (it.name ? it.name.charAt(0).toUpperCase() + it.name.slice(1) : null);
         if (!canonical) continue;
 
-        const parts = [
-          it.brand || undefined,
-          it.variant || undefined,
-          it.unit || undefined,
-          it.name || undefined,
-        ].filter(Boolean) as string[];
-
+        const parts = [it.brand || undefined, it.variant || undefined, it.unit || undefined, it.name || undefined].filter(Boolean) as string[];
         const term = parts.join(" ").trim();
         const safeTerm = term || it.name;
         if (!safeTerm) continue;
@@ -332,7 +324,7 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
       }
     }
 
-    // 2) ✅ UPDATE ORDER (final updated structure)
+    // 2) Update order
     const { data: upd, error: e3 } = await supa
       .from("orders")
       .update({
@@ -346,15 +338,15 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
       .single();
     if (e3) throw e3;
 
-    // 3) ✅ **LEARNING FROM HUMAN FIX** (phone-based; '' for generic)
+    // 3) Learning writes
     try {
       const phone = trim(order.source_phone || "");
       for (const it of normalizedItems) {
         const canon = trim(it.canonical || it.name || "");
         if (!canon) continue;
 
-        const brand = nz(it.brand);     // '' allowed (generic)
-        const variant = nz(it.variant); // '' allowed (generic)
+        const brand = nz(it.brand);
+        const variant = nz(it.variant);
 
         const { error: ebvs } = await supa.rpc("upsert_bvs", {
           p_org_id: order.org_id,
@@ -383,34 +375,226 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
       console.warn("[ai-fix][learn-write] non-fatal:", (e as any)?.message || e);
     }
 
-    // Response
     res.json({ ok: true, order: upd });
   } catch (err: any) {
     console.error("ai-fix error:", err);
     res.status(500).json({ error: err.message || "ai_fix_failed" });
   }
 });
+const OPEN_STATUSES = new Set(["pending", "confirmed", "packing"]);
+const CLOSED_STATUSES = new Set(["shipped", "paid", "cancelled", "delivered"]);
 
-// DELETE ORDER
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers for UI overrides
+// ─────────────────────────────────────────────────────────────────────────────
+async function getOrder(org_id: string, order_id: string) {
+  const { data, error } = await supa
+    .from("orders")
+    .select(
+      "id, org_id, source_phone, status, items, created_at, parse_reason"
+    )
+    .eq("org_id", org_id)
+    .eq("id", order_id)
+    .single(); // `.single()` already limits to 1 row
 
-orders.delete("/:id", async (req, res) => {
+  if (error || !data) {
+    throw new Error(error?.message || "order_not_found");
+  }
+
+  return data as {
+    id: string;
+    org_id: string;
+    source_phone: string | null;
+    status: string;
+    items: any[];
+    created_at: string;
+    parse_reason?: string | null;
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/orders/:id/split
+// Body: { org_id?: string, item_indices?: number[] }
+// - Creates a NEW order with selected items
+// - Removes those items from original
+// - order_link_reason=new order: 'operator_split'
+// ─────────────────────────────────────────────────────────────────────────────
+orders.post("/:id/split", ensureAuth, express.json(), async (req: any, res) => {
+  try {
+    const order_id = String(req.params.id || "");
+    const org_id = req.org_id;
+    const indices: number[] = Array.isArray(req.body?.item_indices)
+      ? req.body.item_indices.map((n: any) => Number(n)).filter((n: any) => Number.isFinite(n))
+      : [];
+
+    if (!order_id || !org_id) return res.status(400).json({ ok: false, error: "missing_fields" });
+
+    const cur = await getOrder(org_id, order_id);
+    const items = Array.isArray(cur.items) ? cur.items : [];
+
+    if (!items.length) return res.json({ ok: false, error: "no_items_to_split" });
+
+    // Default: last item if nothing selected
+    const indicesSet = new Set(indices.length ? indices : [items.length - 1]);
+    const move: any[] = [];
+    const keep: any[] = [];
+    items.forEach((it, idx) => (indicesSet.has(idx) ? move.push(it) : keep.push(it)));
+
+    if (!move.length) return res.json({ ok: false, error: "no_selected_items" });
+
+    // 1) Update original
+    const { error: upErr } = await supa
+      .from("orders")
+      .update({
+        items: keep,
+        parse_reason: cur.parse_reason || "operator_split",
+      })
+      .eq("id", cur.id)
+      .eq("org_id", org_id);
+    if (upErr) throw new Error(upErr.message);
+
+    // 2) Create new order with split items
+    const { data: created, error: insErr } = await supa
+      .from("orders")
+      .insert({
+        org_id,
+        source_phone: cur.source_phone,
+        customer_name: null,
+        raw_text: "[operator_split]",
+        items: move,
+        status: "pending",
+        created_at: new Date().toISOString(),
+        parse_confidence: null,
+        parse_reason: "operator_split",
+        order_link_reason: "operator_split",
+      })
+      .select("id")
+      .single();
+    if (insErr) throw new Error(insErr.message);
+
+    return res.json({ ok: true, new_order_id: created?.id });
+  } catch (e: any) {
+    console.error("[ORDERS][split] ERR", e?.message || e);
+    return res.status(500).json({ ok: false, error: e?.message || "split_failed" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/orders/:id/merge-previous
+// Body: {}
+// - Finds previous open order for same phone
+// - Appends all items of current into previous
+// - Marks current as 'cancelled'
+// - Writes order_link_reason on previous: 'operator_merged_previous'
+// Guards:
+//   • current must be OPEN
+//   • previous must be OPEN
+//   • never merge into a CLOSED order (shipped/paid/cancelled/delivered)
+// ─────────────────────────────────────────────────────────────────────────────
+orders.post(
+  "/:id/merge-previous",
+  ensureAuth,
+  express.json(),
+  async (req: any, res) => {
+    try {
+      const order_id = String(req.params.id || "");
+      const org_id = req.org_id as string | undefined;
+
+      if (!order_id || !org_id) {
+        return res.status(400).json({ ok: false, error: "missing_fields" });
+      }
+
+      // Current (the one we want to fold back)
+      const cur = await getOrder(org_id, order_id);
+
+      // Guard: current must be OPEN; if already closed we shouldn't be merging it
+      if (CLOSED_STATUSES.has(String(cur.status))) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "current_not_open" });
+      }
+
+      const phone = normalizePhone(cur.source_phone || "") || "";
+      if (!phone) {
+        return res.json({ ok: false, error: "no_phone_on_order" });
+      }
+
+      // Find the most recent previous order for the same phone (created before current)
+      const { data: prevList, error: prevErr } = await supa
+        .from("orders")
+        .select("id, status, items, created_at")
+        .eq("org_id", org_id)
+        .eq("source_phone", phone)
+        .lt("created_at", cur.created_at)
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (prevErr) throw new Error(prevErr.message);
+
+      const prev = prevList?.[0];
+      if (!prev) {
+        return res.json({ ok: false, error: "no_previous_order" });
+      }
+
+      // Guard: previous must be OPEN
+      if (CLOSED_STATUSES.has(String(prev.status))) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "previous_not_open" });
+      }
+
+      // Merge items (append)
+      const mergedItems = [...(prev.items || []), ...(cur.items || [])];
+
+      // 1) Append into previous + annotate link reason
+      const { error: upPrevErr } = await supa
+        .from("orders")
+        .update({
+          items: mergedItems,
+          parse_reason: "operator_merged_previous",
+          order_link_reason: "operator_merged_previous",
+        })
+        .eq("id", prev.id)
+        .eq("org_id", org_id);
+
+      if (upPrevErr) throw new Error(upPrevErr.message);
+
+      // 2) Cancel current (never delete—keep audit trail)
+      const { error: cancelErr } = await supa
+        .from("orders")
+        .update({
+          status: "cancelled",
+          parse_reason: "operator_merged_previous",
+        })
+        .eq("id", cur.id)
+        .eq("org_id", org_id);
+
+      if (cancelErr) throw new Error(cancelErr.message);
+
+      return res.json({ ok: true, merged_into: prev.id });
+    } catch (e: any) {
+      console.error("[ORDERS][merge-previous] ERR", e?.message || e);
+      return res
+        .status(500)
+        .json({ ok: false, error: e?.message || "merge_failed" });
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/orders/:id
+// ─────────────────────────────────────────────────────────────────────────────
+orders.delete("/:id", ensureAuth, async (req:any, res) => {
   try {
     const orderId = req.params.id;
+    if (!orderId) return res.status(400).json({ ok: false, error: "order_id_required" });
 
-    if (!orderId) {
-      return res.status(400).json({ ok: false, error: "order_id_required" });
-    }
-
-    const { error } = await supa
-      .from("orders")
-      .delete()
-      .eq("id", orderId);
-
+    const { error } = await supa.from("orders").delete().eq("id", orderId).eq("org_id", req.org_id);
     if (error) {
       console.error("[DELETE ORDER]", error.message);
       return res.status(500).json({ ok: false, error: error.message });
     }
-
     return res.json({ ok: true, deleted: orderId });
   } catch (e: any) {
     console.error("[DELETE ORDER]", e?.message || e);

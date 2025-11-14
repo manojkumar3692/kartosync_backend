@@ -1,41 +1,39 @@
 // src/routes/waba.ts
-import express from 'express';
-import axios from 'axios';
-import { supa } from '../db';
-import { ingestCoreFromMessage } from './ingestCore';
-import { findBestProductForText, getLatestPrice } from '../util/products';
+import express from "express";
+import axios from "axios";
+import { supa } from "../db";
+import { ingestCoreFromMessage } from "./ingestCore";
+import { findBestProductForText, getLatestPrice } from "../util/products";
 
 export const waba = express.Router();
 
-const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || '';
-const META_WA_BASE = 'https://graph.facebook.com/v21.0';
+const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || "";
+const META_WA_BASE = "https://graph.facebook.com/v21.0";
 
-waba.all('/ping', (_req, res) => res.json({ ok: true, where: 'waba' }));
+waba.all("/ping", (_req, res) => res.json({ ok: true, where: "waba" }));
 
 // Simple hit logger so you can confirm mount path
 waba.use((req, _res, next) => {
-  console.log('[WABA][ROUTER HIT]', req.method, req.path);
+  console.log("[WABA][ROUTER HIT]", req.method, req.path);
   next();
 });
 
 // ─────────────────────────────
 // 1) Webhook verification (GET)
-// (router is mounted at /webhook/whatsapp or /api/waba/webhook;
-// we keep our internal path as "/")
 // ─────────────────────────────
-waba.get('/', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
+waba.get("/", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
 
-  console.log('[WABA][VERIFY]', { mode, token_ok: token === META_VERIFY_TOKEN });
+  console.log("[WABA][VERIFY]", { mode, token_ok: token === META_VERIFY_TOKEN });
 
-  if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
-    console.log('[WABA] webhook verified');
+  if (mode === "subscribe" && token === META_VERIFY_TOKEN) {
+    console.log("[WABA] webhook verified");
     return res.status(200).send(challenge);
   }
 
-  console.log('[WABA] webhook verify failed');
+  console.log("[WABA] webhook verify failed");
   return res.sendStatus(403);
 });
 
@@ -48,29 +46,29 @@ async function buildSmartInquiryReply(opts: {
   inquiryType?: string | null;
 }) {
   const { org_id, text } = opts;
-  const inquiryType = (opts.inquiryType || '').toLowerCase() || null;
+  const inquiryType = (opts.inquiryType || "").toLowerCase() || null;
 
   const product = await findBestProductForText(org_id, text);
   if (!product) {
-    if (inquiryType === 'price') {
-      return '💬 Got your price question. We’ll confirm the exact price shortly.';
+    if (inquiryType === "price") {
+      return "💬 Got your price question. We’ll confirm the exact price shortly.";
     }
-    if (inquiryType === 'availability') {
-      return '💬 Got your availability question. We’ll confirm stock shortly.';
+    if (inquiryType === "availability") {
+      return "💬 Got your availability question. We’ll confirm stock shortly.";
     }
     return null;
   }
 
-  if (inquiryType === 'price') {
+  if (inquiryType === "price") {
     const latest = await getLatestPrice(org_id, product.id);
     if (latest) {
-      const unit = product.base_unit || 'unit';
+      const unit = product.base_unit || "unit";
       return `💸 ${product.display_name} is currently ${latest.price} ${latest.currency} per ${unit}.`;
     }
     return `💸 We do have ${product.display_name}. Today’s price changes often — we’ll confirm it for you now.`;
   }
 
-  if (inquiryType === 'availability') {
+  if (inquiryType === "availability") {
     return `✅ Yes, we have ${product.display_name} available.`;
   }
 
@@ -78,85 +76,708 @@ async function buildSmartInquiryReply(opts: {
 }
 
 // ─────────────────────────────
-// Helper: auto-clarification for ambiguous items (per org)
-// • Asks ONLY when the org has 2+ non-empty variants for that canonical
-// • Asks ONLY if the item actually appears in the user's original text
-// • De-dupes by canonical and caps to 3 prompts
+// Clarify + Address + Memory helpers
 // ─────────────────────────────
-async function buildClarifyTextForItems(
-  result: any,
-  originalText: string
-): Promise<string | null> {
-  if (!result || result.kind !== 'order' || !Array.isArray(result.items) || !result.org_id) {
-    return null;
-  }
 
-  const org_id = String(result.org_id);
-  const t = (originalText || '').toLowerCase();
-  const prompts: string[] = [];
+type VariantChoice = {
+  index: number; // item index in order.items
+  label: string; // canonical/name (e.g. "Onion")
+  variants: string[];
+};
+
+// Normalize phone for session key
+function normalizePhoneForKey(raw: string): string {
+  return String(raw || "").replace(/[^\d]/g, "");
+}
+
+// Find ambiguous items (2+ variants configured) for this order
+async function findAmbiguousItemsForOrder(
+  org_id: string,
+  items: any[]
+): Promise<VariantChoice[]> {
+  const out: VariantChoice[] = [];
   const seenCanon = new Set<string>();
-  const MAX_ASK = 3;
 
-  for (const it of result.items) {
-    const label = String(it?.canonical || it?.name || '')
-      .toLowerCase()
-      .replace(/\s+/g, ' ')
+  for (let i = 0; i < (items || []).length; i++) {
+    const it = items[i] || {};
+    const labelRaw = String(it.canonical || it.name || "")
+      .replace(/\s+/g, " ")
       .trim();
+    if (!labelRaw) continue;
 
-    if (!label || seenCanon.has(label)) continue;
-    seenCanon.add(label);
+    const canonKey = labelRaw.toLowerCase();
+    if (seenCanon.has(canonKey)) continue;
+    seenCanon.add(canonKey);
 
-    // Only clarify if user actually mentioned this token in the text
-    const mentioned =
-      t.includes(` ${label} `) ||
-      t.startsWith(`${label} `) ||
-      t.endsWith(` ${label}`) ||
-      t === label;
-    if (!mentioned) continue;
-
-    // Query variants scoped to org & canonical; ignore null/blank variants
     const { data, error } = await supa
-      .from('products')
-      .select('variant')
-      .eq('org_id', org_id)
-      .eq('canonical', label)
-      .not('variant', 'is', null);
+      .from("products")
+      .select("canonical, variant")
+      .eq("org_id", org_id)
+      .ilike("canonical", labelRaw); // case-insensitive
 
     if (error) {
-      console.warn('[WABA][clarify products err]', error.message);
+      console.warn("[WABA][ambig products err]", error.message);
       continue;
     }
 
     const unique = Array.from(
       new Set(
         (data || [])
-          .map((r: any) => String(r?.variant || '').trim())
+          .map((r: any) => String(r?.variant || "").trim())
           .filter(Boolean)
       )
     );
 
-    // Only ask if we truly have choices configured
     if (unique.length >= 2) {
-      prompts.push(`For ${label}, which one do you prefer? (${unique.join(', ')})`);
-      if (prompts.length >= MAX_ASK) break; // avoid long walls of text
+      out.push({
+        index: i,
+        label: labelRaw,
+        variants: unique,
+      });
     }
   }
 
-  if (!prompts.length) return null;
+  return out;
+}
 
-  return `Quick question before we pack your order:\n${prompts.map((p) => `• ${p}`).join('\n')}`;
+// Build a question text for one item
+function buildClarifyQuestionText(choice: VariantChoice): string {
+  const pretty = choice.label;
+  return (
+    "Thanks! Just need a quick confirmation:\n" +
+    `• ${pretty}: which one do you prefer? (${choice.variants.join(", ")})`
+  );
+}
+
+// Format summary list for final confirmation
+function formatOrderSummary(items: any[]): string {
+  const lines = (items || []).map((it: any) => {
+    const qty = it.qty ?? 1;
+    const unit = it.unit ? ` ${it.unit}` : "";
+    const name = it.canonical || it.name || "item";
+    const brand = it.brand ? ` · ${it.brand}` : "";
+    const variant = it.variant ? ` · ${it.variant}` : "";
+    return `* ${qty}${unit} ${name}${brand}${variant}`.trim();
+  });
+  return lines.join("\n");
+}
+
+// Last-variant memory: find last chosen variant for this customer+canonical
+async function getCustomerLastVariant(
+  org_id: string,
+  from_phone: string,
+  canonical: string
+): Promise<string | null> {
+  try {
+    const canonKey = canonical.toLowerCase().trim();
+
+    const { data, error } = await supa
+      .from("orders")
+      .select("items")
+      .eq("org_id", org_id)
+      .eq("source_phone", from_phone) // IMPORTANT: orders.source_phone, not customer_phone
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.warn("[WABA][lastVariant err]", error.message);
+      return null;
+    }
+    if (!data || !data.length) return null;
+
+    for (const row of data) {
+      const items = (row as any).items || [];
+      for (const it of items) {
+        const labelRaw = String(it?.canonical || it?.name || "")
+          .toLowerCase()
+          .trim();
+        if (labelRaw === canonKey && it?.variant) {
+          return String(it.variant);
+        }
+      }
+    }
+    return null;
+  } catch (e: any) {
+    console.warn("[WABA][lastVariant catch]", e?.message || e);
+    return null;
+  }
+}
+
+// 🔹 check if we already captured address for this customer (any order)
+// Once address_done exists for a phone, we never ask again.
+async function hasAddressForOrder(
+  org_id: string,
+  from_phone: string,
+  _order_id: string // not used anymore
+): Promise<boolean> {
+  try {
+    const phoneKey = normalizePhoneForKey(from_phone);
+
+    const { data, error } = await supa
+      .from("order_clarify_sessions")
+      .select("id")
+      .eq("org_id", org_id)
+      .eq("customer_phone", phoneKey)
+      .eq("status", "address_done")
+      .limit(1);
+
+    if (error) {
+      console.warn("[WABA][hasAddress err]", error.message);
+      return false;
+    }
+    return !!(data && data.length);
+  } catch (e: any) {
+    console.warn("[WABA][hasAddress catch]", e?.message || e);
+    return false;
+  }
+}
+
+// Active open order per customer (for reference / edit decisions)
+async function findActiveOrderForPhone(
+  org_id: string,
+  from_phone: string
+): Promise<any | null> {
+  try {
+    const { data, error } = await supa
+      .from("orders")
+      .select("id, items, status, source_phone, created_at")
+      .eq("org_id", org_id)
+      .eq("source_phone", from_phone)
+      .in("status", ["pending", "paid"]) // treat shipped as closed
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.warn("[WABA][activeOrder err]", error.message);
+      return null;
+    }
+    return data || null;
+  } catch (e: any) {
+    console.warn("[WABA][activeOrder catch]", e?.message || e);
+    return null;
+  }
+}
+
+// Active open order but excluding a specific order_id (for merge)
+async function findActiveOrderForPhoneExcluding(
+  org_id: string,
+  from_phone: string,
+  excludeOrderId: string
+): Promise<any | null> {
+  try {
+    const { data, error } = await supa
+      .from("orders")
+      .select("id, items, status, source_phone, created_at")
+      .eq("org_id", org_id)
+      .eq("source_phone", from_phone)
+      .neq("id", excludeOrderId)
+      .in("status", ["pending", "paid"])
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.warn("[WABA][activeOrderExcl err]", error.message);
+      return null;
+    }
+    return data || null;
+  } catch (e: any) {
+    console.warn("[WABA][activeOrderExcl catch]", e?.message || e);
+    return null;
+  }
+}
+
+// Start MULTI-TURN CLARIFY session (for items)
+// - applies last-variant memory first
+// - returns first question text, or null if nothing to clarify.
+async function startClarifyForOrder(opts: {
+    org_id: string;
+    order_id: string;
+    from_phone: string;
+  }): Promise<string | null> {
+    const { org_id, order_id, from_phone } = opts;
+    const phoneKey = normalizePhoneForKey(from_phone);
+  
+    const { data: orderRow, error: orderErr } = await supa
+      .from("orders")
+      .select("id, items, source_phone")
+      .eq("id", order_id)
+      .single();
+  
+    if (orderErr || !orderRow) {
+      console.warn("[WABA][clarify start] order not found", orderErr?.message);
+      return null;
+    }
+  
+    let items = ((orderRow as any).items || []) as any[];
+    let modified = false;
+  
+    // 1) Apply last variant memory
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i] || {};
+      if (it.variant) continue;
+  
+      const labelRaw = String(it.canonical || it.name || "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!labelRaw) continue;
+  
+      const lastVariant = await getCustomerLastVariant(
+        org_id,
+        from_phone,
+        labelRaw
+      );
+      if (lastVariant) {
+        modified = true;
+        items[i] = { ...it, variant: lastVariant };
+      }
+    }
+  
+    if (modified) {
+      await supa.from("orders").update({ items }).eq("id", order_id);
+    }
+  
+    // 2) Find remaining ambiguous items
+    let choices = await findAmbiguousItemsForOrder(org_id, items);
+    choices = choices.filter((c) => !items[c.index].variant);
+  
+    if (!choices.length) return null;
+  
+    const first = choices[0];
+  
+    // Close older sessions
+    await supa
+      .from("order_clarify_sessions")
+      .update({ status: "closed", updated_at: new Date().toISOString() })
+      .eq("org_id", org_id)
+      .eq("customer_phone", phoneKey)
+      .eq("status", "open");
+  
+    // Create new session
+    await supa.from("order_clarify_sessions").insert({
+      org_id,
+      order_id,
+      customer_phone: phoneKey,
+      status: "open",
+      current_index: first.index,
+    });
+  
+    return buildClarifyQuestionText(first);
+  }
+
+// Start ADDRESS session (no more item clarifications needed)
+// - next text from this customer will be treated as address, not order.
+async function startAddressSessionForOrder(opts: {
+  org_id: string;
+  order_id: string;
+  from_phone: string;
+}) {
+  const { org_id, order_id, from_phone } = opts;
+  const phoneKey = normalizePhoneForKey(from_phone);
+
+  // close prior sessions
+  await supa
+    .from("order_clarify_sessions")
+    .update({ status: "closed", updated_at: new Date().toISOString() })
+    .eq("org_id", org_id)
+    .eq("customer_phone", phoneKey)
+    .eq("status", "open");
+
+  const { error } = await supa.from("order_clarify_sessions").insert({
+    org_id,
+    order_id,
+    customer_phone: phoneKey,
+    status: "open",
+    current_index: -1, // SPECIAL: -1 = waiting for address
+  });
+
+  if (error) {
+    console.warn("[WABA][address session insert err]", error.message);
+  }
+}
+
+// Handle a message while clarify/address session is open
+// Returns true if the message was consumed by this handler.
+async function maybeHandleClarifyReply(opts: {
+  org_id: string;
+  phoneNumberId: string;
+  from: string;
+  text: string;
+}): Promise<boolean> {
+  const { org_id, phoneNumberId, from, text } = opts;
+  const phoneKey = normalizePhoneForKey(from);
+  const lower = text.toLowerCase().trim();
+
+  // Look up latest open session
+  const { data: session, error: sessErr } = await supa
+    .from("order_clarify_sessions")
+    .select("id, order_id, current_index, status")
+    .eq("org_id", org_id)
+    .eq("customer_phone", phoneKey)
+    .eq("status", "open")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (sessErr) {
+    console.warn("[WABA][clarify session err]", sessErr.message);
+    return false;
+  }
+  if (!session) return false;
+
+  // Escape hatch during clarify / address flow
+  if (/cancel|ignore previous|new order/i.test(lower)) {
+    await supa
+      .from("order_clarify_sessions")
+      .update({ status: "closed", updated_at: new Date().toISOString() })
+      .eq("id", session.id);
+
+    await sendWabaText({
+      phoneNumberId,
+      to: from,
+      text: "No problem 👍 You can send a new order whenever you’re ready.",
+      orgId: org_id,
+    });
+
+    return true;
+  }
+
+  if (/talk to agent|talk to human/i.test(lower)) {
+    await supa
+      .from("order_clarify_sessions")
+      .update({ status: "closed", updated_at: new Date().toISOString() })
+      .eq("id", session.id);
+
+    await sendWabaText({
+      phoneNumberId,
+      to: from,
+      text:
+        "👨‍💼 Okay, we’ll connect you to a store agent.\n" +
+        "Please wait a moment — a human will reply.",
+      orgId: org_id,
+    });
+
+    return true;
+  }
+
+  // ──────────────────────
+  // ADDRESS STAGE (current_index === -1)
+  // ──────────────────────
+  if (session.current_index === -1) {
+    console.log("[WABA][ADDRESS CAPTURE]", {
+      org_id,
+      order_id: session.order_id,
+      customer: from,
+      address: text,
+    });
+
+    await supa
+      .from("order_clarify_sessions")
+      .update({ status: "address_done", updated_at: new Date().toISOString() })
+      .eq("id", session.id);
+
+    // v1: just acknowledge; optionally later we can persist address on order
+    await sendWabaText({
+      phoneNumberId,
+      to: from,
+      text:
+        "📍 Thanks! We’ve noted your address.\n" +
+        "If you’d like to add more items, just send them here.",
+      orgId: org_id,
+    });
+
+    return true;
+  }
+
+  // ──────────────────────
+  // ITEM VARIANT CLARIFY STAGE
+  // ──────────────────────
+  const { data: orderRow, error: orderErr } = await supa
+    .from("orders")
+    .select("id, items")
+    .eq("id", session.order_id)
+    .single();
+
+  if (orderErr || !orderRow) {
+    console.warn("[WABA][clarify reply] order not found", orderErr?.message);
+
+    // Close the stale session and LET the main handler treat this
+    // as a fresh message (no confusing error to customer)
+    await supa
+      .from("order_clarify_sessions")
+      .update({ status: "closed", updated_at: new Date().toISOString() })
+      .eq("id", session.id);
+
+    return false;
+  }
+
+  const order: any = orderRow;
+  const items: any[] = order.items || [];
+  if (
+    !Array.isArray(items) ||
+    session.current_index < 0 ||
+    session.current_index >= items.length
+  ) {
+    await supa
+      .from("order_clarify_sessions")
+      .update({ status: "closed", updated_at: new Date().toISOString() })
+      .eq("id", session.id);
+
+    await sendWabaText({
+      phoneNumberId,
+      to: from,
+      text:
+        "Sorry, something went wrong with that confirmation. " +
+        "Please send your order again.",
+      orgId: org_id,
+    });
+    return true;
+  }
+
+  const currentIndex = session.current_index;
+  const currentItem = items[currentIndex] || {};
+  const labelRaw = String(currentItem.canonical || currentItem.name || "").trim();
+  const labelKey = labelRaw.toLowerCase();
+
+  // Load variants for this item
+  const { data: productRows, error: prodErr } = await supa
+    .from("products")
+    .select("canonical, variant")
+    .eq("org_id", org_id)
+    .ilike("canonical", labelRaw);
+
+  if (prodErr) {
+    console.warn("[WABA][clarify reply products err]", prodErr.message);
+  }
+
+  const variants = Array.from(
+    new Set(
+      (productRows || [])
+        .map((r: any) => String(r?.variant || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  if (!variants.length) {
+    // nothing to choose, stop clarify and fall back to manual
+    await supa
+      .from("order_clarify_sessions")
+      .update({ status: "closed", updated_at: new Date().toISOString() })
+      .eq("id", session.id);
+
+    await sendWabaText({
+      phoneNumberId,
+      to: from,
+      text:
+        "Got your message 👍 We’ll adjust the order manually for this item " +
+        "and continue processing.",
+      orgId: org_id,
+    });
+    return true;
+  }
+
+  // Try to match answer to one of the variants
+  const answer = lower;
+  let chosen: string | null = null;
+
+  for (const v of variants) {
+    const vLower = v.toLowerCase();
+    if (answer === vLower || answer.includes(vLower)) {
+      chosen = v;
+      break;
+    }
+  }
+
+  if (!chosen) {
+    const optionsStr = variants.join(" / ");
+    await sendWabaText({
+      phoneNumberId,
+      to: from,
+      text: `Sorry, I didn’t catch that. Please reply with one of: ${optionsStr}`,
+      orgId: org_id,
+    });
+    return true;
+  }
+
+  // Update variant in order items
+  items[currentIndex] = {
+    ...currentItem,
+    variant: chosen,
+  };
+
+  const { error: updErr } = await supa
+    .from("orders")
+    .update({ items })
+    .eq("id", order.id);
+
+  if (updErr) {
+    console.warn("[WABA][clarify reply update err]", updErr.message);
+    await sendWabaText({
+      phoneNumberId,
+      to: from,
+      text:
+        "I couldn’t update that item just now. " +
+        "We’ll adjust it manually and confirm your order.",
+      orgId: org_id,
+    });
+    return true;
+  }
+
+  // Check if more ambiguous items remain (still without variant)
+  const remainingChoices = await findAmbiguousItemsForOrder(org_id, items);
+  const stillAmbiguous = remainingChoices.filter((c) => {
+    const it = items[c.index];
+    return !it || !it.variant;
+  });
+
+  if (!stillAmbiguous.length) {
+    // All clarified → close clarify session
+await supa
+.from("order_clarify_sessions")
+.update({ status: "closed", updated_at: new Date().toISOString() })
+.eq("id", session.id);
+
+// Check if customer already provided address (any previous address_done)
+const alreadyHasAddress = await hasAddressForOrder(org_id, from, order.id);
+
+const summary = formatOrderSummary(items);
+
+if (alreadyHasAddress) {
+// Customer has given address before → DO NOT ask again
+const finalText =
+  "✅ Updated order:\n" + summary;
+
+await sendWabaText({
+  phoneNumberId,
+  to: from,
+  text: finalText,
+  orgId: org_id,
+});
+
+return true;
+}
+
+// If no address yet → open address session ONCE
+await startAddressSessionForOrder({
+org_id,
+order_id: order.id,
+from_phone: from,
+});
+
+const finalText =
+"✅ Order confirmed:\n" +
+summary +
+"\n\n📍 Please share your delivery address (or send location) if you haven’t already.";
+
+await sendWabaText({
+phoneNumberId,
+to: from,
+text: finalText,
+orgId: org_id,
+});
+
+return true;
+  }
+
+  // Move to next item and ask again
+  const next = stillAmbiguous[0];
+  await supa
+    .from("order_clarify_sessions")
+    .update({
+      current_index: next.index,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", session.id);
+
+  const prettyCurrent = labelRaw || labelKey || "item";
+  const confirmLine = `Got it: ${prettyCurrent} → ${chosen} ✅`;
+  const nextQuestion = buildClarifyQuestionText(next);
+
+  await sendWabaText({
+    phoneNumberId,
+    to: from,
+    text: `${confirmLine}\n\n${nextQuestion}`,
+    orgId: org_id,
+  });
+
+  return true;
+}
+
+// Edit-like messages we *don’t* support in V1 (we answer safely)
+function isLikelyEditRequest(text: string): boolean {
+  const lower = text.toLowerCase();
+  if (lower.includes("change ")) return true;
+  if (lower.includes("instead of")) return true;
+  if (lower.includes("make it ")) return true;
+  if (lower.includes("make my ")) return true;
+  if (lower.includes("remove ")) return true;
+  if (lower.startsWith("no ")) return true;
+  if (lower.includes("reduce ")) return true;
+  if (lower.includes("increase ")) return true;
+  return false;
+}
+
+// Looks like "add more items to existing order"
+function looksLikeAddToExisting(text: string): boolean {
+  const lower = text.toLowerCase();
+  if (lower.includes("add ")) return true;
+  if (lower.includes("add on")) return true;
+  if (lower.includes("add one more")) return true;
+  if (lower.includes("also")) return true;
+  if (lower.includes("too")) return true;
+  if (lower.includes("more")) return true;
+  if (lower.includes("extra")) return true;
+  return false;
+}
+
+// ─────────────────────────────
+// Explicit user commands: NEW / CANCEL / UPDATE / AGENT
+// ─────────────────────────────
+
+type UserCommand = "new" | "cancel" | "update" | "agent" | null;
+
+function detectUserCommand(text: string): UserCommand {
+  const lower = text.toLowerCase().trim();
+
+  // keep these fairly strict to avoid colliding with normal sentences
+  if (lower === "new" || lower === "new order" || lower.startsWith("start new order")) {
+    return "new";
+  }
+  if (lower === "cancel" || lower === "cancel order" || lower.startsWith("cancel my order")) {
+    return "cancel";
+  }
+  if (
+    lower === "update" ||
+    lower === "update order" ||
+    lower.startsWith("edit order") ||
+    lower.startsWith("modify order")
+  ) {
+    return "update";
+  }
+  if (
+    lower === "agent" ||
+    lower === "talk to agent" ||
+    lower === "talk to human" ||
+    lower === "human" ||
+    lower === "support" ||
+    lower === "customer care"
+  ) {
+    return "agent";
+  }
+
+  return null;
 }
 
 // ─────────────────────────────
 // 2) Incoming messages (POST)
 // ─────────────────────────────
-waba.post('/', async (req, res) => {
+waba.post("/", async (req, res) => {
   try {
-    console.log('[WABA][RAW BODY]', JSON.stringify(req.body));
+    console.log("[WABA][RAW BODY]", JSON.stringify(req.body));
 
     const body = req.body;
     if (!body || !body.entry) {
-      console.log('[WABA] no entry in body');
+      console.log("[WABA] no entry in body");
       return res.sendStatus(200);
     }
 
@@ -168,7 +789,7 @@ waba.post('/', async (req, res) => {
         const metadata = value.metadata || {};
         const phoneNumberId = metadata.phone_number_id as string | undefined;
 
-        console.log('[WABA][ENTRY]', {
+        console.log("[WABA][ENTRY]", {
           phoneNumberId,
           messages_len: messages.length,
         });
@@ -177,23 +798,23 @@ waba.post('/', async (req, res) => {
 
         // Find org by WABA phone_number_id
         const { data: orgs, error: orgErr } = await supa
-          .from('orgs')
-          .select('id, name, ingest_mode, auto_reply_enabled')
-          .eq('wa_phone_number_id', phoneNumberId)
+          .from("orgs")
+          .select("id, name, ingest_mode, auto_reply_enabled")
+          .eq("wa_phone_number_id", phoneNumberId)
           .limit(1);
 
         if (orgErr) {
-          console.warn('[WABA] org lookup error', orgErr.message);
+          console.warn("[WABA] org lookup error", orgErr.message);
           continue;
         }
         const org = orgs?.[0];
         if (!org) {
-          console.warn('[WABA] no org for phone_number_id', phoneNumberId);
+          console.warn("[WABA] no org for phone_number_id", phoneNumberId);
           continue;
         }
 
-        if (org.ingest_mode !== 'waba') {
-          console.log('[WABA] org not in waba mode, skipping', {
+        if (org.ingest_mode !== "waba") {
+          console.log("[WABA] org not in waba mode, skipping", {
             org_id: org.id,
             ingest_mode: org.ingest_mode,
           });
@@ -201,23 +822,118 @@ waba.post('/', async (req, res) => {
         }
 
         for (const msg of messages) {
-          if (msg.type !== 'text') continue;
+          if (msg.type !== "text") continue;
 
           const from = msg.from as string;
-          const text = msg.text?.body?.trim() || '';
+          const text = msg.text?.body?.trim() || "";
           const msgId = msg.id as string;
           const ts = Number(msg.timestamp || Date.now()) * 1000;
 
           if (!text) continue;
 
-          console.log('[WABA][IN]', {
+          const lowerText = text.toLowerCase().trim();
+
+          console.log("---------- WABA DEBUG START ----------");
+          console.log("TEXT:", text);
+          console.log("FROM:", from);
+          console.log(
+            "HAS ACTIVE ORDER:",
+            Boolean(await findActiveOrderForPhone(org.id, from))
+          );
+          console.log("IS EDIT-LIKE:", isLikelyEditRequest(text));
+          console.log("LOOKS LIKE ADD:", looksLikeAddToExisting(text));
+          console.log("---------- WABA DEBUG END ----------");
+
+          console.log("[WABA][IN]", {
             org_id: org.id,
             from,
             msgId,
             text,
           });
 
-          // Parse and store
+          // 0) If we’re in clarify/address session → consume here and SKIP ingestCore
+          const handledByClarify = await maybeHandleClarifyReply({
+            org_id: org.id,
+            phoneNumberId,
+            from,
+            text,
+          });
+          if (handledByClarify) {
+            continue;
+          }
+
+          // 0.2) Explicit commands: NEW / CANCEL / UPDATE / AGENT
+          const cmd = detectUserCommand(text);
+
+          if (cmd === "agent") {
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              text:
+                "👨‍💼 Okay, we’ll connect you to a store agent.\n" +
+                "Please wait a moment — a human will reply.",
+              orgId: org.id,
+            });
+            // here you could also flag the conversation row in DB
+            continue;
+          }
+
+          if (cmd === "cancel") {
+            const activeOrderForCancel = await findActiveOrderForPhone(org.id, from);
+
+            // We *don’t* mutate DB status in V1 (no schema change) — we just inform the store.
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              text: activeOrderForCancel
+                ? "Okay, we’ll treat your last order as cancelled and inform the store. If this was a mistake, you can send a new order."
+                : "Okay, we’ll inform the store. If you’d like to place a new order, please send your items.",
+              orgId: org.id,
+            });
+            continue;
+          }
+
+          if (cmd === "new") {
+            // Conceptually: start fresh flow; we don’t alter previous order in DB in V1.
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              text:
+                "👍 Starting a fresh order. Please send the items you’d like to buy.",
+              orgId: org.id,
+            });
+            continue;
+          }
+
+          if (cmd === "update") {
+            // We do *not* auto-edit any existing order in V1.
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              text:
+                "I can’t update specific items automatically yet.\n" +
+                "Please type your changes clearly (e.g., “change 1kg onion to 2kg onion”) and the store will review it.",
+              orgId: org.id,
+            });
+            continue;
+          }
+
+          // 0.8) Edit-like messages while an order is open → safe fallback (no auto edit in V1)
+          const activeOrderForEdit = await findActiveOrderForPhone(org.id, from);
+          if (activeOrderForEdit && isLikelyEditRequest(text)) {
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              text:
+                "I’m not sure which part of your order to change.\n" +
+                "Please send the updated order clearly, or talk to the store directly.\n" +
+                "If you want, you can cancel this order and create a new one from the beginning.",
+              orgId: org.id,
+            });
+            continue;
+          }
+
+          // 1) Normal path: parse + store
           const result: any = await ingestCoreFromMessage({
             org_id: org.id,
             text,
@@ -225,10 +941,10 @@ waba.post('/', async (req, res) => {
             from_phone: from,
             from_name: null,
             msg_id: msgId,
-            source: 'waba',
+            source: "waba",
           });
 
-          console.log('[WABA][INGEST-RESULT]', {
+          console.log("[WABA][INGEST-RESULT]", {
             org_id: org.id,
             from,
             msgId,
@@ -244,18 +960,94 @@ waba.post('/', async (req, res) => {
 
           let reply: string | null = null;
 
-          // 1) Order path → either clarify OR confirm (never both)
-          if (result.kind === 'order' && result.stored) {
-            const clarify = await buildClarifyTextForItems(result, text); // pass original text
-            if (clarify) {
-              reply = clarify; // ask only the necessary questions
-            } else {
-              reply = '✅ Thanks! We’ve got your order and started processing. If anything is unclear or out of stock, we’ll message you.';
+          // 1.5) If this is an order and there is a PREVIOUS open order,
+          // MERGE only when text clearly looks like "add more" (add / also / extra…)
+          if (
+            result.kind === "order" &&
+            result.stored &&
+            result.order_id &&
+            Array.isArray(result.items) &&
+            looksLikeAddToExisting(text)
+          ) {
+            const previousOpen = await findActiveOrderForPhoneExcluding(
+              org.id,
+              from,
+              result.order_id
+            );
+
+            if (previousOpen && previousOpen.id) {
+              const baseItems = (previousOpen.items || []) as any[];
+              const newItems = (result.items || []) as any[];
+
+              const mergedItems = [...baseItems, ...newItems];
+
+              const { error: updErr } = await supa
+                .from("orders")
+                .update({ items: mergedItems })
+                .eq("id", previousOpen.id);
+
+              if (updErr) {
+                console.warn("[WABA][merge update err]", updErr.message);
+              } else {
+                // Try to delete the temporary new order (best effort)
+                const { error: delErr } = await supa
+                  .from("orders")
+                  .delete()
+                  .eq("id", result.order_id);
+                if (delErr) {
+                  console.warn("[WABA][merge delete err]", delErr.message);
+                }
+
+                // Point the result at the merged/base order
+                result.order_id = previousOpen.id;
+                result.items = mergedItems;
+              }
             }
           }
 
-          // 2) Inquiry path → smart price/availability
-          if (!reply && result.kind === 'inquiry') {
+          // 2) Order path → either start multi-turn clarify OR
+          //    (if no clarify) confirm + maybe open address session
+          if (result.kind === "order" && result.stored && result.order_id) {
+            const items = (result.items || []) as any[];
+
+            const alreadyHasAddress = await hasAddressForOrder(
+              org.id,
+              from,
+              result.order_id
+            );
+
+            const clarifyStart = await startClarifyForOrder({
+              org_id: org.id,
+              order_id: result.order_id,
+              from_phone: from,
+            });
+
+            if (clarifyStart) {
+              reply = clarifyStart;
+            } else {
+              const summary = formatOrderSummary(items);
+
+              if (alreadyHasAddress) {
+                // customer already shared address → never ask again
+                reply = "✅ Updated order:\n" + summary;
+              } else {
+                // ask address only if never given
+                await startAddressSessionForOrder({
+                  org_id: org.id,
+                  order_id: result.order_id,
+                  from_phone: from,
+                });
+
+                reply =
+                  "✅ We’ve got your order:\n" +
+                  summary +
+                  "\n\n📍 Please share your delivery address (or send location) if you haven’t already.";
+              }
+            }
+          }
+
+          // 3) Inquiry path → smart price/availability
+          if (!reply && result.kind === "inquiry") {
             const inquiryType = result.inquiry || result.inquiry_type || null;
             reply = await buildSmartInquiryReply({
               org_id: org.id,
@@ -263,26 +1055,33 @@ waba.post('/', async (req, res) => {
               inquiryType,
             });
             if (!reply) {
-              reply = '💬 Got your question. We’ll confirm the details shortly.';
+              reply = "💬 Got your question. We’ll confirm the details shortly.";
             }
           }
 
-          // 3) Heuristic question fallback
+          // 4) Heuristic question fallback
           if (
             !reply &&
-            /price|rate|how much|available|stock|do you have/i.test(text.toLowerCase())
+            /price|rate|how much|available|stock|do you have/i.test(
+              lowerText
+            )
           ) {
-            reply = '💬 Got your question. We’ll check and reply in a moment.';
+            reply = "💬 Got your question. We’ll check and reply in a moment.";
           }
 
-          // 4) Skip obvious small-talk
-          if (!reply && !result.stored && result.reason === 'small_talk_or_non_order') {
+          // 5) Skip obvious small-talk
+          if (
+            !reply &&
+            !result.stored &&
+            result.reason === "small_talk_or_non_order"
+          ) {
             reply = null;
           }
 
-          // 5) Final fail-soft ack (polite default)
+          // 6) Final fail-soft ack (polite default)
           if (!reply) {
-            reply = '✅ Thanks! We’ve got your message. We’ll follow up if we need any clarification.';
+            reply =
+              "✅ Thanks! We’ve got your message. We’ll follow up if we need any clarification.";
           }
 
           if (reply) {
@@ -299,7 +1098,7 @@ waba.post('/', async (req, res) => {
 
     return res.sendStatus(200);
   } catch (e: any) {
-    console.error('[WABA][ERR]', e?.message || e);
+    console.error("[WABA][ERR]", e?.message || e);
     return res.sendStatus(200);
   }
 });
@@ -315,38 +1114,38 @@ async function sendWabaText(opts: {
 }) {
   const token = process.env.WA_ACCESS_TOKEN || process.env.META_WA_TOKEN;
   if (!token) {
-    console.warn('[WABA] WA_ACCESS_TOKEN missing, cannot send reply');
+    console.warn("[WABA] WA_ACCESS_TOKEN missing, cannot send reply");
     return;
   }
 
-  const toNorm = opts.to.startsWith('+') ? opts.to : `+${opts.to}`;
+  const toNorm = opts.to.startsWith("+") ? opts.to : `+${opts.to}`;
 
   try {
     const resp = await axios.post(
       `${META_WA_BASE}/${opts.phoneNumberId}/messages`,
       {
-        messaging_product: 'whatsapp',
+        messaging_product: "whatsapp",
         to: toNorm,
-        type: 'text',
+        type: "text",
         text: { body: opts.text },
       },
       {
         headers: {
           Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
+          "Content-Type": "application/json",
         },
       }
     );
 
-    console.log('[WABA][SEND]', { to: toNorm, text: opts.text });
+    console.log("[WABA][SEND]", { to: toNorm, text: opts.text });
 
     if (opts.orgId) {
       try {
         const { data: conv, error: convErr } = await supa
-          .from('conversations')
-          .select('id')
-          .eq('org_id', opts.orgId)
-          .eq('customer_phone', toNorm.replace(/^\+/, ''))
+          .from("conversations")
+          .select("id")
+          .eq("org_id", opts.orgId)
+          .eq("customer_phone", toNorm.replace(/^\+/, ""))
           .limit(1)
           .maybeSingle();
 
@@ -354,10 +1153,10 @@ async function sendWabaText(opts: {
 
         if (!convId) {
           const { data: conv2 } = await supa
-            .from('conversations')
-            .select('id')
-            .eq('org_id', opts.orgId)
-            .eq('customer_phone', toNorm)
+            .from("conversations")
+            .select("id")
+            .eq("org_id", opts.orgId)
+            .eq("customer_phone", toNorm)
             .limit(1)
             .maybeSingle();
           convId = conv2?.id || null;
@@ -369,26 +1168,28 @@ async function sendWabaText(opts: {
               ? String(resp.data.messages[0].id)
               : null;
 
-          const { error: msgErr } = await supa.from('messages').insert({
+          const { error: msgErr } = await supa.from("messages").insert({
             org_id: opts.orgId,
             conversation_id: convId,
-            direction: 'out',
-            sender_type: 'ai',
-            channel: 'waba',
+            direction: "out",
+            sender_type: "ai",
+            channel: "waba",
             body: opts.text,
             wa_msg_id,
           });
           if (msgErr) {
-            console.warn('[INBOX][MSG out err]', msgErr.message);
+            console.warn("[INBOX][MSG out err]", msgErr.message);
           }
         }
       } catch (e: any) {
-        console.warn('[INBOX][outbound log err]', e?.message || e);
+        console.warn("[INBOX][outbound log err]", e?.message || e);
       }
     }
   } catch (e: any) {
-    console.warn('[WABA][SEND_ERR]', e?.response?.data || e?.message || e);
+    console.warn("[WABA][SEND_ERR]", e?.response?.data || e?.message || e);
   }
 }
+
+
 
 export default waba;
