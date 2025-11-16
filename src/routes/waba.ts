@@ -289,145 +289,174 @@ async function findActiveOrderForPhoneExcluding(
 
 // All active orders for a phone (pending + paid), newest first
 async function findAllActiveOrdersForPhone(
-    org_id: string,
-    from_phone: string
-  ): Promise<any[]> {
-    try {
-      const { data, error } = await supa
-        .from("orders")
-        .select("id, items, status, source_phone, created_at")
-        .eq("org_id", org_id)
-        .eq("source_phone", from_phone)
-        .in("status", ["pending", "paid"])
-        .order("created_at", { ascending: false });
-  
-      if (error) {
-        console.warn("[WABA][allActiveOrders err]", error.message);
-        return [];
-      }
-      return data || [];
-    } catch (e: any) {
-      console.warn("[WABA][allActiveOrders catch]", e?.message || e);
+  org_id: string,
+  from_phone: string
+): Promise<any[]> {
+  try {
+    const { data, error } = await supa
+      .from("orders")
+      .select("id, items, status, source_phone, created_at")
+      .eq("org_id", org_id)
+      .eq("source_phone", from_phone)
+      .in("status", ["pending", "paid"])
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.warn("[WABA][allActiveOrders err]", error.message);
       return [];
     }
+    return data || [];
+  } catch (e: any) {
+    console.warn("[WABA][allActiveOrders catch]", e?.message || e);
+    return [];
   }
+}
 
 // Most recent order for a customer (ANY status)
 // Used as a fallback for cancel if nothing is "active"
 async function findMostRecentOrderForPhone(
-    org_id: string,
-    from_phone: string
-  ): Promise<any | null> {
-    try {
-      const { data, error } = await supa
-        .from("orders")
-        .select("id, items, status, source_phone, created_at")
-        .eq("org_id", org_id)
-        .eq("source_phone", from_phone)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-  
-      if (error) {
-        console.warn("[WABA][mostRecentOrder err]", error.message);
-        return null;
-      }
-      return data || null;
-    } catch (e: any) {
-      console.warn("[WABA][mostRecentOrder catch]", e?.message || e);
+  org_id: string,
+  from_phone: string
+): Promise<any | null> {
+  try {
+    const { data, error } = await supa
+      .from("orders")
+      .select("id, items, status, source_phone, created_at")
+      .eq("org_id", org_id)
+      .eq("source_phone", from_phone)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.warn("[WABA][mostRecentOrder err]", error.message);
       return null;
     }
+    return data || null;
+  } catch (e: any) {
+    console.warn("[WABA][mostRecentOrder catch]", e?.message || e);
+    return null;
   }
+}
 
+function shortOrderLine(order: any, index: number): string {
+  const items = (order.items || []) as any[];
+  const first = items[0];
+  const firstName = first
+    ? (first.canonical || first.name || "item").toString()
+    : "item";
+  const extraCount = Math.max(items.length - 1, 0);
+  const extraText = extraCount > 0 ? ` + ${extraCount} more` : "";
+  return `${index}. ${firstName}${extraText}`;
+}
 
-  function shortOrderLine(order: any, index: number): string {
-    const items = (order.items || []) as any[];
-    const first = items[0];
-    const firstName = first
-      ? (first.canonical || first.name || "item").toString()
-      : "item";
-    const extraCount = Math.max(items.length - 1, 0);
-    const extraText = extraCount > 0 ? ` + ${extraCount} more` : "";
-    return `${index}. ${firstName}${extraText}`;
+// ─────────────────────────────
+// Debug flow logger (non-invasive)
+// ─────────────────────────────
+async function logFlowEvent(opts: {
+  orgId: string;
+  from?: string;
+  event: string;
+  msgId?: string;
+  orderId?: string | null;
+  text?: string | null;
+  result?: any;
+  meta?: any;
+}) {
+  try {
+    await supa.from("waba_flow_logs").insert({
+      org_id: opts.orgId,
+      customer_phone: opts.from || null,
+      event: opts.event,
+      msg_id: opts.msgId || null,
+      order_id: opts.orderId || null,
+      text: opts.text || null,
+      result: opts.result ?? null,
+      meta: opts.meta ?? null,
+      source: "waba",
+    });
+  } catch (e: any) {
+    console.warn("[WABA][FLOW_LOG_ERR]", e?.message || e);
   }
+}
 
 // Start MULTI-TURN CLARIFY session (for items)
 // - applies last-variant memory first
 // - returns first question text, or null if nothing to clarify.
 async function startClarifyForOrder(opts: {
-    org_id: string;
-    order_id: string;
-    from_phone: string;
-  }): Promise<string | null> {
-    const { org_id, order_id, from_phone } = opts;
-    const phoneKey = normalizePhoneForKey(from_phone);
-  
-    const { data: orderRow, error: orderErr } = await supa
-      .from("orders")
-      .select("id, items, source_phone")
-      .eq("id", order_id)
-      .single();
-  
-    if (orderErr || !orderRow) {
-      console.warn("[WABA][clarify start] order not found", orderErr?.message);
-      return null;
-    }
-  
-    let items = ((orderRow as any).items || []) as any[];
-    let modified = false;
-  
-    // 1) Apply last variant memory
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i] || {};
-      if (it.variant) continue;
-  
-      const labelRaw = String(it.canonical || it.name || "")
-        .replace(/\s+/g, " ")
-        .trim();
-      if (!labelRaw) continue;
-  
-      const lastVariant = await getCustomerLastVariant(
-        org_id,
-        from_phone,
-        labelRaw
-      );
-      if (lastVariant) {
-        modified = true;
-        items[i] = { ...it, variant: lastVariant };
-      }
-    }
-  
-    if (modified) {
-      await supa.from("orders").update({ items }).eq("id", order_id);
-    }
-  
-    // 2) Find remaining ambiguous items
-    let choices = await findAmbiguousItemsForOrder(org_id, items);
-    choices = choices.filter((c) => !items[c.index].variant);
-  
-    if (!choices.length) return null;
-  
-    const first = choices[0];
-  
-    // Close older sessions
-    await supa
-      .from("order_clarify_sessions")
-      .update({ status: "closed", updated_at: new Date().toISOString() })
-      .eq("org_id", org_id)
-      .eq("customer_phone", phoneKey)
-      .eq("status", "open");
-  
-    // Create new session
-    await supa.from("order_clarify_sessions").insert({
-      org_id,
-      order_id,
-      customer_phone: phoneKey,
-      status: "open",
-      current_index: first.index,
-    });
-  
-    return buildClarifyQuestionText(first);
+  org_id: string;
+  order_id: string;
+  from_phone: string;
+}): Promise<string | null> {
+  const { org_id, order_id, from_phone } = opts;
+  const phoneKey = normalizePhoneForKey(from_phone);
+
+  const { data: orderRow, error: orderErr } = await supa
+    .from("orders")
+    .select("id, items, source_phone")
+    .eq("id", order_id)
+    .single();
+
+  if (orderErr || !orderRow) {
+    console.warn("[WABA][clarify start] order not found", orderErr?.message);
+    return null;
   }
+
+  let items = ((orderRow as any).items || []) as any[];
+  let modified = false;
+
+  // 1) Apply last variant memory
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i] || {};
+    if (it.variant) continue;
+
+    const labelRaw = String(it.canonical || it.name || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!labelRaw) continue;
+
+    const lastVariant = await getCustomerLastVariant(
+      org_id,
+      from_phone,
+      labelRaw
+    );
+    if (lastVariant) {
+      modified = true;
+      items[i] = { ...it, variant: lastVariant };
+    }
+  }
+
+  if (modified) {
+    await supa.from("orders").update({ items }).eq("id", order_id);
+  }
+
+  // 2) Find remaining ambiguous items
+  let choices = await findAmbiguousItemsForOrder(org_id, items);
+  choices = choices.filter((c) => !items[c.index].variant);
+
+  if (!choices.length) return null;
+
+  const first = choices[0];
+
+  // Close older sessions
+  await supa
+    .from("order_clarify_sessions")
+    .update({ status: "closed", updated_at: new Date().toISOString() })
+    .eq("org_id", org_id)
+    .eq("customer_phone", phoneKey)
+    .eq("status", "open");
+
+  // Create new session
+  await supa.from("order_clarify_sessions").insert({
+    org_id,
+    order_id,
+    customer_phone: phoneKey,
+    status: "open",
+    current_index: first.index,
+  });
+
+  return buildClarifyQuestionText(first);
+}
 
 // Start ADDRESS session (no more item clarifications needed)
 // - next text from this customer will be treated as address, not order.
@@ -540,7 +569,7 @@ async function maybeHandleClarifyReply(opts: {
       .update({ status: "address_done", updated_at: new Date().toISOString() })
       .eq("id", session.id);
 
-      // 🔹 Mark that we JUST finished an address flow
+    // 🔹 Mark that we JUST finished an address flow
     //    → next order-like message should be treated as "add to same order"
     lastCommandByPhone.set(from, "address_done");
 
@@ -700,51 +729,50 @@ async function maybeHandleClarifyReply(opts: {
 
   if (!stillAmbiguous.length) {
     // All clarified → close clarify session
-await supa
-.from("order_clarify_sessions")
-.update({ status: "closed", updated_at: new Date().toISOString() })
-.eq("id", session.id);
+    await supa
+      .from("order_clarify_sessions")
+      .update({ status: "closed", updated_at: new Date().toISOString() })
+      .eq("id", session.id);
 
-// Check if customer already provided address (any previous address_done)
-const alreadyHasAddress = await hasAddressForOrder(org_id, from, order.id);
+    // Check if customer already provided address (any previous address_done)
+    const alreadyHasAddress = await hasAddressForOrder(org_id, from, order.id);
 
-const summary = formatOrderSummary(items);
+    const summary = formatOrderSummary(items);
 
-if (alreadyHasAddress) {
-// Customer has given address before → DO NOT ask again
-const finalText =
-  "✅ Updated order:\n" + summary;
+    if (alreadyHasAddress) {
+      // Customer has given address before → DO NOT ask again
+      const finalText = "✅ Updated order:\n" + summary;
 
-await sendWabaText({
-  phoneNumberId,
-  to: from,
-  text: finalText,
-  orgId: org_id,
-});
+      await sendWabaText({
+        phoneNumberId,
+        to: from,
+        text: finalText,
+        orgId: org_id,
+      });
 
-return true;
-}
+      return true;
+    }
 
-// If no address yet → open address session ONCE
-await startAddressSessionForOrder({
-org_id,
-order_id: order.id,
-from_phone: from,
-});
+    // If no address yet → open address session ONCE
+    await startAddressSessionForOrder({
+      org_id,
+      order_id: order.id,
+      from_phone: from,
+    });
 
-const finalText =
-"✅ Order confirmed:\n" +
-summary +
-"\n\n📍 Please share your delivery address (or send location) if you haven’t already.";
+    const finalText =
+      "✅ Order confirmed:\n" +
+      summary +
+      "\n\n📍 Please share your delivery address (or send location) if you haven’t already.";
 
-await sendWabaText({
-phoneNumberId,
-to: from,
-text: finalText,
-orgId: org_id,
-});
+    await sendWabaText({
+      phoneNumberId,
+      to: from,
+      text: finalText,
+      orgId: org_id,
+    });
 
-return true;
+    return true;
   }
 
   // Move to next item and ask again
@@ -802,17 +830,21 @@ function looksLikeAddToExisting(text: string): boolean {
 // Explicit user commands: NEW / CANCEL / UPDATE / AGENT
 // ─────────────────────────────
 
-type UserCommand = "new" | "cancel" | "update" | "agent" | "address_done" | "cancel_select" | null;
+type UserCommand =
+  | "new"
+  | "cancel"
+  | "update"
+  | "agent"
+  | "address_done"
+  | "cancel_select"
+  | null;
 
 // last action per phone (in-memory, per Node process)
 const lastCommandByPhone = new Map<string, UserCommand>();
 
 // when we show "you have multiple active orders, reply 1/2/3",
 // we store the order IDs here for that phone
-const pendingCancelOptions = new Map<
-  string,
-  { orderIds: string[] }
->();
+const pendingCancelOptions = new Map<string, { orderIds: string[] }>();
 
 // Track if we already showed the commands tip for this phone (per process)
 const commandsTipShown = new Set<string>();
@@ -877,7 +909,6 @@ function detectUserCommand(text: string): UserCommand {
 // 2) Incoming messages (POST)
 // ─────────────────────────────
 waba.post("/", async (req, res) => {
-    
   try {
     console.log("[WABA][RAW BODY]", JSON.stringify(req.body));
 
@@ -958,81 +989,91 @@ waba.post("/", async (req, res) => {
           });
 
           // 0.15) If we are waiting for the user to choose WHICH order to cancel
-// const lastCmd = lastCommandByPhone.get(from);
-const lastCmd = lastCommandByPhone.get(from);
-if (lastCmd === "cancel_select") {
-  const choiceNum = parseInt(lowerText, 10);
+          const lastCmd = lastCommandByPhone.get(from);
+          if (lastCmd === "cancel_select") {
+            const choiceNum = parseInt(lowerText, 10);
 
-  const options = pendingCancelOptions.get(from);
-  if (!options || !options.orderIds.length) {
-    // nothing to select anymore → reset and let normal flow handle
-    lastCommandByPhone.delete(from);
-  } else if (!Number.isNaN(choiceNum)) {
-    const idx = choiceNum - 1;
-    const orderId = options.orderIds[idx];
+            const options = pendingCancelOptions.get(from);
+            if (!options || !options.orderIds.length) {
+              // nothing to select anymore → reset and let normal flow handle
+              lastCommandByPhone.delete(from);
+            } else if (!Number.isNaN(choiceNum)) {
+              const idx = choiceNum - 1;
+              const orderId = options.orderIds[idx];
 
-    if (idx < 0 || idx >= options.orderIds.length || !orderId) {
-      await sendWabaText({
-        phoneNumberId,
-        to: from,
-        text:
-          "Please reply with a valid number from the list (for example 1 or 2).",
-        orgId: org.id,
-      });
-      continue;
-    }
+              if (idx < 0 || idx >= options.orderIds.length || !orderId) {
+                await sendWabaText({
+                  phoneNumberId,
+                  to: from,
+                  text:
+                    "Please reply with a valid number from the list (for example 1 or 2).",
+                  orgId: org.id,
+                });
+                continue;
+              }
 
-    // Cancel the chosen order
-    const { data: ordRow, error: ordErr } = await supa
-      .from("orders")
-      .select("id, items, status")
-      .eq("id", orderId)
-      .single();
+              // Cancel the chosen order
+              const { data: ordRow, error: ordErr } = await supa
+                .from("orders")
+                .select("id, items, status")
+                .eq("id", orderId)
+                .single();
 
-    if (ordErr || !ordRow) {
-      await sendWabaText({
-        phoneNumberId,
-        to: from,
-        text:
-          "I couldn’t find that order anymore. It may have already been updated by the store.",
-        orgId: org.id,
-      });
-    } else {
-      // mark as cancelled
-      await supa
-        .from("orders")
-        .update({ status: "cancelled_by_customer" })
-        .eq("id", orderId);
+              if (ordErr || !ordRow) {
+                await sendWabaText({
+                  phoneNumberId,
+                  to: from,
+                  text:
+                    "I couldn’t find that order anymore. It may have already been updated by the store.",
+                  orgId: org.id,
+                });
+              } else {
+                // mark as cancelled
+                await supa
+                  .from("orders")
+                  .update({ status: "cancelled_by_customer" })
+                  .eq("id", orderId);
 
-      const summary = formatOrderSummary(ordRow.items || []);
+                const summary = formatOrderSummary(ordRow.items || []);
 
-      const txt =
-        "❌ The selected order has been cancelled:\n" +
-        summary +
-        "\n\nIf this was a mistake, you can send a new order.";
-      await sendWabaText({
-        phoneNumberId,
-        to: from,
-        text: txt,
-        orgId: org.id,
-      });
-    }
+                const txt =
+                  "❌ The selected order has been cancelled:\n" +
+                  summary +
+                  "\n\nIf this was a mistake, you can send a new order.";
 
-    // clear state
-    lastCommandByPhone.delete(from);
-    pendingCancelOptions.delete(from);
-    continue;
-  } else {
-    await sendWabaText({
-      phoneNumberId,
-      to: from,
-      text:
-        "Please reply with the number of the order you want to cancel (for example 1 or 2).",
-      orgId: org.id,
-    });
-    continue;
-  }
-}
+                await sendWabaText({
+                  phoneNumberId,
+                  to: from,
+                  text: txt,
+                  orgId: org.id,
+                });
+
+                await logFlowEvent({
+                  orgId: org.id,
+                  from,
+                  event: "cancel_select_done",
+                  msgId,
+                  orderId,
+                  text,
+                  result: { summary },
+                });
+              }
+
+              // clear state
+              lastCommandByPhone.delete(from);
+              pendingCancelOptions.delete(from);
+              continue;
+            } else {
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                text:
+                  "Please reply with the number of the order you want to cancel (for example 1 or 2).",
+                orgId: org.id,
+              });
+              continue;
+            }
+          }
 
           // 0) If we’re in clarify/address session → consume here and SKIP ingestCore
           const handledByClarify = await maybeHandleClarifyReply({
@@ -1056,103 +1097,138 @@ if (lastCmd === "cancel_select") {
                 "You can also just type your items, e.g. “2kg onion, 1L milk”.",
               orgId: org.id,
             });
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "commands_menu_shown",
+              msgId,
+              text,
+            });
+
             continue;
           }
-
 
           if (handledByClarify) {
             continue;
           }
 
           // 0.1) "order summary" → show ALL active (pending/paid) orders
-if (
-    /order summary|my order|my orders|show my order|show my orders/i.test(
-      lowerText
-    )
-  ) {
-    const activeOrders = await findAllActiveOrdersForPhone(org.id, from);
-  
-    if (!activeOrders.length) {
-      await sendWabaText({
-        phoneNumberId,
-        to: from,
-        text:
-          "📦 You don’t have any active orders right now.\n" +
-          "If you’d like to place a new order, just send your items here.",
-        orgId: org.id,
-      });
-    } else {
-      const blocks = activeOrders.map((o, idx) => {
-        const n = idx + 1;
-        const summary = formatOrderSummary(o.items || []);
-        const status = String(o.status || "pending");
-        return (
-          `#${n} — status: ${status}\n` +
-          (summary || "(no items found)")
-        );
-      });
-  
-      const textOut =
-        "📦 Your active orders:\n\n" +
-        blocks.join("\n\n") +
-        "\n\nTo cancel one, you can type *cancel* and choose the order.";
-  
-      await sendWabaText({
-        phoneNumberId,
-        to: from,
-        text: textOut,
-        orgId: org.id,
-      });
-    }
-  
-    continue;
-  }
+          if (
+            /order summary|my order|my orders|show my order|show my orders/i.test(
+              lowerText
+            )
+          ) {
+            const activeOrders = await findAllActiveOrdersForPhone(org.id, from);
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "order_summary_active",
+              msgId,
+              text,
+              meta: { activeCount: activeOrders.length },
+            });
+
+            if (!activeOrders.length) {
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                text:
+                  "📦 You don’t have any active orders right now.\n" +
+                  "If you’d like to place a new order, just send your items here.",
+                orgId: org.id,
+              });
+            } else {
+              const blocks = activeOrders.map((o, idx) => {
+                const n = idx + 1;
+                const summary = formatOrderSummary(o.items || []);
+                const status = String(o.status || "pending");
+                return (
+                  `#${n} — status: ${status}\n` +
+                  (summary || "(no items found)")
+                );
+              });
+
+              const textOut =
+                "📦 Your active orders:\n\n" +
+                blocks.join("\n\n") +
+                "\n\nTo cancel one, you can type *cancel* and choose the order.";
+
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                text: textOut,
+                orgId: org.id,
+              });
+            }
+
+            continue;
+          }
 
           // 0.2) Explicit commands: NEW / CANCEL / UPDATE / AGENT
           const cmd = detectUserCommand(text);
 
-                    // 0.18) Show last order summary (read-only)
-                    if (
-                        /order summary/i.test(lowerText) ||
-                        /show (my )?order/i.test(lowerText) ||
-                        /last order/i.test(lowerText)
-                      ) {
-                        const last = await findMostRecentOrderForPhone(org.id, from);
-            
-                        if (!last || !Array.isArray(last.items) || last.items.length === 0) {
-                          await sendWabaText({
-                            phoneNumberId,
-                            to: from,
-                            text: "I couldn’t find any previous orders for this number.",
-                            orgId: org.id,
-                          });
-                        } else {
-                          const summary = formatOrderSummary(last.items || []);
-            
-                          const rawStatus = String(last.status || "pending");
-                          let statusText = `Status: ${rawStatus}`;
-                          if (rawStatus === "pending") statusText = "🟡 Status: pending";
-                          else if (rawStatus === "paid") statusText = "🟢 Status: paid";
-                          else if (rawStatus.startsWith("cancelled")) statusText = "🔴 Status: cancelled";
-            
-                          const text =
-                            "📦 Your last order:\n" +
-                            summary +
-                            "\n\n" +
-                            statusText;
-            
-                          await sendWabaText({
-                            phoneNumberId,
-                            to: from,
-                            text,
-                            orgId: org.id,
-                          });
-                        }
-            
-                        continue;
-                      }
+          // 0.18) Show last order summary (read-only)
+          if (
+            /order summary/i.test(lowerText) ||
+            /show (my )?order/i.test(lowerText) ||
+            /last order/i.test(lowerText)
+          ) {
+            const last = await findMostRecentOrderForPhone(org.id, from);
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "order_summary_last",
+              msgId,
+              text,
+              orderId: last?.id || null,
+            });
+
+            if (!last || !Array.isArray(last.items) || last.items.length === 0) {
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                text: "I couldn’t find any previous orders for this number.",
+                orgId: org.id,
+              });
+            } else {
+              const summary = formatOrderSummary(last.items || []);
+
+              const rawStatus = String(last.status || "pending");
+              let statusText = `Status: ${rawStatus}`;
+              if (rawStatus === "pending") statusText = "🟡 Status: pending";
+              else if (rawStatus === "paid") statusText = "🟢 Status: paid";
+              else if (rawStatus.startsWith("cancelled"))
+                statusText = "🔴 Status: cancelled";
+
+              const textOut =
+                "📦 Your last order:\n" +
+                summary +
+                "\n\n" +
+                statusText;
+
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                text: textOut,
+                orgId: org.id,
+              });
+            }
+
+            continue;
+          }
 
           if (cmd === "agent") {
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "command_agent",
+              msgId,
+              text,
+            });
+
             await sendWabaText({
               phoneNumberId,
               to: from,
@@ -1167,7 +1243,16 @@ if (
 
           if (cmd === "cancel") {
             const activeOrders = await findAllActiveOrdersForPhone(org.id, from);
-          
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "command_cancel",
+              msgId,
+              text,
+              meta: { activeCount: activeOrders.length },
+            });
+
             if (!activeOrders.length) {
               await sendWabaText({
                 phoneNumberId,
@@ -1179,41 +1264,58 @@ if (
               });
               continue;
             }
-          
+
             if (activeOrders.length === 1) {
               // Same behaviour as before (Option A) – cancel the single active order
               const activeOrderForCancel = activeOrders[0];
-          
+
               await supa
                 .from("orders")
                 .update({ status: "cancelled_by_customer" })
                 .eq("id", activeOrderForCancel.id);
-          
+
               const summary = formatOrderSummary(activeOrderForCancel.items || []);
-          
+
               const textOut =
                 "❌ Your last order has been cancelled:\n" +
                 summary +
                 "\n\nIf this was a mistake, you can send a new order.";
-          
+
               await sendWabaText({
                 phoneNumberId,
                 to: from,
                 text: textOut,
                 orgId: org.id,
               });
-          
+
+              await maybeSendCommandsTip({
+                phoneNumberId,
+                to: from,
+                orgId: org.id,
+              });
+
               // remember last action (if you still want it)
               lastCommandByPhone.set(from, "cancel");
+
+              await logFlowEvent({
+                orgId: org.id,
+                from,
+                event: "command_cancel_single",
+                msgId,
+                orderId: activeOrderForCancel.id,
+                text,
+                result: { summary },
+              });
+
               continue;
             }
-          
+
             // Multiple active orders → ask user to choose
             lastCommandByPhone.set(from, "cancel_select");
-          
+
             const orderIds = activeOrders.map((o) => o.id);
             pendingCancelOptions.set(from, { orderIds });
-          
+
             const lines = activeOrders.map((o, idx) => {
               const n = idx + 1;
               const items = (o.items || []) as any[];
@@ -1226,26 +1328,43 @@ if (
               const status = String(o.status || "pending");
               return `${n}) ${firstName}${extra}  [${status}]`;
             });
-          
+
             const textOut =
               "You have multiple active orders:\n" +
               lines.join("\n") +
               "\n\nReply with the number of the order you want to cancel (for example 1 or 2).";
-          
+
             await sendWabaText({
               phoneNumberId,
               to: from,
               text: textOut,
               orgId: org.id,
             });
-          
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "command_cancel_multi",
+              msgId,
+              text,
+              meta: { orderIds },
+            });
+
             continue;
           }
 
           if (cmd === "new") {
             // remember last command
             lastCommandByPhone.set(from, "new");
-          
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "command_new",
+              msgId,
+              text,
+            });
+
             // 1) Close all active orders for this phone
             await supa
               .from("orders")
@@ -1253,16 +1372,19 @@ if (
               .eq("org_id", org.id)
               .eq("source_phone", from)
               .in("status", ["pending", "paid"]);
-          
+
             // 2) Close clarify/address sessions
             const phoneKey = normalizePhoneForKey(from);
             await supa
               .from("order_clarify_sessions")
-              .update({ status: "closed", updated_at: new Date().toISOString() })
+              .update({
+                status: "closed",
+                updated_at: new Date().toISOString(),
+              })
               .eq("org_id", org.id)
               .eq("customer_phone", phoneKey)
               .eq("status", "open");
-          
+
             // 3) Respond
             await sendWabaText({
               phoneNumberId,
@@ -1270,11 +1392,19 @@ if (
               text: "👍 Starting a fresh order. Please send the items you’d like to buy.",
               orgId: org.id,
             });
-          
+
             continue;
           }
 
           if (cmd === "update") {
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "command_update",
+              msgId,
+              text,
+            });
+
             // We do *not* auto-edit any existing order in V1.
             await sendWabaText({
               phoneNumberId,
@@ -1290,6 +1420,15 @@ if (
           // 0.8) Edit-like messages while an order is open → safe fallback (no auto edit in V1)
           const activeOrderForEdit = await findActiveOrderForPhone(org.id, from);
           if (activeOrderForEdit && isLikelyEditRequest(text)) {
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "edit_like_message",
+              msgId,
+              text,
+              orderId: activeOrderForEdit.id,
+            });
+
             await sendWabaText({
               phoneNumberId,
               to: from,
@@ -1325,17 +1464,32 @@ if (
             stored: result.stored,
           });
 
+          await logFlowEvent({
+            orgId: org.id,
+            from,
+            event: "ingest_result",
+            msgId,
+            orderId: result.order_id || null,
+            text,
+            result,
+            meta: {
+              kind: result.kind,
+              reason: result.reason,
+              stored: result.stored,
+              lastCmd,
+            },
+          });
+
           if (!org.auto_reply_enabled) continue;
 
           let reply: string | null = null;
 
-          
           const shouldForceMergeAfterAddress = lastCmd === "address_done";
 
           const canMerge =
-          lastCmd !== "cancel" &&
-          lastCmd !== "new" &&
-          (looksLikeAddToExisting(text) || shouldForceMergeAfterAddress);
+            lastCmd !== "cancel" &&
+            lastCmd !== "new" &&
+            (looksLikeAddToExisting(text) || shouldForceMergeAfterAddress);
 
           // 1.5) If this is an order and there is a PREVIOUS open order,
           // MERGE when:
@@ -1380,6 +1534,21 @@ if (
                 // Point the result at the merged/base order
                 result.order_id = previousOpen.id;
                 result.items = mergedItems;
+
+                await logFlowEvent({
+                  orgId: org.id,
+                  from,
+                  event: "merged_into_existing_order",
+                  msgId,
+                  orderId: previousOpen.id,
+                  text,
+                  result: {
+                    mergedInto: previousOpen.id,
+                    newOrderId: result.order_id,
+                    addedItems: newItems.length,
+                    baseItems: baseItems.length,
+                  },
+                });
               }
             }
           }
@@ -1471,7 +1640,27 @@ if (
               text: reply,
               orgId: org.id,
             });
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "auto_reply_decided",
+              msgId,
+              orderId: result.order_id || null,
+              text: reply,
+              result: {
+                kind: result.kind,
+                reason: result.reason,
+              },
+            });
           }
+
+          // Optionally show commands tip once per phone
+        //   await maybeSendCommandsTip({
+        //     phoneNumberId,
+        //     to: from,
+        //     orgId: org.id,
+        //   });
         }
       }
     }
@@ -1518,6 +1707,27 @@ async function sendWabaText(opts: {
     );
 
     console.log("[WABA][SEND]", { to: toNorm, text: opts.text });
+
+    // Debug-flow log for outbound auto replies
+    if (opts.orgId) {
+      try {
+        await logFlowEvent({
+          orgId: opts.orgId,
+          from: toNorm.replace(/^\+/, ""),
+          event: "auto_reply_sent",
+          msgId:
+            resp.data?.messages && resp.data.messages[0]?.id
+              ? String(resp.data.messages[0].id)
+              : undefined,
+          text: opts.text,
+          meta: {
+            phoneNumberId: opts.phoneNumberId,
+          },
+        });
+      } catch (e: any) {
+        console.warn("[WABA][FLOW_LOG_OUT_ERR]", e?.message || e);
+      }
+    }
 
     if (opts.orgId) {
       try {
@@ -1569,7 +1779,5 @@ async function sendWabaText(opts: {
     console.warn("[WABA][SEND_ERR]", e?.response?.data || e?.message || e);
   }
 }
-
-
 
 export default waba;
