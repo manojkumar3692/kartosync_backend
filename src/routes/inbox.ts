@@ -42,6 +42,11 @@ function normE164(s: string): string {
   return t.startsWith("+") ? t : `+${t}`;
 }
 
+// NEW: digits-only normalizer for customer phone keys
+function normalizePhoneForKey(raw: string): string {
+  return String(raw || "").replace(/[^\d]/g, "");
+}
+
 // ───────────────── GET /conversations ─────────────────
 // Source of truth: conversations table (created by ingest upserts)
 inbox.get("/conversations", async (req, res) => {
@@ -104,111 +109,111 @@ inbox.get("/conversations/:conversationId/messages", async (req, res) => {
 // ───────────────── POST /send ─────────────────
 // Body: { org_id, phone, text }  (phone optional if you prefer conversation_id later)
 inbox.post("/send", express.json(), async (req, res) => {
-    try {
-      const orgId = getOrgId(req) || String(req.body?.org_id || "");
-      // accept either `phone` or legacy `to`
-      const phoneRaw = String(req.body?.phone || req.body?.to || "");
-      const text = String(req.body?.text || "");
-      if (!orgId) return res.status(401).json({ ok: false, error: "no_org" });
-      if (!phoneRaw || !text) {
-        return res.status(400).json({ ok: false, error: "phone_and_text_required" });
-      }
-  
-      // find org → phone_number_id
-      const { data: orgs, error: orgErr } = await supa
-        .from("orgs")
-        .select("id, wa_phone_number_id")
-        .eq("id", orgId)
-        .limit(1)
-        .single();
-  
-      if (orgErr) throw orgErr;
-      const phoneNumberId = (orgs as any)?.wa_phone_number_id;
-      if (!phoneNumberId) {
-        return res.status(400).json({ ok: false, error: "org_missing_wa_phone_number_id" });
-      }
-  
-      if (!META_WA_TOKEN) {
-        console.warn("[INBOX][send] META_WA_TOKEN/WA_ACCESS_TOKEN missing");
-        return res.status(500).json({ ok: false, error: "wa_token_missing" });
-      }
-  
-      const toNorm = normE164(phoneRaw);
-  
-      // Send via Cloud API
-      const resp = await axios.post(
-        `${META_WA_BASE}/${phoneNumberId}/messages`,
-        {
-          messaging_product: "whatsapp",
-          to: toNorm,
-          type: "text",
-          text: { body: text },
+  try {
+    const orgId = getOrgId(req) || String(req.body?.org_id || "");
+    // accept either `phone` or legacy `to`
+    const phoneRaw = String(req.body?.phone || req.body?.to || "");
+    const text = String(req.body?.text || "");
+    if (!orgId) return res.status(401).json({ ok: false, error: "no_org" });
+    if (!phoneRaw || !text) {
+      return res.status(400).json({ ok: false, error: "phone_and_text_required" });
+    }
+
+    // find org → phone_number_id
+    const { data: orgs, error: orgErr } = await supa
+      .from("orgs")
+      .select("id, wa_phone_number_id")
+      .eq("id", orgId)
+      .limit(1)
+      .single();
+
+    if (orgErr) throw orgErr;
+    const phoneNumberId = (orgs as any)?.wa_phone_number_id;
+    if (!phoneNumberId) {
+      return res.status(400).json({ ok: false, error: "org_missing_wa_phone_number_id" });
+    }
+
+    if (!META_WA_TOKEN) {
+      console.warn("[INBOX][send] META_WA_TOKEN/WA_ACCESS_TOKEN missing");
+      return res.status(500).json({ ok: false, error: "wa_token_missing" });
+    }
+
+    const toNorm = normE164(phoneRaw);
+
+    // Send via Cloud API
+    const resp = await axios.post(
+      `${META_WA_BASE}/${phoneNumberId}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to: toNorm,
+        type: "text",
+        text: { body: text },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${META_WA_TOKEN}`,
+          "Content-Type": "application/json",
         },
-        {
-          headers: {
-            Authorization: `Bearer ${META_WA_TOKEN}`,
-            "Content-Type": "application/json",
-          },
-        }
-      );
-  
-      const wa_msg_id =
-        resp.data?.messages && resp.data.messages[0]?.id
-          ? String(resp.data.messages[0].id)
-          : null;
-  
-      console.log("[INBOX][SEND]", { orgId, to: toNorm, text });
-  
-      // Find (or create) conversation row for this phone so the web UI reflects the reply immediately
-      const { data: convRow } = await supa
+      }
+    );
+
+    const wa_msg_id =
+      resp.data?.messages && resp.data.messages[0]?.id
+        ? String(resp.data.messages[0].id)
+        : null;
+
+    console.log("[INBOX][SEND]", { orgId, to: toNorm, text });
+
+    // Find (or create) conversation row for this phone so the web UI reflects the reply immediately
+    const { data: convRow } = await supa
+      .from("conversations")
+      .select("id")
+      .eq("org_id", orgId)
+      .eq("customer_phone", toNorm.replace(/^\+/, "")) // most rows stored without '+'
+      .limit(1)
+      .maybeSingle();
+
+    let conversationId: string | null = convRow?.id || null;
+    if (!conversationId) {
+      const { data: convRow2 } = await supa
         .from("conversations")
         .select("id")
         .eq("org_id", orgId)
-        .eq("customer_phone", toNorm.replace(/^\+/, "")) // most rows stored without '+'
+        .eq("customer_phone", toNorm)
         .limit(1)
         .maybeSingle();
-  
-      let conversationId: string | null = convRow?.id || null;
-      if (!conversationId) {
-        const { data: convRow2 } = await supa
-          .from("conversations")
-          .select("id")
-          .eq("org_id", orgId)
-          .eq("customer_phone", toNorm)
-          .limit(1)
-          .maybeSingle();
-        conversationId = convRow2?.id || null;
-      }
-  
-      // Log outbound message if we have a conversation
-      if (conversationId) {
-        await supa.from("messages").insert({
-          org_id: orgId,
-          conversation_id: conversationId,
-          direction: "out",
-          sender_type: "store", // or 'ai'
-          channel: "waba",
-          body: text,
-          wa_msg_id,
-        });
-  
-        // bump conversation preview
-        await supa
-          .from("conversations")
-          .update({
-            last_message_at: new Date().toISOString(),
-            last_message_preview: text.slice(0, 120),
-          })
-          .eq("id", conversationId)
-          .eq("org_id", orgId);
-      }
-  
-      return res.json({ ok: true });
-    } catch (e: any) {
-      console.error("[INBOX][send][ERR]", e?.response?.data || e?.message || e);
-      return res.status(500).json({ ok: false, error: "send_failed" });
+      conversationId = convRow2?.id || null;
     }
-  });
+
+    // Log outbound message if we have a conversation
+    if (conversationId) {
+      await supa.from("messages").insert({
+        org_id: orgId,
+        conversation_id: conversationId,
+        direction: "out",
+        sender_type: "store", // or 'ai'
+        channel: "waba",
+        body: text,
+        wa_msg_id,
+      });
+
+      // bump conversation preview
+      await supa
+        .from("conversations")
+        .update({
+          last_message_at: new Date().toISOString(),
+          last_message_preview: text.slice(0, 120),
+        })
+        .eq("id", conversationId)
+        .eq("org_id", orgId);
+    }
+
+    return res.json({ ok: true });
+  } catch (e: any) {
+    console.error("[INBOX][send][ERR]", e?.response?.data || e?.message || e);
+    return res.status(500).json({ ok: false, error: "send_failed" });
+  }
+});
 
 // ─────────── GET /latest-order?org_id=..&phone=.. ───────────
 // Used by the AI reasoning panel (right side)
@@ -237,85 +242,179 @@ inbox.get("/latest-order", async (req, res) => {
 // ───────────────── GET /messages (compat) ─────────────────
 // Returns merged inbound (orders) + outbound (messages) for a phone
 inbox.get("/messages", async (req, res) => {
-    try {
-      const orgId = getOrgId(req) || String(req.query.org_id || "");
-      const phoneRaw = String(req.query.phone || "").trim();
-      if (!orgId) return res.status(401).json({ ok: false, error: "no_org" });
-      if (!phoneRaw) return res.status(400).json({ ok: false, error: "phone_required" });
-  
-      const phonePlain = phoneRaw.replace(/[^\d]/g, "");
-      const phonePlus = phonePlain ? `+${phonePlain}` : "";
-  
-      // 1) inbound from orders
-      const { data: orders, error: ordErr } = await supa
-        .from("orders")
-        .select("id, raw_text, created_at")
-        .eq("org_id", orgId)
-        .or(`source_phone.eq.${phonePlain},source_phone.eq.${phonePlus}`)
-        .order("created_at", { ascending: true });
-  
-      if (ordErr) throw ordErr;
-  
-      const inbound = (orders || []).map((o: any) => ({
-        id: `in-${o.id}`,
-        from: "customer" as const,
-        text: o.raw_text || "",
-        ts: o.created_at,
-      }));
-  
-      // 2) outbound from messages (only those tied to this phone’s conversation)
-      // find conversation by either plain or + format
-      const { data: conv1 } = await supa
+  try {
+    const orgId = getOrgId(req) || String(req.query.org_id || "");
+    const phoneRaw = String(req.query.phone || "").trim();
+    if (!orgId) return res.status(401).json({ ok: false, error: "no_org" });
+    if (!phoneRaw) return res.status(400).json({ ok: false, error: "phone_required" });
+
+    const phonePlain = phoneRaw.replace(/[^\d]/g, "");
+    const phonePlus = phonePlain ? `+${phonePlain}` : "";
+
+    // 1) inbound from orders
+    const { data: orders, error: ordErr } = await supa
+      .from("orders")
+      .select("id, raw_text, created_at")
+      .eq("org_id", orgId)
+      .or(`source_phone.eq.${phonePlain},source_phone.eq.${phonePlus}`)
+      .order("created_at", { ascending: true });
+
+    if (ordErr) throw ordErr;
+
+    const inbound = (orders || []).map((o: any) => ({
+      id: `in-${o.id}`,
+      from: "customer" as const,
+      text: o.raw_text || "",
+      ts: o.created_at,
+    }));
+
+    // 2) outbound from messages (only those tied to this phone’s conversation)
+    // find conversation by either plain or + format
+    const { data: conv1 } = await supa
+      .from("conversations")
+      .select("id")
+      .eq("org_id", orgId)
+      .eq("customer_phone", phonePlain)
+      .limit(1)
+      .maybeSingle();
+
+    let conversationId = conv1?.id || null;
+    if (!conversationId) {
+      const { data: conv2 } = await supa
         .from("conversations")
         .select("id")
         .eq("org_id", orgId)
-        .eq("customer_phone", phonePlain)
+        .eq("customer_phone", phonePlus)
         .limit(1)
         .maybeSingle();
-  
-      let conversationId = conv1?.id || null;
-      if (!conversationId) {
-        const { data: conv2 } = await supa
-          .from("conversations")
-          .select("id")
-          .eq("org_id", orgId)
-          .eq("customer_phone", phonePlus)
-          .limit(1)
-          .maybeSingle();
-        conversationId = conv2?.id || null;
-      }
-  
-      let outbound: Array<{ id: string; from: "store"; text: string; ts: string }> = [];
-      if (conversationId) {
-        const { data: msgs, error: msgErr } = await supa
-          .from("messages")
-          .select("id, body, created_at, direction")
-          .eq("org_id", orgId)
-          .eq("conversation_id", conversationId)
-          .order("created_at", { ascending: true });
-  
-        if (msgErr) throw msgErr;
-  
-        outbound = (msgs || [])
-          .filter((m: any) => (m.direction || "").toLowerCase() === "out")
-          .map((m: any) => ({
-            id: `out-${m.id}`,
-            from: "store" as const,
-            text: m.body || "",
-            ts: m.created_at,
-          }));
-      }
-  
-      // 3) merge + sort
-      const merged = [...inbound, ...outbound].sort(
-        (a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime()
-      );
-  
-      return res.json(merged);
-    } catch (e: any) {
-      console.error("[INBOX][GET /messages]", e?.message || e);
-      return res.status(500).json({ ok: false, error: "inbox_messages_failed" });
+      conversationId = conv2?.id || null;
     }
-  });
+
+    let outbound: Array<{ id: string; from: "store"; text: string; ts: string }> = [];
+    if (conversationId) {
+      const { data: msgs, error: msgErr } = await supa
+        .from("messages")
+        .select("id, body, created_at, direction")
+        .eq("org_id", orgId)
+        .eq("conversation_id", conversationId)
+        .order("created_at", { ascending: true });
+
+      if (msgErr) throw msgErr;
+
+      outbound = (msgs || [])
+        .filter((m: any) => (m.direction || "").toLowerCase() === "out")
+        .map((m: any) => ({
+          id: `out-${m.id}`,
+          from: "store" as const,
+          text: m.body || "",
+          ts: m.created_at,
+        }));
+    }
+
+    // 3) merge + sort
+    const merged = [...inbound, ...outbound].sort(
+      (a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime()
+    );
+
+    return res.json(merged);
+  } catch (e: any) {
+    console.error("[INBOX][GET /messages]", e?.message || e);
+    return res.status(500).json({ ok: false, error: "inbox_messages_failed" });
+  }
+});
+
+// ───────────── NEW: per-customer auto-reply APIs ─────────────
+
+// GET /api/inbox/auto_reply?org_id=...&phone=...
+// Returns { enabled: boolean } (default true if no row)
+inbox.get("/auto_reply", async (req, res) => {
+  try {
+    const orgId = getOrgId(req) || String(req.query.org_id || "");
+    const phoneRaw = String(req.query.phone || "").trim();
+
+    if (!orgId) {
+      return res.status(401).json({ ok: false, error: "no_org" });
+    }
+    if (!phoneRaw) {
+      return res.status(400).json({ ok: false, error: "phone_required" });
+    }
+
+    const phoneKey = normalizePhoneForKey(phoneRaw);
+
+    const { data, error } = await supa
+      .from("org_customer_settings")
+      .select("auto_reply_enabled")
+      .eq("org_id", orgId)
+      .eq("customer_phone", phoneKey)
+      .maybeSingle();
+
+    if (error) {
+      console.error("[INBOX][auto_reply GET err]", error.message);
+      return res.status(500).json({ ok: false, error: "db_error" });
+    }
+
+    const enabled =
+      data && typeof data.auto_reply_enabled === "boolean"
+        ? !!data.auto_reply_enabled
+        : true; // default ON
+
+    return res.json({ ok: true, enabled });
+  } catch (e: any) {
+    console.error("[INBOX][auto_reply GET catch]", e?.message || e);
+    return res.status(500).json({ ok: false, error: "auto_reply_get_failed" });
+  }
+});
+
+// POST /api/inbox/auto_reply
+// Body: { org_id, phone, enabled }
+inbox.post("/auto_reply", express.json(), async (req, res) => {
+  try {
+    const orgId = getOrgId(req) || String(req.body?.org_id || "");
+    const phoneRaw = String(req.body?.phone || "").trim();
+    const enabled = req.body?.enabled;
+
+    if (!orgId) {
+      return res.status(401).json({ ok: false, error: "no_org" });
+    }
+    if (!phoneRaw || typeof enabled !== "boolean") {
+      return res.status(400).json({
+        ok: false,
+        error: "org_id, phone, enabled(boolean) are required",
+      });
+    }
+
+    const phoneKey = normalizePhoneForKey(phoneRaw);
+
+    const { data, error } = await supa
+      .from("org_customer_settings")
+      .upsert(
+        {
+          org_id: orgId,
+          customer_phone: phoneKey,
+          auto_reply_enabled: enabled,
+        },
+        {
+          onConflict: "org_id,customer_phone",
+        }
+      )
+      .select("auto_reply_enabled")
+      .maybeSingle();
+
+    if (error) {
+      console.error("[INBOX][auto_reply POST err]", error.message);
+      return res.status(500).json({ ok: false, error: "db_error" });
+    }
+
+    const finalEnabled =
+      data && typeof data.auto_reply_enabled === "boolean"
+        ? !!data.auto_reply_enabled
+        : enabled;
+
+    return res.json({ ok: true, enabled: finalEnabled });
+  } catch (e: any) {
+    console.error("[INBOX][auto_reply POST catch]", e?.message || e);
+    return res.status(500).json({ ok: false, error: "auto_reply_post_failed" });
+  }
+});
 
 export default inbox;

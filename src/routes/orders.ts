@@ -239,22 +239,36 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
   }
 
   const normalizedItems = Array.isArray(human_fixed?.items)
-    ? human_fixed.items
-        .map((it: any) => ({
-          qty:
-            it?.qty === null || it?.qty === undefined || Number.isNaN(Number(it?.qty))
-              ? null
-              : Number(it.qty),
-          unit: trim(it?.unit) || null,
-          name: trim(it?.name || it?.canonical || ""),
-          canonical: trim(it?.canonical) || null,
-          brand: trim(it?.brand) || null,
-          variant: trim(it?.variant) || null,
-          notes: trim(it?.notes) || null,
-          category: trim(it?.category) || null,
-        }))
-        .filter((it: any) => it.name && it.name.length > 0)
-    : [];
+  ? human_fixed.items
+      .map((it: any) => ({
+        qty:
+          it?.qty === null || it?.qty === undefined || Number.isNaN(Number(it?.qty))
+            ? null
+            : Number(it.qty),
+        unit: trim(it?.unit) || null,
+        name: trim(it?.name || it?.canonical || ""),
+        canonical: trim(it?.canonical) || null,
+        brand: trim(it?.brand) || null,
+        variant: trim(it?.variant) || null,
+        notes: trim(it?.notes) || null,
+        category: trim(it?.category) || null,
+
+        // ✅ NEW: keep price fields so they are stored in orders.items
+        price_per_unit:
+          it?.price_per_unit === null ||
+          it?.price_per_unit === undefined ||
+          Number.isNaN(Number(it?.price_per_unit))
+            ? null
+            : Number(it.price_per_unit),
+        line_total:
+          it?.line_total === null ||
+          it?.line_total === undefined ||
+          Number.isNaN(Number(it?.line_total))
+            ? null
+            : Number(it.line_total),
+      }))
+      .filter((it: any) => it.name && it.name.length > 0)
+  : [];
 
   if (!normalizedItems.length) {
     return res.status(400).json({ error: "human_fixed_items_required" });

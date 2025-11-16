@@ -26,7 +26,10 @@ waba.get("/", (req, res) => {
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  console.log("[WABA][VERIFY]", { mode, token_ok: token === META_VERIFY_TOKEN });
+  console.log("[WABA][VERIFY]", {
+    mode,
+    token_ok: token === META_VERIFY_TOKEN,
+  });
 
   if (mode === "subscribe" && token === META_VERIFY_TOKEN) {
     console.log("[WABA] webhook verified");
@@ -89,6 +92,43 @@ type VariantChoice = {
 function normalizePhoneForKey(raw: string): string {
   return String(raw || "").replace(/[^\d]/g, "");
 }
+
+async function isAutoReplyEnabledForCustomer(opts: {
+    orgId: string;
+    phoneRaw: string;
+    orgAutoReplyEnabled: boolean;
+  }): Promise<boolean> {
+    const { orgId, phoneRaw, orgAutoReplyEnabled } = opts;
+  
+    // 1) Org-level master switch
+    if (!orgAutoReplyEnabled) return false;
+  
+    const phoneKey = normalizePhoneForKey(phoneRaw);
+    if (!phoneKey) return true; // default ON if we can't normalise
+  
+    try {
+      const { data, error } = await supa
+        .from("org_customer_settings")
+        .select("auto_reply_enabled")
+        .eq("org_id", orgId)
+        .eq("customer_phone", phoneKey)    // ✅ HERE
+        .maybeSingle();
+  
+      if (error) {
+        console.warn("[WABA][cust auto-reply lookup err]", error.message);
+        return true; // fail-open
+      }
+  
+      if (!data || typeof data.auto_reply_enabled !== "boolean") {
+        return true; // no override row → default ON
+      }
+  
+      return data.auto_reply_enabled;
+    } catch (e: any) {
+      console.warn("[WABA][cust auto-reply catch]", e?.message || e);
+      return true;
+    }
+  }
 
 // Find ambiguous items (2+ variants configured) for this order
 async function findAmbiguousItemsForOrder(
@@ -633,7 +673,9 @@ async function maybeHandleClarifyReply(opts: {
 
   const currentIndex = session.current_index;
   const currentItem = items[currentIndex] || {};
-  const labelRaw = String(currentItem.canonical || currentItem.name || "").trim();
+  const labelRaw = String(
+    currentItem.canonical || currentItem.name || ""
+  ).trim();
   const labelKey = labelRaw.toLowerCase();
 
   // Load variants for this item
@@ -877,10 +919,18 @@ function detectUserCommand(text: string): UserCommand {
   const lower = text.toLowerCase().trim();
 
   // keep these fairly strict to avoid colliding with normal sentences
-  if (lower === "new" || lower === "new order" || lower.startsWith("start new order")) {
+  if (
+    lower === "new" ||
+    lower === "new order" ||
+    lower.startsWith("start new order")
+  ) {
     return "new";
   }
-  if (lower === "cancel" || lower === "cancel order" || lower.startsWith("cancel my order")) {
+  if (
+    lower === "cancel" ||
+    lower === "cancel order" ||
+    lower.startsWith("cancel my order")
+  ) {
     return "cancel";
   }
   if (
@@ -966,6 +1016,35 @@ waba.post("/", async (req, res) => {
           const msgId = msg.id as string;
           const ts = Number(msg.timestamp || Date.now()) * 1000;
 
+          // 🔹 Check per-customer auto-reply *before* going into AI
+          const autoReplyForCustomer = await isAutoReplyEnabledForCustomer({
+            orgId: org.id,
+  phoneRaw: from,
+  orgAutoReplyEnabled: !!org.auto_reply_enabled,
+          });
+
+          if (!autoReplyForCustomer) {
+            // Auto-reply OFF for this customer:
+            // - Do NOT send to AI
+            // - Just log to inbox and let human chat
+            await logInboundMessageToInbox({
+              orgId: org.id,
+              from,
+              text,
+              msgId,
+            });
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "auto_reply_disabled_for_customer_inbound",
+              msgId,
+              text,
+            });
+
+            continue; // 🛑 skip clarify, commands, ingestCore, auto-replies
+          }
+
           if (!text) continue;
 
           const lowerText = text.toLowerCase().trim();
@@ -1005,8 +1084,7 @@ waba.post("/", async (req, res) => {
                 await sendWabaText({
                   phoneNumberId,
                   to: from,
-                  text:
-                    "Please reply with a valid number from the list (for example 1 or 2).",
+                  text: "Please reply with a valid number from the list (for example 1 or 2).",
                   orgId: org.id,
                 });
                 continue;
@@ -1023,8 +1101,7 @@ waba.post("/", async (req, res) => {
                 await sendWabaText({
                   phoneNumberId,
                   to: from,
-                  text:
-                    "I couldn’t find that order anymore. It may have already been updated by the store.",
+                  text: "I couldn’t find that order anymore. It may have already been updated by the store.",
                   orgId: org.id,
                 });
               } else {
@@ -1067,8 +1144,7 @@ waba.post("/", async (req, res) => {
               await sendWabaText({
                 phoneNumberId,
                 to: from,
-                text:
-                  "Please reply with the number of the order you want to cancel (for example 1 or 2).",
+                text: "Please reply with the number of the order you want to cancel (for example 1 or 2).",
                 orgId: org.id,
               });
               continue;
@@ -1119,7 +1195,10 @@ waba.post("/", async (req, res) => {
               lowerText
             )
           ) {
-            const activeOrders = await findAllActiveOrdersForPhone(org.id, from);
+            const activeOrders = await findAllActiveOrdersForPhone(
+              org.id,
+              from
+            );
 
             await logFlowEvent({
               orgId: org.id,
@@ -1186,7 +1265,11 @@ waba.post("/", async (req, res) => {
               orderId: last?.id || null,
             });
 
-            if (!last || !Array.isArray(last.items) || last.items.length === 0) {
+            if (
+              !last ||
+              !Array.isArray(last.items) ||
+              last.items.length === 0
+            ) {
               await sendWabaText({
                 phoneNumberId,
                 to: from,
@@ -1204,10 +1287,7 @@ waba.post("/", async (req, res) => {
                 statusText = "🔴 Status: cancelled";
 
               const textOut =
-                "📦 Your last order:\n" +
-                summary +
-                "\n\n" +
-                statusText;
+                "📦 Your last order:\n" + summary + "\n\n" + statusText;
 
               await sendWabaText({
                 phoneNumberId,
@@ -1242,7 +1322,10 @@ waba.post("/", async (req, res) => {
           }
 
           if (cmd === "cancel") {
-            const activeOrders = await findAllActiveOrdersForPhone(org.id, from);
+            const activeOrders = await findAllActiveOrdersForPhone(
+              org.id,
+              from
+            );
 
             await logFlowEvent({
               orgId: org.id,
@@ -1274,7 +1357,9 @@ waba.post("/", async (req, res) => {
                 .update({ status: "cancelled_by_customer" })
                 .eq("id", activeOrderForCancel.id);
 
-              const summary = formatOrderSummary(activeOrderForCancel.items || []);
+              const summary = formatOrderSummary(
+                activeOrderForCancel.items || []
+              );
 
               const textOut =
                 "❌ Your last order has been cancelled:\n" +
@@ -1418,7 +1503,10 @@ waba.post("/", async (req, res) => {
           }
 
           // 0.8) Edit-like messages while an order is open → safe fallback (no auto edit in V1)
-          const activeOrderForEdit = await findActiveOrderForPhone(org.id, from);
+          const activeOrderForEdit = await findActiveOrderForPhone(
+            org.id,
+            from
+          );
           if (activeOrderForEdit && isLikelyEditRequest(text)) {
             await logFlowEvent({
               orgId: org.id,
@@ -1480,7 +1568,25 @@ waba.post("/", async (req, res) => {
             },
           });
 
-          if (!org.auto_reply_enabled) continue;
+          //   if (!org.auto_reply_enabled) continue;
+
+          // NEW: org-level + per-customer auto-reply gate
+          const autoReplyAllowed = await isAutoReplyEnabledForCustomer({
+            orgId: org.id,
+            phoneRaw: from,
+            orgAutoReplyEnabled: !!org.auto_reply_enabled,
+          });
+
+          console.log("[WABA][AUTO-REPLY-GATE]", {
+            org_id: org.id,
+            from,
+            autoReplyAllowed,
+          });
+
+          if (!autoReplyAllowed) {
+            // Parsing + storing is already done above; we just skip auto-reply.
+            continue;
+          }
 
           let reply: string | null = null;
 
@@ -1604,16 +1710,15 @@ waba.post("/", async (req, res) => {
               inquiryType,
             });
             if (!reply) {
-              reply = "💬 Got your question. We’ll confirm the details shortly.";
+              reply =
+                "💬 Got your question. We’ll confirm the details shortly.";
             }
           }
 
           // 4) Heuristic question fallback
           if (
             !reply &&
-            /price|rate|how much|available|stock|do you have/i.test(
-              lowerText
-            )
+            /price|rate|how much|available|stock|do you have/i.test(lowerText)
           ) {
             reply = "💬 Got your question. We’ll check and reply in a moment.";
           }
@@ -1656,11 +1761,11 @@ waba.post("/", async (req, res) => {
           }
 
           // Optionally show commands tip once per phone
-        //   await maybeSendCommandsTip({
-        //     phoneNumberId,
-        //     to: from,
-        //     orgId: org.id,
-        //   });
+          //   await maybeSendCommandsTip({
+          //     phoneNumberId,
+          //     to: from,
+          //     orgId: org.id,
+          //   });
         }
       }
     }
@@ -1672,112 +1777,235 @@ waba.post("/", async (req, res) => {
   }
 });
 
+// Log inbound-only message (when auto-reply is OFF for this customer)
+async function logInboundMessageToInbox(opts: {
+  orgId: string;
+  from: string; // customer phone (raw)
+  text: string;
+  msgId?: string;
+}) {
+  try {
+    const { orgId, from, text } = opts;
+    const phonePlain = normalizePhoneForKey(from); // digits only
+    const phonePlus = phonePlain ? `+${phonePlain}` : "";
+
+    // Find existing conversation by phone
+    const { data: conv1 } = await supa
+      .from("conversations")
+      .select("id")
+      .eq("org_id", orgId)
+      .eq("customer_phone", phonePlain)
+      .limit(1)
+      .maybeSingle();
+
+    let conversationId = conv1?.id || null;
+
+    if (!conversationId) {
+      const { data: conv2 } = await supa
+        .from("conversations")
+        .select("id")
+        .eq("org_id", orgId)
+        .eq("customer_phone", phonePlus)
+        .limit(1)
+        .maybeSingle();
+      conversationId = conv2?.id || null;
+    }
+
+    // If still nothing, create a new conversation row
+    if (!conversationId) {
+      const { data: inserted, error: convErr } = await supa
+        .from("conversations")
+        .insert({
+          org_id: orgId,
+          customer_phone: phonePlain,
+          customer_name: null,
+          source: "waba",
+          last_message_at: new Date().toISOString(),
+          last_message_preview: text.slice(0, 120),
+        })
+        .select("id")
+        .single();
+
+      if (convErr) {
+        console.warn("[INBOX][inbound conv insert err]", convErr.message);
+        return;
+      }
+      conversationId = inserted.id;
+    } else {
+      // bump preview if conv exists
+      await supa
+        .from("conversations")
+        .update({
+          last_message_at: new Date().toISOString(),
+          last_message_preview: text.slice(0, 120),
+        })
+        .eq("id", conversationId)
+        .eq("org_id", orgId);
+    }
+
+    // Insert inbound message row
+    await supa.from("messages").insert({
+      org_id: orgId,
+      conversation_id: conversationId,
+      direction: "in",
+      sender_type: "customer",
+      channel: "waba",
+      body: text,
+      wa_msg_id: opts.msgId || null,
+    });
+  } catch (e: any) {
+    console.warn("[INBOX][inbound log err]", e?.message || e);
+  }
+}
+
 // ─────────────────────────────
 // Send via Cloud API + log to inbox
 // ─────────────────────────────
 async function sendWabaText(opts: {
-  phoneNumberId: string;
-  to: string;
-  text: string;
-  orgId?: string;
-}) {
-  const token = process.env.WA_ACCESS_TOKEN || process.env.META_WA_TOKEN;
-  if (!token) {
-    console.warn("[WABA] WA_ACCESS_TOKEN missing, cannot send reply");
-    return;
-  }
-
-  const toNorm = opts.to.startsWith("+") ? opts.to : `+${opts.to}`;
-
-  try {
-    const resp = await axios.post(
-      `${META_WA_BASE}/${opts.phoneNumberId}/messages`,
-      {
+    phoneNumberId: string;
+    to: string;
+    text?: string;
+    image?: string;      // <── NEW
+    caption?: string;    // <── NEW
+    orgId?: string;
+  }) {
+    const token = process.env.WA_ACCESS_TOKEN || process.env.META_WA_TOKEN;
+    if (!token) {
+      console.warn("[WABA] WA_ACCESS_TOKEN missing, cannot send reply");
+      return;
+    }
+  
+    const toNorm = opts.to.startsWith("+") ? opts.to : `+${opts.to}`;
+  
+    // -------------------------------------------
+    // 🚀 1) SEND IMAGE (NEW)
+    // -------------------------------------------
+    let payload: any;
+  
+    if (opts.image) {
+      payload = {
+        messaging_product: "whatsapp",
+        to: toNorm,
+        type: "image",
+        image: {
+          link: opts.image,                   // direct URL
+          caption: opts.caption || opts.text || "", 
+        },
+      };
+    } else {
+      // -------------------------------------------
+      // 🚀 2) FALLBACK → TEXT (EXACT OLD LOGIC)
+      // -------------------------------------------
+      payload = {
         messaging_product: "whatsapp",
         to: toNorm,
         type: "text",
-        text: { body: opts.text },
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    console.log("[WABA][SEND]", { to: toNorm, text: opts.text });
-
-    // Debug-flow log for outbound auto replies
-    if (opts.orgId) {
-      try {
-        await logFlowEvent({
-          orgId: opts.orgId,
-          from: toNorm.replace(/^\+/, ""),
-          event: "auto_reply_sent",
-          msgId:
-            resp.data?.messages && resp.data.messages[0]?.id
-              ? String(resp.data.messages[0].id)
-              : undefined,
-          text: opts.text,
-          meta: {
-            phoneNumberId: opts.phoneNumberId,
-          },
-        });
-      } catch (e: any) {
-        console.warn("[WABA][FLOW_LOG_OUT_ERR]", e?.message || e);
-      }
+        text: { body: opts.text || "" },
+      };
     }
-
-    if (opts.orgId) {
-      try {
-        const { data: conv, error: convErr } = await supa
-          .from("conversations")
-          .select("id")
-          .eq("org_id", opts.orgId)
-          .eq("customer_phone", toNorm.replace(/^\+/, ""))
-          .limit(1)
-          .maybeSingle();
-
-        let convId = conv?.id || null;
-
-        if (!convId) {
-          const { data: conv2 } = await supa
+  
+    try {
+      const resp = await axios.post(
+        `${META_WA_BASE}/${opts.phoneNumberId}/messages`,
+        payload,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+  
+      console.log("[WABA][SEND]", {
+        to: toNorm,
+        type: opts.image ? "image" : "text",
+        text: opts.text,
+        image: opts.image,
+      });
+  
+      // ------------------------------------------------
+      // FLOW LOG (unchanged)
+      // ------------------------------------------------
+      if (opts.orgId) {
+        try {
+          await logFlowEvent({
+            orgId: opts.orgId,
+            from: toNorm.replace(/^\+/, ""),
+            event: "auto_reply_sent",
+            msgId:
+              resp.data?.messages && resp.data.messages[0]?.id
+                ? String(resp.data.messages[0].id)
+                : undefined,
+            text: opts.text,
+            meta: {
+              phoneNumberId: opts.phoneNumberId,
+              image: opts.image || null,
+            },
+          });
+        } catch (e: any) {
+          console.warn("[WABA][FLOW_LOG_OUT_ERR]", e?.message || e);
+        }
+      }
+  
+      // ------------------------------------------------
+      // INBOX MESSAGE LOGGING (unchanged)
+      // ------------------------------------------------
+      if (opts.orgId) {
+        try {
+          const { data: conv } = await supa
             .from("conversations")
             .select("id")
             .eq("org_id", opts.orgId)
-            .eq("customer_phone", toNorm)
+            .eq("customer_phone", toNorm.replace(/^\+/, ""))
             .limit(1)
             .maybeSingle();
-          convId = conv2?.id || null;
-        }
-
-        if (convId) {
-          const wa_msg_id =
-            resp.data?.messages && resp.data.messages[0]?.id
-              ? String(resp.data.messages[0].id)
-              : null;
-
-          const { error: msgErr } = await supa.from("messages").insert({
-            org_id: opts.orgId,
-            conversation_id: convId,
-            direction: "out",
-            sender_type: "ai",
-            channel: "waba",
-            body: opts.text,
-            wa_msg_id,
-          });
-          if (msgErr) {
-            console.warn("[INBOX][MSG out err]", msgErr.message);
+  
+          let convId = conv?.id || null;
+  
+          if (!convId) {
+            const { data: conv2 } = await supa
+              .from("conversations")
+              .select("id")
+              .eq("org_id", opts.orgId)
+              .eq("customer_phone", toNorm)
+              .limit(1)
+              .maybeSingle();
+            convId = conv2?.id || null;
           }
+  
+          if (convId) {
+            const wa_msg_id =
+              resp.data?.messages && resp.data.messages[0]?.id
+                ? String(resp.data.messages[0].id)
+                : null;
+  
+            const bodyToStore = opts.image
+              ? `[image sent] ${opts.caption || opts.text || ""}`
+              : opts.text;
+  
+            const { error: msgErr } = await supa.from("messages").insert({
+              org_id: opts.orgId,
+              conversation_id: convId,
+              direction: "out",
+              sender_type: "ai",
+              channel: "waba",
+              body: bodyToStore,
+              wa_msg_id,
+            });
+  
+            if (msgErr) {
+              console.warn("[INBOX][MSG out err]", msgErr.message);
+            }
+          }
+        } catch (e: any) {
+          console.warn("[INBOX][outbound log err]", e?.message || e);
         }
-      } catch (e: any) {
-        console.warn("[INBOX][outbound log err]", e?.message || e);
       }
+    } catch (e: any) {
+      console.warn("[WABA][SEND_ERR]", e?.response?.data || e?.message || e);
     }
-  } catch (e: any) {
-    console.warn("[WABA][SEND_ERR]", e?.response?.data || e?.message || e);
   }
-}
 
 export default waba;
+export { sendWabaText };
+

@@ -6,7 +6,7 @@ import bodyParser from 'body-parser';
 import { auth } from './routes/auth';
 import { org } from './routes/org';
 import { orders } from './routes/orders';
-import { payments } from './routes/payments';
+import payments from "./routes/payments";
 import { ingest } from './routes/ingest';
 import { ordersFeedback } from './routes/orders_feedback';
 import { aiCorrections } from "./routes/ai-corrections";
@@ -19,6 +19,8 @@ import suggestReply from './routes/suggestReply';
 import availability from './routes/availability';
 import waba from './routes/waba';
 import { inbox } from './routes/inbox';
+import analytics from './routes/analytics';
+import path from "path"; // ⬅️ add this
 
 // ─────────────────────────────
 // Boot diagnostics
@@ -30,6 +32,11 @@ console.log('[AI] AI_MODEL =', process.env.AI_MODEL || 'gpt-4o-mini');
 console.log('[AI] AI_DAILY_USD =', process.env.AI_DAILY_USD || '(default 5.00)');
 
 const app = express();
+
+// 🔹 Serve /static from <project-root>/static
+const STATIC_ROOT = path.join(process.cwd(), "static");
+console.log("[STATIC] Serving from", STATIC_ROOT);
+app.use("/static", express.static(STATIC_ROOT));
 
 // ─────────────────────────────
 // Global CORS
@@ -104,6 +111,7 @@ app.use('/api/orders', orders);
 app.use('/api/orders', ordersFeedback);
 app.use('/api/payments', payments);
 app.use("/api/ai-corrections", aiCorrections);
+app.use("/api/analytics", analytics);
 
 // ─────────────────────────────
 // Server start
