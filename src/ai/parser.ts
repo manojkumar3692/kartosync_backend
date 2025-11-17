@@ -30,6 +30,10 @@ export const ItemSchema = z.object({
   // NEW:
   brand: z.string().nullable().default(null),
   variant: z.string().nullable().default(null),
+
+  // 🔥 NEW FIELDS (for pricing)
+  price_per_unit: z.number().nullable().default(null),
+  line_total: z.number().nullable().default(null),
 });
 
 export const ParseResultSchema = z.object({
@@ -76,6 +80,9 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
           category: "meat",
           brand: null,
           variant: null,
+          // 🔥 NEW
+      price_per_unit: null,
+      line_total: null,
         },
         {
           name: "milk",
@@ -86,6 +93,9 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
           category: "dairy",
           brand: null,
           variant: null,
+          // 🔥 NEW
+      price_per_unit: null,
+      line_total: null,
         },
       ],
       confidence: 0.92,
@@ -106,6 +116,9 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
           category: "dairy",
           brand: null,
           variant: null,
+          // 🔥 NEW
+      price_per_unit: null,
+      line_total: null,
         },
       ],
       confidence: 0.85,
@@ -126,6 +139,9 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
           category: "grocery",
           brand: null,
           variant: null,
+          // 🔥 NEW
+      price_per_unit: null,
+      line_total: null,
         },
       ],
       confidence: 0.8,
@@ -336,7 +352,29 @@ function coerceToItem(it: any): z.infer<typeof ItemSchema> {
     return v ? v : null;
   })();
 
-  return { name, qty, unit, notes, canonical, category, brand, variant };
+  // 🔥 NEW: carry prices if rule parser ever emits them
+  const price_per_unit =
+    typeof it?.price_per_unit === "number" && !Number.isNaN(it.price_per_unit)
+      ? it.price_per_unit
+      : null;
+
+  const line_total =
+    typeof it?.line_total === "number" && !Number.isNaN(it.line_total)
+      ? it.line_total
+      : null;
+
+  return {
+    name,
+    qty,
+    unit,
+    notes,
+    canonical,
+    category,
+    brand,
+    variant,
+    price_per_unit,
+    line_total,
+  };
 }
 
 // Null-safe micro-heuristics (now with brand/variant)
@@ -523,6 +561,9 @@ function postSplitCommaList(raw: string, parsed: ParseResult): ParseResult {
         category: null,
         brand: detectBrand(p, null),
         variant: detectVariant(p),
+        // 🔥 NEW
+  price_per_unit: null,
+  line_total: null,
       }));
       return {
         items: applyMicroHeuristics(items as any),
@@ -672,6 +713,14 @@ export async function aiParseOrder(
                   category: trimStr(x?.category) || null,
                   brand: trimStr(x?.brand) || null,
                   variant: trimStr(x?.variant) || null,
+                  price_per_unit:
+      typeof x?.price_per_unit === "number" && !Number.isNaN(x.price_per_unit)
+        ? x.price_per_unit
+        : null,
+    line_total:
+      typeof x?.line_total === "number" && !Number.isNaN(x.line_total)
+        ? x.line_total
+        : null,
                 }))
                 .filter((x) => !!x.name);
 

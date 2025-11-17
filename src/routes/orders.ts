@@ -10,7 +10,7 @@ export const orders = express.Router();
 // ─────────────────────────────────────────────────────────────────────────────
 // Status constants (store lowercase in DB; accept any case from client)
 // ─────────────────────────────────────────────────────────────────────────────
-const STATUS_LIST = ["pending", "shipped", "paid"] as const;
+const STATUS_LIST = ["pending", "shipped", "paid", "cancelled"] as const;
 type OrderStatus = (typeof STATUS_LIST)[number];
 const STATUS_SET = new Set<string>(STATUS_LIST);
 
@@ -64,7 +64,7 @@ function ensureAuth(req: any, res: any, next: any) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/orders  → list recent orders for this org
-// Optional: ?status=pending|shipped|paid&limit=100&offset=0 (case-insensitive)
+// Optional: ?status=pending|shipped|paid|cancelled&limit=100&offset=0
 // ─────────────────────────────────────────────────────────────────────────────
 orders.get("/", ensureAuth, async (req: any, res) => {
   try {
@@ -84,6 +84,70 @@ orders.get("/", ensureAuth, async (req: any, res) => {
     res.json(data || []);
   } catch (err: any) {
     console.error("Orders GET error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/orders/past → list past (closed) orders for this org
+// We define "past" as: paid + cancelled
+// ─────────────────────────────────────────────────────────────────────────────
+orders.get("/past", ensureAuth, async (req: any, res) => {
+  try {
+    const { limit = "200", offset = "0" } = req.query || {};
+    const PAST_STATUSES: OrderStatus[] = ["paid", "cancelled"];
+
+    const { data, error } = await supa
+      .from("orders")
+      .select("*")
+      .eq("org_id", req.org_id)
+      .in("status", PAST_STATUSES)
+      .order("created_at", { ascending: false })
+      .range(Number(offset), Number(offset) + Number(limit) - 1);
+
+    if (error) throw error;
+
+    let orders = Array.isArray(data) ? data : [];
+
+    // 🔁 Backfill frozen prices for any past orders that still have null prices
+    for (const o of orders) {
+      const items = Array.isArray(o.items) ? o.items : [];
+
+      // "Needs freeze" = at least one item with both price_per_unit AND line_total missing
+      const needsFreeze = items.some(
+        (it: any) =>
+          it &&
+          (it.price_per_unit === null ||
+            it.price_per_unit === undefined) &&
+          (it.line_total === null || it.line_total === undefined)
+      );
+
+      if (!needsFreeze) continue;
+
+      const frozen = await snapshotPricesFromCatalog(req.org_id, o.id);
+      if (!frozen) continue;
+
+      o.items = frozen;
+
+      // fire-and-forget update of DB so next time it's already frozen
+      try {
+        await supa
+          .from("orders")
+          .update({ items: frozen })
+          .eq("id", o.id)
+          .eq("org_id", req.org_id);
+      } catch (e: any) {
+        console.warn(
+          "[orders][GET /past] failed to persist frozen prices for order",
+          o.id,
+          e?.message || e
+        );
+      }
+    }
+
+    res.json(orders);
+  } catch (err: any) {
+    console.error("Orders GET /past error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -134,16 +198,134 @@ async function parsePipeline(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helper: when closing an order (shipped/paid), snapshot prices from catalog
+// so future catalog changes don't affect old orders.
+// ─────────────────────────────────────────────────────────────────────────────
+async function snapshotPricesFromCatalog(
+  org_id: string,
+  order_id: string
+): Promise<any[] | null> {
+  try {
+    // 1) Load the current order with items
+    const { data: order, error: orderErr } = await supa
+      .from("orders")
+      .select("id, org_id, items")
+      .eq("org_id", org_id)
+      .eq("id", order_id)
+      .single();
+
+    if (orderErr || !order || !Array.isArray(order.items)) {
+      if (orderErr) {
+        console.warn("[orders][snapshotPrices] load order err:", orderErr.message);
+      }
+      return null;
+    }
+
+    const items: any[] = order.items || [];
+    if (!items.length) return items;
+
+    // 2) Load catalog for this org (same shape as /products admin API)
+    const { data: catalog, error: catErr } = await supa
+    .from("products")
+    .select("canonical, variant, price_per_unit, dynamic_price")
+    .eq("org_id", org_id);
+
+    if (catErr || !Array.isArray(catalog) || !catalog.length) {
+      if (catErr) {
+        console.warn("[orders][snapshotPrices] catalog err:", catErr.message);
+      }
+      return null;
+    }
+
+    const normKey = (s?: string | null) =>
+      (s || "").trim().toLowerCase();
+
+    const getBaseName = (p: any) => normKey(p.canonical);
+
+    function findMatchingProduct(
+      canonical?: string | null,
+      variant?: string | null
+    ): any | undefined {
+      const canonKey = normKey(canonical);
+      const varKey = normKey(variant);
+      if (!canonKey && !varKey) return undefined;
+
+      // 1) exact canonical match
+      let candidates = catalog.filter((p) => getBaseName(p) === canonKey);
+
+      // 2) contains match (e.g. "onion" vs "onion small")
+      if (!candidates.length && canonKey) {
+        candidates = catalog.filter((p) => {
+          const base = getBaseName(p);
+          return base && (base.includes(canonKey) || canonKey.includes(base));
+        });
+      }
+
+      if (!candidates.length) return undefined;
+
+      // 3) if variant known, try to match
+      if (varKey) {
+        const byVar = candidates.find(
+          (p) => normKey(p.variant) === varKey
+        );
+        if (byVar) return byVar;
+      }
+
+      // 4) fallback: first candidate
+      return candidates[0];
+    }
+
+    // 3) Freeze prices on each item
+    const frozen = items.map((it: any) => {
+      // if price already set, NEVER overwrite
+      if (
+        typeof it?.price_per_unit === "number" &&
+        !Number.isNaN(it.price_per_unit)
+      ) {
+        return it;
+      }
+
+      const product = findMatchingProduct(
+        it?.canonical || it?.name,
+        it?.variant
+      );
+
+      // ignore dynamic_price flag → always use catalog price when present
+      if (
+        !product ||
+        typeof product.price_per_unit !== "number" ||
+        Number.isNaN(product.price_per_unit)
+      ) {
+        return it; // still no price
+      }
+
+      const price = Number(product.price_per_unit);
+      const qty =
+        typeof it?.qty === "number" && !Number.isNaN(it.qty)
+          ? it.qty
+          : 1;
+
+      const line_total =
+        typeof it?.line_total === "number" && !Number.isNaN(it.line_total)
+          ? it.line_total
+          : qty * price;
+
+      return {
+        ...it,
+        price_per_unit: price,
+        line_total,
+      };
+    });
+
+    return frozen;
+  } catch (e: any) {
+    console.warn("[orders][snapshotPrices] non-fatal error:", e?.message || e);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/orders  → create order for this org
-// Body:
-//   {
-//     raw_text?: string,           // if present, we parse into items
-//     items?: any[],               // or pass structured items directly
-//     source_phone?: string | null,
-//     customer_name?: string | null,
-//     created_at?: string | Date   // optional (ISO) for backfill
-//   }
-// Status defaults to "pending".
 // ─────────────────────────────────────────────────────────────────────────────
 orders.post("/", ensureAuth, async (req: any, res) => {
   try {
@@ -161,7 +343,50 @@ orders.post("/", ensureAuth, async (req: any, res) => {
       parse_confidence = parsed.confidence ?? null;
       parse_reason = parsed.reason ?? null;
     } else {
-      finalItems = Array.isArray(items) ? items : [];
+      // 🔹 Manual / UI-created items → normalize + keep pricing fields
+      const incoming = Array.isArray(items) ? items : [];
+
+      finalItems = incoming.map((it: any) => ({
+        name: typeof it.name === "string" ? it.name : "",
+        qty:
+          typeof it.qty === "number" && !Number.isNaN(it.qty)
+            ? it.qty
+            : null,
+        unit:
+          typeof it.unit === "string" && it.unit.trim()
+            ? it.unit.trim()
+            : null,
+        notes:
+          typeof it.notes === "string" && it.notes.trim()
+            ? it.notes.trim()
+            : null,
+        canonical:
+          typeof it.canonical === "string" && it.canonical.trim()
+            ? it.canonical.trim()
+            : null,
+        category:
+          typeof it.category === "string" && it.category.trim()
+            ? it.category.trim()
+            : null,
+        brand:
+          typeof it.brand === "string" && it.brand.trim()
+            ? it.brand.trim()
+            : null,
+        variant:
+          typeof it.variant === "string" && it.variant.trim()
+            ? it.variant.trim()
+            : null,
+
+        // ✅ persist pricing fields
+        price_per_unit:
+          typeof it.price_per_unit === "number" && !Number.isNaN(it.price_per_unit)
+            ? it.price_per_unit
+            : null,
+        line_total:
+          typeof it.line_total === "number" && !Number.isNaN(it.line_total)
+            ? it.line_total
+            : null,
+      }));
     }
 
     if (!finalItems.length) {
@@ -191,9 +416,10 @@ orders.post("/", ensureAuth, async (req: any, res) => {
   }
 });
 
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/orders/:id/status  → update status for an order in this org
-// Body: { status: 'pending' | 'shipped' | 'paid' }  // case-insensitive
 // ─────────────────────────────────────────────────────────────────────────────
 orders.post("/:id/status", ensureAuth, async (req: any, res) => {
   const { id } = req.params;
@@ -205,12 +431,31 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
   }
 
   try {
+    // When closing the order, snapshot prices so catalog changes don't affect it
+    if (next === "shipped" || next === "paid") {
+      const frozenItems = await snapshotPricesFromCatalog(req.org_id, id);
+
+      if (frozenItems) {
+        const { error } = await supa
+          .from("orders")
+          .update({ status: next, items: frozenItems })
+          .eq("id", id)
+          .eq("org_id", req.org_id);
+
+        if (error) throw error;
+        return res.json({ ok: true, status: next });
+      }
+      // If snapshot fails, we fall through and just update status like before
+    }
+
+    // Original behaviour (other statuses, or snapshot failure)
     const { error } = await supa
       .from("orders")
       .update({ status: next })
       .eq("id", id)
       .eq("org_id", req.org_id);
     if (error) throw error;
+
     res.json({ ok: true, status: next });
   } catch (err: any) {
     console.error("Order update error:", err);
@@ -220,11 +465,6 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/orders/:id/ai-fix
-// Body: { human_fixed: { items: Item[], reason?: string } }
-// Effect:
-//   1) Logs into ai_corrections (for future learning)
-//   2) Updates orders.items + parse_reason = 'human_fix' (immediate UI reflect)
-//   3) Writes learnings to brand_variant_stats + customer_prefs (phone-based)
 // ─────────────────────────────────────────────────────────────────────────────
 orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
   const { id } = req.params;
@@ -239,36 +479,36 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
   }
 
   const normalizedItems = Array.isArray(human_fixed?.items)
-  ? human_fixed.items
-      .map((it: any) => ({
-        qty:
-          it?.qty === null || it?.qty === undefined || Number.isNaN(Number(it?.qty))
-            ? null
-            : Number(it.qty),
-        unit: trim(it?.unit) || null,
-        name: trim(it?.name || it?.canonical || ""),
-        canonical: trim(it?.canonical) || null,
-        brand: trim(it?.brand) || null,
-        variant: trim(it?.variant) || null,
-        notes: trim(it?.notes) || null,
-        category: trim(it?.category) || null,
+    ? human_fixed.items
+        .map((it: any) => ({
+          qty:
+            it?.qty === null || it?.qty === undefined || Number.isNaN(Number(it?.qty))
+              ? null
+              : Number(it.qty),
+          unit: trim(it?.unit) || null,
+          name: trim(it?.name || it?.canonical || ""),
+          canonical: trim(it?.canonical) || null,
+          brand: trim(it?.brand) || null,
+          variant: trim(it?.variant) || null,
+          notes: trim(it?.notes) || null,
+          category: trim(it?.category) || null,
 
-        // ✅ NEW: keep price fields so they are stored in orders.items
-        price_per_unit:
-          it?.price_per_unit === null ||
-          it?.price_per_unit === undefined ||
-          Number.isNaN(Number(it?.price_per_unit))
-            ? null
-            : Number(it.price_per_unit),
-        line_total:
-          it?.line_total === null ||
-          it?.line_total === undefined ||
-          Number.isNaN(Number(it?.line_total))
-            ? null
-            : Number(it.line_total),
-      }))
-      .filter((it: any) => it.name && it.name.length > 0)
-  : [];
+          // ✅ keep price fields
+          price_per_unit:
+            it?.price_per_unit === null ||
+            it?.price_per_unit === undefined ||
+            Number.isNaN(Number(it?.price_per_unit))
+              ? null
+              : Number(it.price_per_unit),
+          line_total:
+            it?.line_total === null ||
+            it?.line_total === undefined ||
+            Number.isNaN(Number(it?.line_total))
+              ? null
+              : Number(it.line_total),
+        }))
+        .filter((it: any) => it.name && it.name.length > 0)
+    : [];
 
   if (!normalizedItems.length) {
     return res.status(400).json({ error: "human_fixed_items_required" });
@@ -428,10 +668,6 @@ async function getOrder(org_id: string, order_id: string) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/orders/:id/split
-// Body: { org_id?: string, item_indices?: number[] }
-// - Creates a NEW order with selected items
-// - Removes those items from original
-// - order_link_reason=new order: 'operator_split'
 // ─────────────────────────────────────────────────────────────────────────────
 orders.post("/:id/split", ensureAuth, express.json(), async (req: any, res) => {
   try {
@@ -494,17 +730,7 @@ orders.post("/:id/split", ensureAuth, express.json(), async (req: any, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/orders/:id/merge-previous
-// Body: {}
-// - Finds previous open order for same phone
-// - Appends all items of current into previous
-// - Marks current as 'cancelled'
-// - Writes order_link_reason on previous: 'operator_merged_previous'
-// Guards:
-//   • current must be OPEN
-//   • previous must be OPEN
-//   • never merge into a CLOSED order (shipped/paid/cancelled/delivered)
 // ─────────────────────────────────────────────────────────────────────────────
 orders.post(
   "/:id/merge-previous",
@@ -615,8 +841,5 @@ orders.delete("/:id", ensureAuth, async (req:any, res) => {
     return res.status(500).json({ ok: false, error: e?.message || "delete_failed" });
   }
 });
-
-
-
 
 export default orders;
