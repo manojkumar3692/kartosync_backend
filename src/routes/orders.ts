@@ -197,6 +197,39 @@ async function parsePipeline(
   return { items, used: "rules", confidence: null, reason: "rule_fallback" };
 }
 
+
+// Compute order_total from items using line_total or price_per_unit * qty
+function computeOrderTotalFromItems(items: any[]): number {
+  if (!Array.isArray(items) || !items.length) return 0;
+
+  let sum = 0;
+  for (const it of items) {
+    if (!it) continue;
+
+    const qty =
+      typeof it.qty === "number" && !Number.isNaN(it.qty) ? it.qty : 1;
+
+    const lineTotal =
+      typeof it.line_total === "number" && !Number.isNaN(it.line_total)
+        ? it.line_total
+        : null;
+
+    const pricePerUnit =
+      typeof it.price_per_unit === "number" &&
+      !Number.isNaN(it.price_per_unit)
+        ? it.price_per_unit
+        : null;
+
+    if (lineTotal != null) {
+      sum += lineTotal;
+    } else if (pricePerUnit != null) {
+      sum += pricePerUnit * qty;
+    }
+  }
+
+  return sum;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: when closing an order (shipped/paid), snapshot prices from catalog
 // so future catalog changes don't affect old orders.
@@ -393,6 +426,8 @@ orders.post("/", ensureAuth, async (req: any, res) => {
       return res.status(400).json({ error: "no_items_detected" });
     }
 
+    const order_total = computeOrderTotalFromItems(finalItems);
+
     const insert = {
       org_id: req.org_id,
       source_phone: phoneNorm || null, // never store a display name here
@@ -403,6 +438,11 @@ orders.post("/", ensureAuth, async (req: any, res) => {
       parse_confidence,
       parse_reason,
       order_link_reason: "new", // default for manual creations
+
+      // 🔹 NEW: pricing fields
+      order_total,          // 0 if no prices, a number otherwise
+      pricing_locked: false,
+
       ...(created_at ? { created_at: new Date(created_at).toISOString() } : {}),
     };
 
@@ -436,19 +476,53 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
       const frozenItems = await snapshotPricesFromCatalog(req.org_id, id);
 
       if (frozenItems) {
+        const order_total = computeOrderTotalFromItems(frozenItems);
+
         const { error } = await supa
           .from("orders")
-          .update({ status: next, items: frozenItems })
+          .update({
+            status: next,
+            items: frozenItems,
+            order_total,
+            pricing_locked: true,
+          })
           .eq("id", id)
           .eq("org_id", req.org_id);
 
         if (error) throw error;
         return res.json({ ok: true, status: next });
       }
-      // If snapshot fails, we fall through and just update status like before
+
+      // Snapshot failed → still close order, compute total from existing items if possible
+      const { data: curOrder, error: loadErr } = await supa
+        .from("orders")
+        .select("items")
+        .eq("id", id)
+        .eq("org_id", req.org_id)
+        .single();
+
+      if (loadErr) throw loadErr;
+
+      const existingItems = Array.isArray(curOrder?.items)
+        ? curOrder.items
+        : [];
+      const order_total = computeOrderTotalFromItems(existingItems);
+
+      const { error } = await supa
+        .from("orders")
+        .update({
+          status: next,
+          order_total,
+          pricing_locked: true,
+        })
+        .eq("id", id)
+        .eq("org_id", req.org_id);
+
+      if (error) throw error;
+      return res.json({ ok: true, status: next });
     }
 
-    // Original behaviour (other statuses, or snapshot failure)
+    // Original behaviour for other statuses (pending/cancelled, etc.)
     const { error } = await supa
       .from("orders")
       .update({ status: next })
@@ -578,13 +652,17 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
       }
     }
 
-    // 2) Update order
+    // 2) Update order (including fresh order_total)
+    const new_order_total = computeOrderTotalFromItems(normalizedItems);
+
     const { data: upd, error: e3 } = await supa
       .from("orders")
       .update({
         items: normalizedItems,
         parse_confidence: null,
         parse_reason: reason,
+        order_total: new_order_total,
+        // 🔸 we DO NOT touch pricing_locked here; if it's already true, it stays true
       })
       .eq("id", id)
       .eq("org_id", req.org_id)

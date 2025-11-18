@@ -21,6 +21,8 @@ import waba from './routes/waba';
 import { inbox } from './routes/inbox';
 import analytics from './routes/analytics';
 import path from "path"; // ⬅️ add this
+import adminBusiness from './routes/admin_business';
+import testing from './routes/testing';
 
 // ─────────────────────────────
 // Boot diagnostics
@@ -112,6 +114,10 @@ app.use('/api/orders', ordersFeedback);
 app.use('/api/payments', payments);
 app.use("/api/ai-corrections", aiCorrections);
 app.use("/api/analytics", analytics);
+
+// new changes
+app.use("/admin/business", adminBusiness);
+app.use("/api/testing", testing);
 
 // ─────────────────────────────
 // Server start

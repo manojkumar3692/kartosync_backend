@@ -8,8 +8,16 @@ import {
   isNotOrderMessage,
 } from "../util/notOrder";
 
-import { IngestInput, IngestResult, IngestSource, IngestItem } from "../types";
+import {
+  IngestInput,
+  IngestResult,
+  IngestSource,
+  IngestItem,
+  InquiryKind,
+} from "../types";
 import { decideLinking } from "./ingestCore/linking"; // ⬅️ linking decision (append vs new)
+import { findBestProductForTextV2 } from "../util/productMatcher";
+import { formatInquiryReply } from "../util/inquiryReply"; // NEW
 
 // ─────────────────────────────────────────────────────────
 // Optional AI parser hook (safe if missing → rules fallback)
@@ -115,6 +123,34 @@ function splitAndCleanLines(textRaw: string): string[] {
           .replace(/^\d+[\.\)]\s+/, "") // "1. " / "2) "
     )
     .filter(Boolean);
+}
+
+
+// Simple token overlap between query and product name
+function hasStrongTokenOverlap(query: string, candidate: string): boolean {
+  const norm = (s: string) =>
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/gi, " ")
+      .split(/\s+/)
+      .filter(Boolean);
+
+  const qTokens = norm(query);
+  const cTokens = norm(candidate);
+
+  if (!qTokens.length || !cTokens.length) return false;
+
+  const overlap = qTokens.filter((t) => cTokens.includes(t));
+  const overlapCount = overlap.length;
+
+  // 🔑 RULE:
+  // - if user gave 2+ words (e.g. "paneer biryani"), require overlap >= 2
+  // - if user gave only 1 word (e.g. "biryani"), overlap >= 1 is ok
+  if (qTokens.length >= 2) {
+    return overlapCount >= 2;
+  } else {
+    return overlapCount >= 1;
+  }
 }
 
 // Extract qty/unit from a single line
@@ -404,8 +440,8 @@ async function enrichWithPrefs(
           .order("score", { ascending: false })
           .limit(1);
         if (bvs && bvs[0]) {
-          brandPref = brandPref || ((bvs[0].brand || "").trim() || null);
-          variantPref = variantPref || ((bvs[0].variant || "").trim() || null);
+          brandPref = brandPref || (bvs[0].brand || "").trim() || null;
+          variantPref = variantPref || (bvs[0].variant || "").trim() || null;
         }
       } catch {}
     }
@@ -663,6 +699,7 @@ export async function ingestCoreFromMessage(
     const from_name = trim(input.from_name || "");
     const from_phone_raw = trim(input.from_phone || "");
     const source = input.source || "other";
+    const activeOrderId = trim(input.active_order_id || "");
 
     if (!orgId || !textRaw) {
       return {
@@ -841,152 +878,184 @@ export async function ingestCoreFromMessage(
       }
     }
 
-    // 7) Inquiry path
-    let inquiry = null as ReturnType<typeof detectInquiry>;
-    if ((!parsed.items || parsed.items.length === 0) && !hasListShape) {
-      inquiry = detectInquiry(String(textFlat));
-    }
+        // Let AI hint that this is an inquiry even if our regex misses slang
+        const aiTaggedInquiry =
+        typeof parsed.reason === "string" &&
+        /^inq:/.test(parsed.reason.toLowerCase());
+  
+      // Only treat as "inquiry" when the text clearly looks like a question
+      // (we now support both "do you have" and "do u have"/"hv", etc.)
+      const looksLikeQuestion =
+        /(\?|do you have|do u have|have stock|in stock|available|availability|price|rate|how much|stock)/i.test(
+          textFlat
+        ) ||
+        /\b(can i get|can i have|is there|you have|u have)\b/i.test(textFlat);
+  
+      // 🔍 Diagnostic log — extremely helpful
+      console.log("[INGEST][core][inquiry-guard-check]", {
+        text: textFlat,
+        parsedItems: parsed.items?.length || 0,
+        hasListShape,
+        looksLikeQuestion,
+        aiTaggedInquiry,
+        parsedReason: parsed.reason,
+      });
+  
+      if (
+        (!parsed.items || parsed.items.length === 0) &&
+        !hasListShape &&
+        (looksLikeQuestion || aiTaggedInquiry)
+      ) {
+        console.log("[INGEST][core] → considering inquiry detection");
+  
+        // Small helper type for what detectInquiry returns
+        type DetectedInquiry = {
+          kind: InquiryKind;      // "availability" | "price" | etc.
+          canonical: string;
+          confidence?: number;
+        };
+  
+        let detected: DetectedInquiry | null = null;
+  
+        // 1️⃣ Try to derive inquiry directly from AI reason, e.g.
+        //    "inq:availability:Paneer Biryani" or "inq:price:onion"
+        if (
+          typeof parsed.reason === "string" &&
+          /^inq:/.test(parsed.reason.toLowerCase())
+        ) {
+          const m =
+            /^inq:(price|availability)(?::(.+))?/i.exec(parsed.reason) || null;
+          if (m) {
+            const kind = m[1].toLowerCase() as InquiryKind;
+            const canonical = (m[2] || "").trim() || textFlat;
+            detected = { kind, canonical, confidence: 0.9 };
+            console.log("[INGEST][core][inquiry-from-ai-reason]", detected);
+          }
+        }
+  
+        // 2️⃣ Fallback to regex-based detector if AI did not give us a clean hint
+        if (!detected) {
+          const d = detectInquiry(textFlat) as any;
+          if (d && d.kind && d.canonical) {
+            detected = {
+              kind: d.kind as InquiryKind,
+              canonical: d.canonical,
+              confidence: d.confidence,
+            };
+          }
+        }
+  
+        console.log("[INGEST][core][detectInquiry]", detected);
+  
+        if (detected) {
+          const base: IngestResult = {
+            ok: true,
+            kind: "inquiry",
+            used: "inquiry",
+            stored: false,
+            order_id: undefined,
+  
+            // 🔥 These match your IngestInquiry type exactly:
+            inquiry: detected.kind,              // InquiryKind
+            inquiry_type: detected.kind,         // backwards compatibility
+            inquiry_canonical: detected.canonical,
+          };
+  
+          let matched: any = null;
+          try {
+            matched = await findBestProductForTextV2(orgId, detected.canonical);
+            console.log("[INGEST][core][inquiry-match-success]", matched);
+          } catch (e: any) {
+            console.log(
+              "[INGEST][core][inquiry-match-error]",
+              e?.message || e
+            );
+          }
+  
+          if (matched) {
+            // 🔍 Take the best product name we have
+            const candidateName = String(
+              matched.display_name || matched.canonical || ""
+            ).trim();
+        
+            const queryName = String(detected.canonical || "").trim();
+        
+            // If similarity is weak (e.g. "paneer biryani" vs "chicken biryani"),
+            // treat as NO MATCH → this will trigger inquiry_no_match + auto-pause.
+            const strongEnough = hasStrongTokenOverlap(queryName, candidateName);
+        
+            console.log("[INGEST][core][inquiry-match-overlap]", {
+              queryName,
+              candidateName,
+              strongEnough,
+            });
+        
+            if (strongEnough) {
+              return {
+                ...base,
+                reply: formatInquiryReply(matched, detected.kind),
+                reason: "inquiry_detected",
+              };
+            }
+        
+            // fall through to no-match below
+          }
+  
+          return {
+            ...base,
+            reply: `I could not find "${detected.canonical}". Please send exact product name.`,
+            reason: "inquiry_no_match",
+          };
+        }
+      }
 
-    if (!parsed.items || parsed.items.length === 0) {
-      if (!inquiry) {
-        console.log("[INGEST][core][SKIP] not order & not inquiry", {
-          reason: parsed.reason,
+        // 8) ORDER path starts here
+
+    // ⬇️ NEW: BEFORE anything, hydrate brand/variant from prefs (auto-learned)
+    // WHY: If we can resolve brand/variant, we want to avoid sending clarify at all.
+    try {
+        const { items: hydrated, applied } = await enrichWithPrefs(
+          orgId,
+          phoneNorm,
+          parsed.items || []
+        );
+        if (applied > 0) {
+          parsed.items = hydrated;
+          parsed.reason = ((parsed.reason || "") + "; prefs_hydrated").trim();
+        }
+      } catch (e: any) {
+        console.warn("[INGEST][prefs_enrich warn]", e?.message || e);
+      }
+      // ⬆️ INSERTION POINT: right after items exist, before append/new decision.
+  
+      // ⛑ SAFETY NET:
+      // If, after AI + rules + list fallback + qty fallback + prefs enrich,
+      // we STILL have no items, do NOT create or update an order.
+      if (!parsed.items || parsed.items.length === 0) {
+        console.log("[INGEST][core] no items after parse + enrich; treating as none", {
+          reason: parsed.reason || "—",
+          text: textFlat,
         });
+  
         return {
           ok: true,
           stored: false,
           kind: "none",
           used: parsed.used,
-          reason: "skipped_by_gate",
+          reason: `no_items_after_parse:${parsed.reason || ""}`.trim(),
         };
       }
-
-      // Avoid msg_id uniqueness collision on inquiry inserts
-      if (msg_id) {
-        const existingByMsg = await existsOrderByMsgId(msg_id);
-        if (existingByMsg) {
-          console.log("[INGEST][core][SKIP] duplicate-inquiry-msgid", {
-            msg_id,
-            order_id: existingByMsg.id,
-          });
-          return {
-            ok: true,
-            stored: false,
-            kind: "none",
-            used: "inquiry",
-            reason: "duplicate_msgid",
-            order_id: existingByMsg.id,
-          };
-        }
-      }
-
-      const dedupeKey = makeDedupeKey(
-        orgId,
-        String(textFlat),
-        ts,
-        phoneNorm,
-        msg_id || null
-      );
-      const { data: existing2 } = await supa
-        .from("orders")
-        .select("id")
-        .eq("org_id", orgId)
-        .eq("dedupe_key", dedupeKey)
-        .limit(1);
-      if (existing2 && existing2[0]) {
-        console.log("[INGEST][core][SKIP] duplicate-inquiry", {
-          orgId,
-          dedupeKey,
-        });
+  
+      // Ignore seller-style money messages (heuristic)
+      if (/\b(aed|dirham|dh|dhs|price|₹|rs|\$)\b/i.test(textFlat)) {
         return {
           ok: true,
           stored: false,
           kind: "none",
-          used: "inquiry",
-          reason: "duplicate",
+          used: parsed.used,
+          reason: "seller_money_message",
         };
       }
-
-      const items = [
-        {
-          qty: null,
-          unit: null,
-          canonical: inquiry.canonical,
-          brand: null,
-          variant: null,
-          notes: null,
-        },
-      ];
-
-      const reasonTag =
-        `inq:${inquiry.kind}` + (msg_id ? `; msgid:${msg_id}` : "");
-
-      const { error: insInqErr, data: createdInquiry } = await supa
-        .from("orders")
-        .insert({
-          org_id: orgId,
-          source_phone: phoneNorm,
-          customer_name: customerName,
-          raw_text: textRaw,
-          items,
-          status: "pending",
-          created_at: new Date(ts).toISOString(),
-          dedupe_key: dedupeKey,
-          parse_confidence: inquiry.confidence ?? null,
-          parse_reason: reasonTag,
-          msg_id: msg_id || null,
-        })
-        .select("id")
-        .single();
-      if (insInqErr) throw insInqErr;
-
-      console.log("[INGEST][core] inquiry stored", {
-        kind: inquiry.kind,
-        id: createdInquiry?.id,
-      });
-
-      return {
-        ok: true,
-        stored: true,
-        kind: "inquiry",
-        used: "inquiry",
-        inquiry: inquiry.kind,
-        order_id: createdInquiry!.id,
-        org_id: orgId,
-        items,
-        reason: reasonTag,
-      };
-    }
-
-    // 8) ORDER path starts here
-
-    // ⬇️ NEW: BEFORE anything, hydrate brand/variant from prefs (auto-learned)
-    // WHY: If we can resolve brand/variant, we want to avoid sending clarify at all.
-    try {
-      const { items: hydrated, applied } = await enrichWithPrefs(
-        orgId,
-        phoneNorm,
-        parsed.items || []
-      );
-      if (applied > 0) {
-        parsed.items = hydrated;
-        parsed.reason = ((parsed.reason || "") + "; prefs_hydrated").trim();
-      }
-    } catch (e: any) {
-      console.warn("[INGEST][prefs_enrich warn]", e?.message || e);
-    }
-    // ⬆️ INSERTION POINT: right after items exist, before append/new decision.
-
-    // Ignore seller-style money messages (heuristic)
-    if (/\b(aed|dirham|dh|dhs|price|₹|rs|\$)\b/i.test(textFlat)) {
-      return {
-        ok: true,
-        stored: false,
-        kind: "none",
-        used: parsed.used,
-        reason: "seller_money_message",
-      };
-    }
 
     // If there is a recent inquiry and this isn't explicit confirmation, don't auto-place
     const recentInq = await findRecentInquiry(
@@ -1091,18 +1160,141 @@ export async function ingestCoreFromMessage(
       }
     }
 
+        // ─────────────────────────────────────────────────────────
+    // Forced append when caller passes active_order_id
+    // (e.g., WABA knows there is an active pending order)
+    // ─────────────────────────────────────────────────────────
+    if (activeOrderId) {
+      try {
+        const { data: target, error: tgtErr } = await supa
+          .from("orders")
+          .select("id, items, status, source_phone")
+          .eq("org_id", orgId)
+          .eq("id", activeOrderId)
+          .single();
+
+        if (!tgtErr && target && target.id) {
+          const status = String(target.status || "").toLowerCase();
+
+          // Only append if it is still "open" and belongs to same phone
+          const phonePlain = String(phoneNorm || "").replace(/^\+/, "");
+          const srcPhone = String(target.source_phone || "");
+          const matchesPhone =
+            !phonePlain ||
+            srcPhone === phonePlain ||
+            srcPhone === "+" + phonePlain;
+
+          const isOpen = ![
+            "cancelled_by_customer",
+            "archived_for_new",
+            "paid",
+            "shipped",
+          ].includes(status);
+
+          if (matchesPhone && isOpen) {
+            const prevItems = Array.isArray(target.items)
+              ? target.items
+              : [];
+            const newItems = [...prevItems, ...(parsed.items || [])];
+
+            const { error: upErr } = await supa
+              .from("orders")
+              .update({
+                items: newItems,
+                parse_reason:
+                  (parsed.reason ?? "forced_append_active_order") +
+                  (msg_id ? `; msgid:${msg_id}` : ""),
+                parse_confidence: parsed.confidence ?? null,
+                ...(msg_id ? { msg_id } : {}),
+                order_link_reason: "forced_append_active_order",
+              })
+              .eq("id", target.id);
+
+            if (upErr) throw upErr;
+
+            // learning writes (same as append path)
+            try {
+              for (const it of parsed.items) {
+                const canon = trim(it.canonical || it.name || "");
+                if (!canon) continue;
+                const brand = (it.brand ?? "") + "";
+                const variant = (it.variant ?? "") + "";
+                const { error: eb } = await supa.rpc("upsert_bvs", {
+                  p_org_id: orgId,
+                  p_canonical: canon,
+                  p_brand: brand,
+                  p_variant: variant,
+                  p_inc: 1,
+                });
+                if (eb)
+                  console.warn("[INGEST][core][bvs err]", eb.message);
+                if (phoneNorm) {
+                  const { error: ec } = await supa.rpc(
+                    "upsert_customer_pref",
+                    {
+                      p_org_id: orgId,
+                      p_phone: phoneNorm,
+                      p_canonical: canon,
+                      p_brand: brand,
+                      p_variant: variant,
+                      p_inc: 1,
+                    }
+                  );
+                  if (ec)
+                    console.warn(
+                      "[INGEST][core][custpref err]",
+                      ec.message
+                    );
+                }
+              }
+            } catch (e: any) {
+              console.warn(
+                "[INGEST][core][forced_append learn warn]",
+                e?.message || e
+              );
+            }
+
+            // Auto-clarify if needed (WABA-only)
+            await maybeAutoSendClarify(orgId, target.id, source);
+
+            console.log(
+              "[INGEST][core] forced append into active_order_id",
+              target.id
+            );
+            return {
+              ok: true,
+              stored: true,
+              kind: "order",
+              used: parsed.used,
+              merged_into: target.id,
+              order_id: target.id,
+              items: newItems,
+              org_id: orgId,
+              reason: "forced_append_active_order",
+            };
+          }
+        }
+      } catch (e: any) {
+        console.warn(
+          "[INGEST][core][forced_append warn]",
+          e?.message || e
+        );
+        // if anything fails, we simply fall through to normal append/new logic
+      }
+    }
+
     // ─────────────────────────────────────────────────────────
     // Decide append vs new using last order snapshot
     // ─────────────────────────────────────────────────────────
     const phonePlain = String(phoneNorm || "").replace(/^\+/, "");
     const { data: lastRowsAny } = await supa
-    .from("orders")
-    .select("id, status, created_at")
-    .eq("org_id", orgId)
-    .or(`source_phone.eq.${phonePlain},source_phone.eq.+${phonePlain}`)
-    .not("status", "in", ["cancelled_by_customer", "archived_for_new"])
-    .order("created_at", { ascending: false })
-    .limit(1);
+      .from("orders")
+      .select("id, status, created_at")
+      .eq("org_id", orgId)
+      .or(`source_phone.eq.${phonePlain},source_phone.eq.+${phonePlain}`)
+      .not("status", "in", ["cancelled_by_customer", "archived_for_new"])
+      .order("created_at", { ascending: false })
+      .limit(1);
 
     const lastAny = lastRowsAny?.[0] || null;
 

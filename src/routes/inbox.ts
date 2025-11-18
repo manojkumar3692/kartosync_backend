@@ -239,19 +239,100 @@ inbox.get("/latest-order", async (req, res) => {
   }
 });
 
-// ───────────────── GET /messages (compat) ─────────────────
-// Returns merged inbound (orders) + outbound (messages) for a phone
+// ───────────────── GET /messages ─────────────────
+// WABA orgs: use `messages` table only (in + out) → no duplicates
+// Non-WABA orgs: keep old behaviour (orders as inbound, messages as outbound)
 inbox.get("/messages", async (req, res) => {
   try {
     const orgId = getOrgId(req) || String(req.query.org_id || "");
     const phoneRaw = String(req.query.phone || "").trim();
-    if (!orgId) return res.status(401).json({ ok: false, error: "no_org" });
-    if (!phoneRaw) return res.status(400).json({ ok: false, error: "phone_required" });
+
+    if (!orgId) {
+      return res.status(401).json({ ok: false, error: "no_org" });
+    }
+    if (!phoneRaw) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "phone_required" });
+    }
 
     const phonePlain = phoneRaw.replace(/[^\d]/g, "");
     const phonePlus = phonePlain ? `+${phonePlain}` : "";
 
-    // 1) inbound from orders
+    // 0) Look up org to know ingest_mode
+    const { data: orgRow, error: orgErr } = await supa
+      .from("orgs")
+      .select("id, ingest_mode")
+      .eq("id", orgId)
+      .maybeSingle();
+
+    if (orgErr) {
+      console.error("[INBOX][GET /messages] org lookup err", orgErr.message);
+    }
+
+    const ingestMode = (orgRow?.ingest_mode || "").toLowerCase();
+
+    // ─────────────────────────────
+    // CASE A: WABA → use `messages` only
+    // ─────────────────────────────
+    if (ingestMode === "waba") {
+      // 1) Find conversation (plain or +)
+      const { data: conv1 } = await supa
+        .from("conversations")
+        .select("id")
+        .eq("org_id", orgId)
+        .eq("customer_phone", phonePlain)
+        .limit(1)
+        .maybeSingle();
+
+      let conversationId = conv1?.id || null;
+      if (!conversationId) {
+        const { data: conv2 } = await supa
+          .from("conversations")
+          .select("id")
+          .eq("org_id", orgId)
+          .eq("customer_phone", phonePlus)
+          .limit(1)
+          .maybeSingle();
+        conversationId = conv2?.id || null;
+      }
+
+      if (!conversationId) {
+        // no chat yet
+        return res.json([]);
+      }
+
+      // 2) Read ALL messages for this conversation (in + out)
+      const { data: msgs, error: msgErr } = await supa
+        .from("messages")
+        .select("id, body, created_at, direction")
+        .eq("org_id", orgId)
+        .eq("conversation_id", conversationId)
+        .order("created_at", { ascending: true });
+
+      if (msgErr) throw msgErr;
+
+      const merged = (msgs || []).map((m: any) => {
+        const dir = (m.direction || "").toLowerCase();
+        const from: "customer" | "store" =
+          dir === "in" ? "customer" : "store";
+
+        return {
+          id: `${dir === "in" ? "in" : "out"}-${m.id}`,
+          from,
+          text: m.body || "",
+          ts: m.created_at,
+        };
+      });
+
+      return res.json(merged);
+    }
+
+    // ─────────────────────────────
+    // CASE B: non-WABA → keep old behaviour
+    // ─────────────────────────────
+
+    // 1) inbound from orders (legacy)
     const { data: orders, error: ordErr } = await supa
       .from("orders")
       .select("id, raw_text, created_at")
@@ -269,8 +350,7 @@ inbox.get("/messages", async (req, res) => {
     }));
 
     // 2) outbound from messages (only those tied to this phone’s conversation)
-    // find conversation by either plain or + format
-    const { data: conv1 } = await supa
+    const { data: conv1b } = await supa
       .from("conversations")
       .select("id")
       .eq("org_id", orgId)
@@ -278,25 +358,25 @@ inbox.get("/messages", async (req, res) => {
       .limit(1)
       .maybeSingle();
 
-    let conversationId = conv1?.id || null;
-    if (!conversationId) {
-      const { data: conv2 } = await supa
+    let conversationIdB = conv1b?.id || null;
+    if (!conversationIdB) {
+      const { data: conv2b } = await supa
         .from("conversations")
         .select("id")
         .eq("org_id", orgId)
         .eq("customer_phone", phonePlus)
         .limit(1)
         .maybeSingle();
-      conversationId = conv2?.id || null;
+      conversationIdB = conv2b?.id || null;
     }
 
     let outbound: Array<{ id: string; from: "store"; text: string; ts: string }> = [];
-    if (conversationId) {
+    if (conversationIdB) {
       const { data: msgs, error: msgErr } = await supa
         .from("messages")
         .select("id, body, created_at, direction")
         .eq("org_id", orgId)
-        .eq("conversation_id", conversationId)
+        .eq("conversation_id", conversationIdB)
         .order("created_at", { ascending: true });
 
       if (msgErr) throw msgErr;
@@ -311,7 +391,6 @@ inbox.get("/messages", async (req, res) => {
         }));
     }
 
-    // 3) merge + sort
     const merged = [...inbound, ...outbound].sort(
       (a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime()
     );
@@ -319,14 +398,16 @@ inbox.get("/messages", async (req, res) => {
     return res.json(merged);
   } catch (e: any) {
     console.error("[INBOX][GET /messages]", e?.message || e);
-    return res.status(500).json({ ok: false, error: "inbox_messages_failed" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "inbox_messages_failed" });
   }
 });
 
 // ───────────── NEW: per-customer auto-reply APIs ─────────────
 
 // GET /api/inbox/auto_reply?org_id=...&phone=...
-// Returns { enabled: boolean } (default true if no row)
+// Returns { enabled: boolean, last_inquiry_* fields... }
 inbox.get("/auto_reply", async (req, res) => {
   try {
     const orgId = getOrgId(req) || String(req.query.org_id || "");
@@ -343,7 +424,16 @@ inbox.get("/auto_reply", async (req, res) => {
 
     const { data, error } = await supa
       .from("org_customer_settings")
-      .select("auto_reply_enabled")
+      .select(
+        `
+        auto_reply_enabled,
+        last_inquiry_text,
+        last_inquiry_kind,
+        last_inquiry_canonical,
+        last_inquiry_at,
+        last_inquiry_status
+      `
+      )
       .eq("org_id", orgId)
       .eq("customer_phone", phoneKey)
       .maybeSingle();
@@ -353,12 +443,23 @@ inbox.get("/auto_reply", async (req, res) => {
       return res.status(500).json({ ok: false, error: "db_error" });
     }
 
+    // 👇 Cast to any so TS stops treating this as GenericStringError
+    const row: any = data || {};
+
     const enabled =
-      data && typeof data.auto_reply_enabled === "boolean"
-        ? !!data.auto_reply_enabled
+      row && typeof row.auto_reply_enabled === "boolean"
+        ? !!row.auto_reply_enabled
         : true; // default ON
 
-    return res.json({ ok: true, enabled });
+    return res.json({
+      ok: true,
+      enabled,
+      last_inquiry_text: row.last_inquiry_text ?? null,
+      last_inquiry_kind: row.last_inquiry_kind ?? null,
+      last_inquiry_canonical: row.last_inquiry_canonical ?? null,
+      last_inquiry_at: row.last_inquiry_at ?? null,
+      last_inquiry_status: row.last_inquiry_status ?? null,
+    });
   } catch (e: any) {
     console.error("[INBOX][auto_reply GET catch]", e?.message || e);
     return res.status(500).json({ ok: false, error: "auto_reply_get_failed" });
@@ -414,6 +515,55 @@ inbox.post("/auto_reply", express.json(), async (req, res) => {
   } catch (e: any) {
     console.error("[INBOX][auto_reply POST catch]", e?.message || e);
     return res.status(500).json({ ok: false, error: "auto_reply_post_failed" });
+  }
+});
+
+// POST /api/inbox/inquiry_resolved
+// Body: { org_id, phone, inquiry_at?, canonical? }
+// Marks the last inquiry as resolved for this customer
+// POST /api/inbox/inquiry_resolved
+// Body: { org_id, phone, inquiry_at?, canonical? }
+inbox.post("/inquiry_resolved", express.json(), async (req, res) => {
+  try {
+    const orgId = getOrgId(req) || String(req.body?.org_id || "");
+    const phoneRaw = String(req.body?.phone || "").trim();
+    const inquiryAt = req.body?.inquiry_at ? String(req.body.inquiry_at) : null;
+    const canonical = req.body?.canonical ? String(req.body.canonical) : null;
+
+    if (!orgId) {
+      return res.status(401).json({ ok: false, error: "no_org" });
+    }
+    if (!phoneRaw) {
+      return res.status(400).json({ ok: false, error: "phone_required" });
+    }
+
+    const phoneKey = normalizePhoneForKey(phoneRaw);
+
+    const update: any = {
+      last_inquiry_status: "resolved",
+    };
+
+    // Optional: only clear if same inquiry
+    if (inquiryAt) update.last_inquiry_at = inquiryAt;
+    if (canonical) update.last_inquiry_canonical = canonical;
+
+    const { error } = await supa
+      .from("org_customer_settings")
+      .update(update)
+      .eq("org_id", orgId)
+      .eq("customer_phone", phoneKey);
+
+    if (error) {
+      console.error("[INBOX][inquiry_resolved err]", error.message);
+      return res.status(500).json({ ok: false, error: "db_error" });
+    }
+
+    return res.json({ ok: true });
+  } catch (e: any) {
+    console.error("[INBOX][inquiry_resolved catch]", e?.message || e);
+    return res
+      .status(500)
+      .json({ ok: false, error: "inquiry_resolved_failed" });
   }
 });
 

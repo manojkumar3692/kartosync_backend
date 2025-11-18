@@ -13,7 +13,8 @@ import { supa } from "../db"; // ← optional logging
 // ─────────────────────────────────────────────────────────────────────────────
 // Safe string helpers (avoid .trim on undefined / non-strings)
 // ─────────────────────────────────────────────────────────────────────────────
-const asStr = (v: any) => (typeof v === "string" ? v : v == null ? "" : String(v));
+const asStr = (v: any) =>
+  typeof v === "string" ? v : v == null ? "" : String(v);
 const trimStr = (v: any) => asStr(v).trim();
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -45,10 +46,129 @@ export const ParseResultSchema = z.object({
 export type ParseResult = z.infer<typeof ParseResultSchema>;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 1.1) Internal kind classification (for better parse_reason)
+// ─────────────────────────────────────────────────────────────────────────────
+type ParsedKind =
+  | "order"
+  | "price_inquiry"
+  | "availability_inquiry"
+  | "menu_request"
+  | "greeting"
+  | "unknown";
+
+function hasOrderIntentVerb(t: string): boolean {
+  return /\b(send|need|want|order|buy|deliver|give|bring|pack|take|place|can you send)\b/i.test(
+    t
+  );
+}
+function hasPriceWord(t: string): boolean {
+  return /\b(price|rate|how much|cost|prize)\b/i.test(t);
+}
+function hasAvailabilityWord(t: string): boolean {
+  return /\b(available|availability|in stock|stock|have you|do you have|is there)\b/i.test(
+    t
+  );
+}
+function hasMenuWord(t: string): boolean {
+  return /\b(menu|what all|what are the items|list of items|options do you have)\b/i.test(
+    t
+  );
+}
+function looksLikeGreeting(t: string): boolean {
+  return /^(hi|hello|hlo|hey|thanks|thank you|ok|k|👍|🙏|good (morning|night|evening))\b/i.test(
+    t
+  );
+}
+
+// Decide a high-level kind from parsed result + raw text
+function classifyParsedKind(parsed: ParseResult, raw: string): ParsedKind {
+  const t = trimStr(raw).toLowerCase();
+  const reason = trimStr(parsed.reason).toLowerCase();
+  const hasItems = Array.isArray(parsed.items) && parsed.items.length > 0;
+
+  // Strong hints from reason first (backward compatible with older reasons)
+  if (
+    reason.startsWith("inq:price") ||
+    reason.includes("inquiry:price") ||
+    reason.includes("inquiry about price")
+  ) {
+    return "price_inquiry";
+  }
+  if (
+    reason.startsWith("inq:availability") ||
+    reason.includes("inquiry:availability") ||
+    reason.includes("inquiry about availability")
+  ) {
+    return "availability_inquiry";
+  }
+  if (reason.startsWith("inq:menu") || reason.includes("menu_request")) {
+    return "menu_request";
+  }
+  if (
+    reason.startsWith("non_order:greeting") ||
+    reason === "greeting" ||
+    reason === "greeting_or_noise"
+  ) {
+    return "greeting";
+  }
+
+  // If model thinks it's an order and we have items → treat as order
+  if (parsed.is_order_like && hasItems) {
+    return "order";
+  }
+
+  // Not an order-like, or no items → use text heuristics
+  if (hasPriceWord(t) && !hasOrderIntentVerb(t)) {
+    return "price_inquiry";
+  }
+  if (hasAvailabilityWord(t) && !hasOrderIntentVerb(t)) {
+    return "availability_inquiry";
+  }
+  if (hasMenuWord(t) && !hasOrderIntentVerb(t)) {
+    return "menu_request";
+  }
+  if (looksLikeGreeting(t)) {
+    return "greeting";
+  }
+
+  // Default / unknown
+  return "unknown";
+}
+
+// Build a standardized parse_reason from kind + label + previous reason
+function buildParseReasonFromKind(
+  kind: ParsedKind,
+  primaryLabel: string | null,
+  prevReason: string | null
+): string {
+  const label = (primaryLabel || "").trim().toLowerCase();
+  const safePrev = trimStr(prevReason);
+
+  switch (kind) {
+    case "price_inquiry":
+      return label ? `inq:price:${label}` : "inq:price";
+    case "availability_inquiry":
+      return label ? `inq:availability:${label}` : "inq:availability";
+    case "menu_request":
+      return "inq:menu";
+    case "greeting":
+      return "non_order:greeting";
+    case "order":
+      // For orders, keep old human-friendly reason if present
+      return safePrev || "order";
+    case "unknown":
+    default:
+      // Fallback – keep old reason if any, else generic
+      return safePrev || "items_detected";
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const MODEL = process.env.AI_MODEL || "gpt-4o-mini";
 const ENABLE_AI = !!OPENAI_API_KEY;
-const PER_CALL_CAP = Number(process.env.AI_PER_CALL_USD_MAX || 0) || undefined; // e.g. 1.00
+const PER_CALL_CAP =
+  Number(process.env.AI_PER_CALL_USD_MAX || 0) || undefined; // e.g. 1.00
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 2) Prompt (system + few-shots)
@@ -80,9 +200,8 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
           category: "meat",
           brand: null,
           variant: null,
-          // 🔥 NEW
-      price_per_unit: null,
-      line_total: null,
+          price_per_unit: null,
+          line_total: null,
         },
         {
           name: "milk",
@@ -93,9 +212,8 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
           category: "dairy",
           brand: null,
           variant: null,
-          // 🔥 NEW
-      price_per_unit: null,
-      line_total: null,
+          price_per_unit: null,
+          line_total: null,
         },
       ],
       confidence: 0.92,
@@ -116,9 +234,8 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
           category: "dairy",
           brand: null,
           variant: null,
-          // 🔥 NEW
-      price_per_unit: null,
-      line_total: null,
+          price_per_unit: null,
+          line_total: null,
         },
       ],
       confidence: 0.85,
@@ -139,9 +256,8 @@ const FEWSHOTS: Array<{ user: string; assistant: ParseResult }> = [
           category: "grocery",
           brand: null,
           variant: null,
-          // 🔥 NEW
-      price_per_unit: null,
-      line_total: null,
+          price_per_unit: null,
+          line_total: null,
         },
       ],
       confidence: 0.8,
@@ -172,6 +288,13 @@ const VERB_SYNONYMS: Record<string, string> = {
   book: "order",
   keep: "send",
   bring: "send",
+   // NEW: chat-style shortcuts
+   u: "you",
+   ur: "your",
+   yr: "your",
+   r: "are",
+   hv: "have",
+   hav: "have",
 };
 
 // Replace the whole UNIT_SYNONYMS block with this:
@@ -199,12 +322,16 @@ const WORD_NORMALIZE: Array<[RegExp, string]> = [
   [/idly/gi, "idli"],
   [/tooth\s*brush/gi, "toothbrush"],
   [/david\s*off/gi, "davidoff"],
+    // NEW: food typos we see a lot
+    [/biriyani/gi, "biryani"],
+    [/toma+to+/gi, "tomato"],
+    [/chiken/gi, "chicken"],
 ];
 
 function normalizeLight(text: string): string {
   let s = text;
   s = s.replace(/\bgm(s)?\b/gi, "g");
-s = s.replace(/\bkg(s)?\b/gi, "kg");
+  s = s.replace(/\bkg(s)?\b/gi, "kg");
   // verbs
   for (const [k, v] of Object.entries(VERB_SYNONYMS)) {
     const re = new RegExp(`\\b${k}\\b`, "gi");
@@ -237,7 +364,10 @@ const BRAND_HINTS: Record<string, string[]> = {
   "sanitary pads": ["whisper", "stayfree", "sofy"],
 };
 
-const VARIANT_PATTERNS: Array<{ re: RegExp; norm: string | ((m: RegExpExecArray) => string) }> = [
+const VARIANT_PATTERNS: Array<{
+  re: RegExp;
+  norm: string | ((m: RegExpExecArray) => string);
+}> = [
   { re: /(full\s*fat)/i, norm: "Full Fat" },
   { re: /(low\s*fat|lite|light)/i, norm: "Low Fat" },
   { re: /(skim|double\s*toned)/i, norm: "Skim" },
@@ -276,14 +406,17 @@ function detectVariant(base: string): string | null {
 // ─────────────────────────────────────────────────────────────────────────────
 // List heuristics (bias away from false 'greeting')
 // ─────────────────────────────────────────────────────────────────────────────
-function hasOrderIntentVerb(t: string): boolean {
-  return /\b(send|need|want|order|buy|deliver|give|bring|pack|take|place|can you send)\b/i.test(t);
-}
 function hasUnitOrQty(t: string): boolean {
-  return /\b(\d+(\.\d+)?)\s?(kg|g|l|ml|pack|pc|pcs|dozen)\b/i.test(t) || /\b\d+\b/.test(t);
+  return (
+    /\b(\d+(\.\d+)?)\s?(kg|g|l|ml|pack|pc|pcs|dozen)\b/i.test(t) ||
+    /\b\d+\b/.test(t)
+  );
 }
 function isMultiLineProducty(t: string): boolean {
-  const lines = t.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const lines = t
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
   if (lines.length < 2) return false;
   let productish = 0;
   for (const l of lines) {
@@ -301,11 +434,37 @@ function isCommaListWithIntent(t: string): boolean {
 function isGreetingOrNoise(text: string): boolean {
   const t = trimStr(text).toLowerCase();
   if (!t) return true;
+
   // If it looks like a list, do NOT treat as noise.
   if (isMultiLineProducty(t) || isCommaListWithIntent(t)) return false;
-  return /^(hi|hello|hlo|thanks|thank you|ok|k|👍|🙏|good (morning|night|evening)|done|received)\b/.test(
-    t
-  );
+
+  const GREETING_RE =
+    /^(hi|hello|hlo|hey|thanks|thank you|ok|okay|k|👍|🙏|good (morning|night|evening)|done|received)\b/;
+
+  // If it doesn't even start with a greeting → not noise
+  if (!GREETING_RE.test(t)) return false;
+
+  // Strip the greeting and look at the rest
+  const rest = t.replace(GREETING_RE, "").trim();
+  if (!rest) {
+    // Pure greeting like "hi", "hello", "thanks"
+    return true;
+  }
+
+  // If the rest clearly looks like a question/inquiry → NOT noise
+  if (/[?]/.test(rest)) return false;
+
+  // If the rest mentions items / price / availability / menu → NOT noise
+  if (
+    /\b(price|rate|cost|menu|available|availability|in stock|stock|have|deliver|send|order|buy|kg|g|l|ml|packet|pack|biryani|milk|onion|tomato)\b/.test(
+      rest
+    )
+  ) {
+    return false;
+  }
+
+  // Safe default: treat stuff like "hi how are you" as noise
+  return true;
 }
 
 // Coerce any rule-parser shape into our ItemSchema-ish
@@ -398,15 +557,20 @@ function applyMicroHeuristics(
     if (!it.canonical) {
       if (/ice\s*cream/i.test(baseName)) it.canonical = "Ice Cream";
       else if (/croissants?/i.test(baseName)) it.canonical = "Croissant";
-      else if (/mustard\s*seeds?/i.test(baseName)) it.canonical = "Mustard Seeds";
-      else if (/fenugreek\s*seeds?/i.test(baseName)) it.canonical = "Fenugreek Seeds";
+      else if (/mustard\s*seeds?/i.test(baseName))
+        it.canonical = "Mustard Seeds";
+      else if (/fenugreek\s*seeds?/i.test(baseName))
+        it.canonical = "Fenugreek Seeds";
       else if (/tooth\s*brush/i.test(baseName)) it.canonical = "Toothbrush";
-      else if (/sanitary\s*pads?/i.test(baseName)) it.canonical = "Sanitary Pads";
-      else if (/coffee\s*powder/i.test(baseName)) it.canonical = "Coffee Powder";
+      else if (/sanitary\s*pads?/i.test(baseName))
+        it.canonical = "Sanitary Pads";
+      else if (/coffee\s*powder/i.test(baseName))
+        it.canonical = "Coffee Powder";
       else if (/pop\s*corn/i.test(baseName)) it.canonical = "Popcorn";
       else if (/shampoo/i.test(baseName)) it.canonical = "Shampoo";
       else if (/idli|idly/i.test(baseName)) it.canonical = "Idli Batter";
-      else if (/chapati|chapati|chapathi/i.test(baseName)) it.canonical = "Chapati";
+      else if (/chapati|chapati|chapathi/i.test(baseName))
+        it.canonical = "Chapati";
     }
 
     // NEW: cheap brand + variant detection from raw text
@@ -561,14 +725,14 @@ function postSplitCommaList(raw: string, parsed: ParseResult): ParseResult {
         category: null,
         brand: detectBrand(p, null),
         variant: detectVariant(p),
-        // 🔥 NEW
-  price_per_unit: null,
-  line_total: null,
+        price_per_unit: null,
+        line_total: null,
       }));
       return {
         items: applyMicroHeuristics(items as any),
         confidence: Math.max(parsed.confidence ?? 0.5, 0.7),
-        reason: (parsed.reason ? parsed.reason + "; " : "") + "post_split_comma_list",
+        reason:
+          (parsed.reason ? parsed.reason + "; " : "") + "post_split_comma_list",
         is_order_like: true,
       };
     }
@@ -618,16 +782,20 @@ export async function aiParseOrder(
   // If we have a strong list bias but no qty, set qty=1 for each line item (cheap default)
   if (listBias && baseline.items.length > 0) {
     baseline.items = baseline.items.map((it) => ({ ...it, qty: it.qty ?? 1 }));
-    baseline.reason = (baseline.reason ? baseline.reason + "; " : "") + "list_bias_qty1";
+    baseline.reason =
+      (baseline.reason ? baseline.reason + "; " : "") + "list_bias_qty1";
     baseline.confidence = Math.max(baseline.confidence, 0.7);
   }
 
   if (!ENABLE_AI) {
-    console.warn("[AI$ DISABLED] OPENAI_API_KEY not set; returning baseline only.", {
-      model: MODEL,
-      org_id: opts?.org_id || null,
-      customer_phone: opts?.customer_phone || null,
-    });
+    console.warn(
+      "[AI$ DISABLED] OPENAI_API_KEY not set; returning baseline only.",
+      {
+        model: MODEL,
+        org_id: opts?.org_id || null,
+        customer_phone: opts?.customer_phone || null,
+      }
+    );
     return postSplitCommaList(raw, baseline);
   }
 
@@ -650,7 +818,9 @@ export async function aiParseOrder(
   // Visibility: planned cost
   console.log("[AI$ PLAN]", {
     model: MODEL,
-    approxUSD: Number((approxUSD as any).toFixed ? (approxUSD as any).toFixed(4) : approxUSD),
+    approxUSD: Number(
+      (approxUSD as any).toFixed ? (approxUSD as any).toFixed(4) : approxUSD
+    ),
     org_id: opts?.org_id || null,
     customer_phone: opts?.customer_phone || null,
   });
@@ -659,7 +829,9 @@ export async function aiParseOrder(
   const gateOk = typeof canSpend === "object" ? (canSpend as any).ok : !!canSpend;
   if (!gateOk) {
     const reason =
-      typeof canSpend === "object" ? (canSpend as any).reason : "daily_cap_exceeded";
+      typeof canSpend === "object"
+        ? (canSpend as any).reason
+        : "daily_cap_exceeded";
     console.warn("[AI$ BLOCK pre] daily cap gate", {
       reason,
       approxUSD,
@@ -669,11 +841,14 @@ export async function aiParseOrder(
     });
     return postSplitCommaList(raw, baseline);
   }
-  if (typeof canSpend === "object" && (canSpend as any).today !== undefined) {
+  if (
+    typeof canSpend === "object" &&
+    (canSpend as any).today !== undefined
+  ) {
     console.log(
-      `[AI$ PRE ok] today=$${(canSpend as any).today.toFixed(4)} + ~${(approxUSD as any).toFixed(
-        4
-      )} <= cap=$${((canSpend as any).cap ?? 0).toFixed(2)}`
+      `[AI$ PRE ok] today=$${(canSpend as any).today.toFixed(4)} + ~${(
+        approxUSD as any
+      ).toFixed(4)} <= cap=$${((canSpend as any).cap ?? 0).toFixed(2)}`
     );
   }
 
@@ -714,13 +889,15 @@ export async function aiParseOrder(
                   brand: trimStr(x?.brand) || null,
                   variant: trimStr(x?.variant) || null,
                   price_per_unit:
-      typeof x?.price_per_unit === "number" && !Number.isNaN(x.price_per_unit)
-        ? x.price_per_unit
-        : null,
-    line_total:
-      typeof x?.line_total === "number" && !Number.isNaN(x.line_total)
-        ? x.line_total
-        : null,
+                    typeof x?.price_per_unit === "number" &&
+                    !Number.isNaN(x.price_per_unit)
+                      ? x.price_per_unit
+                      : null,
+                  line_total:
+                    typeof x?.line_total === "number" &&
+                    !Number.isNaN(x.line_total)
+                      ? x.line_total
+                      : null,
                 }))
                 .filter((x) => !!x.name);
 
@@ -819,11 +996,14 @@ export async function aiParseOrder(
       | undefined;
 
     if (!usage) {
-      console.warn("[AI$ WARN] OpenAI returned no usage; cost cannot be computed.", {
-        model: MODEL,
-        org_id: opts?.org_id || null,
-        customer_phone: opts?.customer_phone || null,
-      });
+      console.warn(
+        "[AI$ WARN] OpenAI returned no usage; cost cannot be computed.",
+        {
+          model: MODEL,
+          org_id: opts?.org_id || null,
+          customer_phone: opts?.customer_phone || null,
+        }
+      );
     }
 
     const cost = estimateCostUSD(usage, MODEL);
@@ -854,22 +1034,36 @@ export async function aiParseOrder(
     try {
       parsed = ParseResultSchema.parse(JSON.parse(content));
     } catch {
-      console.warn("[AI$ SKIP post] model returned non-JSON → using baseline. reason:", baseline.reason);
+      console.warn(
+        "[AI$ SKIP post] model returned non-JSON → using baseline. reason:",
+        baseline.reason
+      );
       return postSplitCommaList(raw, baseline);
     }
 
     // Normalize items further (null-safe)
     parsed.items = applyMicroHeuristics(parsed.items);
 
-    // ✅ Preserve model-provided reason; only add fallback if missing/blank
-    const aiReason = trimStr(parsed.reason);
-    if (!aiReason) {
-      parsed.reason = baseline.items.length ? "refined_from_rules" : "items_detected";
-    } else {
-      parsed.reason = aiReason;
-    }
+    // First, get a primary label BEFORE we possibly clear items for inquiries
+    const primaryLabel: string | null =
+      Array.isArray(parsed.items) && parsed.items.length > 0
+        ? trimStr(
+            parsed.items[0].canonical ||
+              parsed.items[0].name ||
+              ""
+          ) || null
+        : null;
 
-    // If model says it's not an order (or empty items), we still allow inquiry downstream.
+    // Decide high-level kind and normalize parse_reason to our compact format
+    const kind: ParsedKind = classifyParsedKind(parsed, raw);
+    parsed.reason = buildParseReasonFromKind(
+      kind,
+      primaryLabel,
+      parsed.reason
+    );
+
+    // If model says it's not an order (or empty items), we keep behaviour:
+    // callers see `is_order_like=false` and no items from AI (inquiries / greetings).
     if (!parsed.is_order_like || parsed.items.length === 0) {
       return { ...parsed, items: [], is_order_like: false };
     }

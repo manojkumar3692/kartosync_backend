@@ -3,7 +3,8 @@ import express from "express";
 import axios from "axios";
 import { supa } from "../db";
 import { ingestCoreFromMessage } from "./ingestCore";
-import { findBestProductForText, getLatestPrice } from "../util/products";
+import { getLatestPrice } from "../util/products";
+import { findBestProductForTextV2 } from "../util/productMatcher";
 
 export const waba = express.Router();
 
@@ -40,43 +41,628 @@ waba.get("/", (req, res) => {
   return res.sendStatus(403);
 });
 
+const WABA_DEBUG = process.env.WABA_DEBUG === "1";
+
+function wabaDebug(...args: any[]) {
+  if (!WABA_DEBUG) return;
+  console.log("[WABA-DEBUG]", ...args);
+}
+
+
+// ─────────────────────────────
+// Business-type helpers
+// ─────────────────────────────
+
+type BusinessType =
+  | "grocery"
+  | "meat"
+  | "cloud_kitchen"
+  | "restaurant"
+  | "salon"
+  | "pharmacy"
+  | "generic";
+
+function normalizeBusinessType(raw: string | null | undefined): BusinessType {
+  const t = (raw || "").toLowerCase().trim();
+
+  if (["grocery", "supermarket", "mini_mart"].includes(t)) return "grocery";
+  if (["meat", "butcher"].includes(t)) return "meat";
+  if (["cloud_kitchen", "cloudkitchen", "dark_kitchen"].includes(t))
+    return "cloud_kitchen";
+  if (["restaurant", "cafe", "café"].includes(t)) return "restaurant";
+  if (["salon", "spa", "barber", "barbershop"].includes(t)) return "salon";
+  if (["pharmacy", "medical_store"].includes(t)) return "pharmacy";
+
+  return "generic";
+}
+
+/**
+ * Decide if we should auto-ask for delivery address on WhatsApp.
+ *
+ * - For most businesses → true by default (if supports_delivery !== false)
+ * - For salons (walk-in / appointment-style) → false by default
+ * - Explicit supports_delivery=false always disables address asking.
+ */
+function orgNeedsDeliveryAddress(org: any): boolean {
+  if (org && org.supports_delivery === false) return false;
+
+  const bt = normalizeBusinessType(org?.primary_business_type);
+  if (bt === "salon") {
+    // Default: don't auto-ask address for salons/barbers
+    return false;
+  }
+
+  // Others (grocery, meat, cloud_kitchen, restaurant, generic, etc.)
+  return true;
+}
+
+
+// ─────────────────────────────
+// Helper: product options + prices for a text
+// ─────────────────────────────
+
+type ProductPriceOption = {
+    productId: string;
+    name: string;
+    variant: string | null;
+    unit: string;
+    price: number | null;
+    currency: string | null;
+  };
+  
+  type ProductOptionsResult = {
+    best: {
+      id: string;
+      display_name: string;
+      canonical?: string | null;
+      base_unit?: string | null;
+    };
+    options: ProductPriceOption[];
+  };
+  
+  /**
+   * Given a free-text like "price of onion",
+   *  1) find the best matching product,
+   *  2) then fetch all variants of that canonical for this org,
+   *  3) attach latest price for each.
+   *
+   * If anything fails, we fall back gracefully.
+   */
+  async function findProductOptionsForText(
+    org_id: string,
+    text: string
+  ): Promise<ProductOptionsResult | null> {
+    // 1) Try your existing fuzzy matcher first
+    let best: any = await findBestProductForTextV2(org_id, text);
+  
+    // ─────────────────────────────────────────────
+    // 1b) GENERIC FALLBACK: token-based search
+    //     (for spelling differences like biriyani vs biryani,
+    //      works for any vertical: grocery, salon, pharmacy, etc.)
+    // ─────────────────────────────────────────────
+    if (!best || !best.id) {
+      try {
+        const raw = (text || "").toLowerCase();
+  
+        // basic cleanup
+        const words = raw
+          .replace(/[^a-z0-9\s]/gi, " ")
+          .split(/\s+/)
+          .filter(Boolean);
+  
+        const stopwords = new Set([
+          "hi",
+          "hello",
+          "hey",
+          "what",
+          "whats",
+          "is",
+          "the",
+          "a",
+          "an",
+          "of",
+          "for",
+          "to",
+          "do",
+          "you",
+          "have",
+          "any",
+          "today",
+          "please",
+          "pls",
+          "kindly",
+          "how",
+          "much",
+          "price",
+          "rate",
+          "cost",
+          "available",
+          "availability",
+          "stock",
+          "there",
+        ]);
+  
+        const keywords = words.filter(
+          (w) => !stopwords.has(w) && w.length >= 3
+        );
+        if (!keywords.length) {
+          // nothing meaningful left → give up, keep old behaviour
+          return null;
+        }
+  
+        // Fetch candidate products for this org (generic, all business types)
+        const { data, error } = await supa
+          .from("products")
+          .select("id, canonical, display_name, base_unit")
+          .eq("org_id", org_id);
+  
+        if (error || !data || !data.length) {
+          return null;
+        }
+  
+        // Very simple token-overlap scoring (generic across domains)
+        let bestRow: any | null = null;
+        let bestScore = 0;
+  
+        for (const row of data) {
+          const name = String(
+            row.display_name || row.canonical || ""
+          ).toLowerCase();
+  
+          const nameTokens = name.split(/\s+/).filter(Boolean);
+          if (!nameTokens.length) continue;
+  
+          const overlap = nameTokens.filter((t) => keywords.includes(t));
+          let score = overlap.length;
+  
+          // Slight bonus if the product name contains the raw keyword string
+          const joined = keywords.join(" ");
+          if (joined && name.includes(joined)) {
+            score += 0.5;
+          }
+  
+          if (score > bestScore) {
+            bestScore = score;
+            bestRow = row;
+          }
+        }
+  
+        // Require at least some overlap to avoid random matches
+        if (!bestRow || bestScore <= 0) {
+          return null; // fall back to your existing generic text
+        }
+  
+        // Map fallback row to the "best" shape your code expects
+        best = {
+          id: bestRow.id,
+          display_name:
+            bestRow.display_name || bestRow.canonical || "item",
+          canonical: bestRow.canonical || null,
+          base_unit: bestRow.base_unit || null,
+        };
+      } catch (e: any) {
+        console.warn(
+          "[WABA][fallback product search err]",
+          e?.message || e
+        );
+        return null;
+      }
+    }
+  
+    const canon =
+      (best.canonical || best.display_name || "").toString().trim();
+    if (!canon) {
+      // we still return best, but no extra options
+      return {
+        best: {
+          id: best.id,
+          display_name: best.display_name || canon || "item",
+          canonical: best.canonical || null,
+          base_unit: best.base_unit || null,
+        },
+        options: [],
+      };
+    }
+  
+    // 2) Fetch all products with same canonical in this org
+    const { data, error } = await supa
+    .from("products")
+    .select("id, canonical, variant, base_unit, display_name, price_per_unit")
+    .eq("org_id", org_id)
+    .ilike("canonical", canon);
+  
+    if (error) {
+      console.warn("[WABA][productOptions err]", error.message);
+      // fall back to just 'best' product
+      return {
+        best: {
+          id: best.id,
+          display_name: best.display_name || canon || "item",
+          canonical: best.canonical || null,
+          base_unit: best.base_unit || null,
+        },
+        options: [],
+      };
+    }
+  
+    const rows = (data || []) as any[];
+  
+    // If nothing else is configured, still return best as an option
+    if (!rows.length) {
+      return {
+        best: {
+          id: best.id,
+          display_name: best.display_name || canon || "item",
+          canonical: best.canonical || null,
+          base_unit: best.base_unit || null,
+        },
+        options: [],
+      };
+    }
+  
+    const options: ProductPriceOption[] = [];
+  
+    for (const row of rows) {
+        const id = row.id;
+        if (!id) continue;
+      
+        const latest = await getLatestPrice(org_id, id).catch((e: any) => {
+          console.warn("[WABA][latestPrice err]", e?.message || e);
+          return null;
+        });
+      
+        // ✅ NEW: fall back to price_per_unit when there is no latest price
+        const price =
+          latest && typeof latest.price === "number"
+            ? latest.price
+            : typeof row.price_per_unit === "number"
+            ? row.price_per_unit
+            : null;
+      
+        const currency = latest ? latest.currency : null;
+      
+        options.push({
+          productId: id,
+          name:
+            row.display_name ||
+            row.canonical ||
+            best.display_name ||
+            canon ||
+            "item",
+          variant: row.variant ? String(row.variant).trim() || null : null,
+          unit: row.base_unit || best.base_unit || "unit",
+          price,        // ✅ now includes static price_per_unit fallback
+          currency,     // may be null
+        });
+      }
+  
+    return {
+      best: {
+        id: best.id,
+        display_name: best.display_name || canon || "item",
+        canonical: best.canonical || null,
+        base_unit: best.base_unit || null,
+      },
+      options,
+    };
+  }
+  
+  /** Format a single line like:
+   *   "Onion Nashik – 7.00 AED / kg"
+   */
+  function formatPriceLine(opt: ProductPriceOption): string {
+    const label = opt.variant
+      ? `${opt.name} ${opt.variant}`.trim()
+      : opt.name;
+  
+    // ✅ allow price even if currency is null
+  if (opt.price != null) {
+    const cur = opt.currency || "";
+    const curPart = cur ? ` ${cur}` : "";
+    return `${label} – ${opt.price}${curPart} / ${opt.unit}`;
+  }
+  
+    // price missing → softer wording
+    return `${label} – price varies, we’ll confirm the exact price.`;
+  }
+
 // ─────────────────────────────
 // Helper: smart reply for price / availability inquiries
 // ─────────────────────────────
 async function buildSmartInquiryReply(opts: {
-  org_id: string;
-  text: string;
-  inquiryType?: string | null;
-}) {
-  const { org_id, text } = opts;
-  const inquiryType = (opts.inquiryType || "").toLowerCase() || null;
-
-  const product = await findBestProductForText(org_id, text);
-  if (!product) {
+    org_id: string;
+    text: string;
+    inquiryType?: string | null;
+  }) {
+    const { org_id, text } = opts;
+    const inquiryType = (opts.inquiryType || "").toLowerCase() || null;
+  
+    // 1) Try to resolve product + variants + prices
+    let optionsResult: ProductOptionsResult | null = null;
+    try {
+      optionsResult = await findProductOptionsForText(org_id, text);
+    } catch (e: any) {
+      console.warn("[WABA][buildSmartInquiryReply options err]", e?.message || e);
+    }
+  
+    // If we couldn't find *any* product at all, fall back to your old behaviour
+    if (!optionsResult) {
+      if (inquiryType === "price") {
+        return "💬 Got your price question. We’ll confirm the exact price shortly.";
+      }
+      if (inquiryType === "availability") {
+        return "💬 Got your availability question. We’ll confirm stock shortly.";
+      }
+      return null;
+    }
+  
+    const { best, options } = optionsResult;
+  
+    // 2) PRICE inquiry
     if (inquiryType === "price") {
-      return "💬 Got your price question. We’ll confirm the exact price shortly.";
+    const priced = options.filter((o) => o.price != null);
+  
+      // 2a) Multiple variants with prices → show menu
+      if (priced.length >= 2) {
+        const lines = priced.map((opt, idx) => {
+          const line = formatPriceLine(opt);
+          const num = idx + 1;
+          return `${num}\uFE0F\u20E3 ${line}`; // 1️⃣, 2️⃣, ...
+        });
+      
+        const title =
+          `We have a few options for ${best.display_name}:\n` +
+          lines.join("\n") +
+          "\n\nTo order, reply with the option number and quantity.\n" ;
+      
+        return title;
+      }
+  
+      // 2b) Single option with price
+if (priced.length === 1) {
+    const line = formatPriceLine(priced[0]);
+    return `💸 ${line}\n\nWould you like to place the order?`;
+  }
+  
+      // 2c) No price data but products exist
+      if (options.length > 0) {
+        // Show variants names, but admit price is changing
+        const variantNames = options.map((o) =>
+          o.variant ? `${o.name} ${o.variant}`.trim() : o.name
+        );
+        const unique = Array.from(new Set(variantNames)).filter(Boolean);
+  
+        if (unique.length >= 2) {
+          return (
+            `We do have ${best.display_name} in multiple options:\n` +
+            unique.map((v, idx) => `${idx + 1}) ${v}`).join("\n") +
+            "\n\n💸 Today’s prices change often — we’ll confirm the exact price now."
+          );
+        }
+  
+        return (
+          `💸 We do have ${best.display_name}. ` +
+          "Today’s price changes often — we’ll confirm it for you now."
+        );
+      }
+  
+      // Last fallback if somehow no options
+      return (
+        `💸 We do have ${best.display_name}. ` +
+        "Today’s price changes often — we’ll confirm it for you now."
+      );
     }
+  
+    // 3) AVAILABILITY inquiry
     if (inquiryType === "availability") {
-      return "💬 Got your availability question. We’ll confirm stock shortly.";
+      // If we have variants, gently mention that:
+      if (options.length >= 2) {
+        const names = Array.from(
+          new Set(
+            options.map((o) =>
+              o.variant ? `${o.name} ${o.variant}`.trim() : o.name
+            )
+          )
+        ).filter(Boolean);
+  
+        if (names.length) {
+          return (
+            "✅ Yes, we have this available. Some options:\n" +
+            names.map((n, i) => `${i + 1}) ${n}`).join("\n")
+          );
+        }
+      }
+  
+      return `✅ Yes, we have ${best.display_name} available.`;
     }
-    return null;
+  
+    // 4) Unknown inquiry type → soft generic reply
+    return "💬 Got your question. We’ll confirm the details shortly.";
   }
 
-  if (inquiryType === "price") {
-    const latest = await getLatestPrice(org_id, product.id);
-    if (latest) {
-      const unit = product.base_unit || "unit";
-      return `💸 ${product.display_name} is currently ${latest.price} ${latest.currency} per ${unit}.`;
+
+
+  // ─────────────────────────────
+// Helper: MENU / RATE CARD / PRICE LIST
+// ─────────────────────────────
+
+function extractMenuKeywords(text: string): string[] {
+    const raw = (text || "").toLowerCase();
+    const cleaned = raw.replace(/[^a-z0-9\s]/gi, " ");
+    const parts = cleaned.split(/\s+/).filter(Boolean);
+  
+    const stopwords = new Set([
+      "hi",
+      "hello",
+      "hey",
+      "please",
+      "pls",
+      "kindly",
+      "what",
+      "whats",
+      "is",
+      "the",
+      "a",
+      "an",
+      "of",
+      "for",
+      "to",
+      "me",
+      "you",
+      "your",
+      "today",
+      "todays",
+      "menu",
+      "list",
+      "price",
+      "prices",
+      "rate",
+      "card",
+      "ratecard",
+      "services",
+      "service",
+      "send",
+      "show",
+      "give",
+      "need",
+      "want",
+      "can",
+      "could",
+      "tell",
+      "my",
+      "our",
+      "this",
+      "that",
+    ]);
+  
+    const kws = parts.filter((w) => !stopwords.has(w) && w.length >= 3);
+    return Array.from(new Set(kws)); // unique
+  }
+  
+  async function buildMenuReply(opts: {
+    org_id: string;
+    text: string;
+    businessType?: BusinessType | null;
+  }): Promise<string | null> {
+    const { org_id, text } = opts;
+    const businessType = opts.businessType || "generic";
+  
+    try {
+      // 1) Fetch all products for this org
+      const { data, error } = await supa
+        .from("products")
+        .select(
+          "id, display_name, canonical, variant, base_unit, price_per_unit"
+        )
+        .eq("org_id", org_id);
+  
+      if (error) {
+        console.warn("[WABA][menu products err]", error.message);
+        return null;
+      }
+  
+      const rows = (data || []) as any[];
+      if (!rows.length) return null;
+  
+      // 2) Try to filter by keywords from the text (veg, hair, fish, etc.)
+      const keywords = extractMenuKeywords(text);
+      let filtered = rows;
+  
+      if (keywords.length) {
+        filtered = rows.filter((row) => {
+          const name = String(
+            row.display_name || row.canonical || ""
+          ).toLowerCase();
+          const variant = String(row.variant || "").toLowerCase();
+  
+          return keywords.some(
+            (kw) => name.includes(kw) || variant.includes(kw)
+          );
+        });
+  
+        // If filter killed everything, fall back to full list
+        if (!filtered.length) {
+          filtered = rows;
+        }
+      }
+  
+      if (!filtered.length) return null;
+  
+      // 3) Build ProductPriceOption[] with latest prices
+      const options: ProductPriceOption[] = [];
+      const MAX_ITEMS = 15;
+  
+      for (const row of filtered.slice(0, MAX_ITEMS)) {
+        const id = row.id;
+        if (!id) continue;
+  
+        const latest = await getLatestPrice(org_id, id).catch((e: any) => {
+          console.warn("[WABA][menu latestPrice err]", e?.message || e);
+          return null;
+        });
+  
+        const price =
+          latest && typeof latest.price === "number"
+            ? latest.price
+            : typeof row.price_per_unit === "number"
+            ? row.price_per_unit
+            : null;
+  
+        const currency = latest ? latest.currency : null;
+  
+        options.push({
+          productId: id,
+          name:
+            row.display_name ||
+            row.canonical ||
+            "item",
+          variant: row.variant ? String(row.variant).trim() || null : null,
+          unit: row.base_unit || "unit",
+          price,
+          currency,
+        });
+      }
+  
+      if (!options.length) return null;
+  
+      // 4) Choose header based on business type + whether it was filtered
+      const isFiltered = keywords.length > 0;
+      let header: string;
+  
+      if (businessType === "restaurant" || businessType === "cloud_kitchen") {
+        header = isFiltered
+          ? "📋 Here’s the menu you asked for:\n"
+          : "📋 Here’s today’s main menu:\n";
+      } else if (businessType === "salon") {
+        header = isFiltered
+          ? "📋 Here are the services you asked for:\n"
+          : "📋 Here’s our main services menu:\n";
+      } else {
+        header = isFiltered
+          ? "📋 Here are the items you asked for:\n"
+          : "📋 Here’s our main list:\n";
+      }
+  
+      const lines = options.map((opt, idx) => {
+        const num = idx + 1;
+        const line = formatPriceLine(opt); // e.g. "Onion Nashik – 7 AED / kg"
+        return `${num}) ${line}`;
+      });
+  
+      const footer =
+        "\nIf you’d like to order, please reply with the item names and quantities.";
+  
+      // Extra hint if it was a generic menu (no filter)
+      const filterHint = !isFiltered
+        ? "\n\nYou can also ask for a specific list, for example “veg menu”, “hair services menu”, or “fruits price list”."
+        : "";
+  
+      return header + lines.join("\n") + "\n" + footer + filterHint;
+    } catch (e: any) {
+      console.warn("[WABA][buildMenuReply err]", e?.message || e);
+      return null;
     }
-    return `💸 We do have ${product.display_name}. Today’s price changes often — we’ll confirm it for you now.`;
   }
-
-  if (inquiryType === "availability") {
-    return `✅ Yes, we have ${product.display_name} available.`;
-  }
-
-  return null;
-}
 
 // ─────────────────────────────
 // Clarify + Address + Memory helpers
@@ -245,31 +831,50 @@ async function getCustomerLastVariant(
 // 🔹 check if we already captured address for this customer (any order)
 // Once address_done exists for a phone, we never ask again.
 async function hasAddressForOrder(
-  org_id: string,
-  from_phone: string,
-  _order_id: string // not used anymore
-): Promise<boolean> {
-  try {
-    const phoneKey = normalizePhoneForKey(from_phone);
-
-    const { data, error } = await supa
-      .from("order_clarify_sessions")
-      .select("id")
-      .eq("org_id", org_id)
-      .eq("customer_phone", phoneKey)
-      .eq("status", "address_done")
-      .limit(1);
-
-    if (error) {
-      console.warn("[WABA][hasAddress err]", error.message);
+    org_id: string,
+    from_phone: string,
+    order_id: string
+  ): Promise<boolean> {
+    // 1) Prefer checking the order itself
+    try {
+      const { data: orderRow, error: orderErr } = await supa
+        .from("orders")
+        .select("shipping_address")
+        .eq("id", order_id)
+        .single();
+  
+      if (!orderErr && orderRow) {
+        const addr = (orderRow as any).shipping_address;
+        if (addr && String(addr).trim().length > 0) {
+          return true;
+        }
+      }
+    } catch (e: any) {
+      console.warn("[WABA][hasAddress order check err]", e?.message || e);
+    }
+  
+    // 2) Fallback: legacy session-based check
+    try {
+      const phoneKey = normalizePhoneForKey(from_phone);
+  
+      const { data, error } = await supa
+        .from("order_clarify_sessions")
+        .select("id")
+        .eq("org_id", org_id)
+        .eq("customer_phone", phoneKey)
+        .eq("status", "address_done")
+        .limit(1);
+  
+      if (error) {
+        console.warn("[WABA][hasAddress err]", error.message);
+        return false;
+      }
+      return !!(data && data.length);
+    } catch (e: any) {
+      console.warn("[WABA][hasAddress catch]", e?.message || e);
       return false;
     }
-    return !!(data && data.length);
-  } catch (e: any) {
-    console.warn("[WABA][hasAddress catch]", e?.message || e);
-    return false;
   }
-}
 
 // Active open order per customer (for reference / edit decisions)
 async function findActiveOrderForPhone(
@@ -532,12 +1137,13 @@ async function startAddressSessionForOrder(opts: {
 // Handle a message while clarify/address session is open
 // Returns true if the message was consumed by this handler.
 async function maybeHandleClarifyReply(opts: {
-  org_id: string;
-  phoneNumberId: string;
-  from: string;
-  text: string;
-}): Promise<boolean> {
-  const { org_id, phoneNumberId, from, text } = opts;
+    org_id: string;
+    phoneNumberId: string;
+    from: string;
+    text: string;
+    needsAddress?: boolean;
+  }): Promise<boolean> {
+    const { org_id, phoneNumberId, from, text, needsAddress = true } = opts;
   const phoneKey = normalizePhoneForKey(from);
   const lower = text.toLowerCase().trim();
 
@@ -603,17 +1209,27 @@ async function maybeHandleClarifyReply(opts: {
       customer: from,
       address: text,
     });
-
+  
+    // 1) Mark session as address_done
     await supa
       .from("order_clarify_sessions")
       .update({ status: "address_done", updated_at: new Date().toISOString() })
       .eq("id", session.id);
-
-    // 🔹 Mark that we JUST finished an address flow
-    //    → next order-like message should be treated as "add to same order"
+  
+    // 2) Persist address on the order itself
+    try {
+      await supa
+        .from("orders")
+        .update({ shipping_address: text })
+        .eq("id", session.order_id);
+    } catch (e: any) {
+      console.warn("[WABA][address save err]", e?.message || e);
+    }
+  
+    // 3) Mark that we JUST finished an address flow
     lastCommandByPhone.set(from, "address_done");
-
-    // v1: just acknowledge; optionally later we can persist address on order
+  
+    // 4) Acknowledge to customer
     await sendWabaText({
       phoneNumberId,
       to: from,
@@ -622,7 +1238,7 @@ async function maybeHandleClarifyReply(opts: {
         "If you’d like to add more items, just send them here.",
       orgId: org_id,
     });
-
+  
     return true;
   }
 
@@ -775,45 +1391,58 @@ async function maybeHandleClarifyReply(opts: {
       .from("order_clarify_sessions")
       .update({ status: "closed", updated_at: new Date().toISOString() })
       .eq("id", session.id);
-
-    // Check if customer already provided address (any previous address_done)
-    const alreadyHasAddress = await hasAddressForOrder(org_id, from, order.id);
-
+  
     const summary = formatOrderSummary(items);
-
-    if (alreadyHasAddress) {
-      // Customer has given address before → DO NOT ask again
-      const finalText = "✅ Updated order:\n" + summary;
-
+  
+    // Should this org ask for address at all?
+    if (!needsAddress) {
+      const finalText = "✅ Order confirmed:\n" + summary;
+  
       await sendWabaText({
         phoneNumberId,
         to: from,
         text: finalText,
         orgId: org_id,
       });
-
+  
       return true;
     }
-
+  
+    // Check if customer already provided address (any previous address_done)
+    const alreadyHasAddress = await hasAddressForOrder(org_id, from, order.id);
+  
+    if (alreadyHasAddress) {
+      const finalText = "✅ Updated order:\n" + summary;
+  
+      await sendWabaText({
+        phoneNumberId,
+        to: from,
+        text: finalText,
+        orgId: org_id,
+      });
+  
+      return true;
+    }
+  
     // If no address yet → open address session ONCE
     await startAddressSessionForOrder({
       org_id,
       order_id: order.id,
       from_phone: from,
     });
-
+  
     const finalText =
       "✅ Order confirmed:\n" +
       summary +
       "\n\n📍 Please share your delivery address (or send location) if you haven’t already.";
-
+  
     await sendWabaText({
       phoneNumberId,
       to: from,
       text: finalText,
       orgId: org_id,
     });
-
+  
     return true;
   }
 
@@ -985,10 +1614,12 @@ waba.post("/", async (req, res) => {
 
         // Find org by WABA phone_number_id
         const { data: orgs, error: orgErr } = await supa
-          .from("orgs")
-          .select("id, name, ingest_mode, auto_reply_enabled")
-          .eq("wa_phone_number_id", phoneNumberId)
-          .limit(1);
+  .from("orgs")
+  .select(
+    "id, name, ingest_mode, auto_reply_enabled, primary_business_type, supports_delivery"
+  )
+  .eq("wa_phone_number_id", phoneNumberId)
+  .limit(1);
 
         if (orgErr) {
           console.warn("[WABA] org lookup error", orgErr.message);
@@ -1016,6 +1647,15 @@ waba.post("/", async (req, res) => {
           const msgId = msg.id as string;
           const ts = Number(msg.timestamp || Date.now()) * 1000;
 
+          if (!text) continue;
+
+          await logInboundMessageToInbox({
+            orgId: org.id,
+            from,
+            text,
+            msgId,
+          });
+
           // 🔹 Check per-customer auto-reply *before* going into AI
           const autoReplyForCustomer = await isAutoReplyEnabledForCustomer({
             orgId: org.id,
@@ -1024,15 +1664,7 @@ waba.post("/", async (req, res) => {
           });
 
           if (!autoReplyForCustomer) {
-            // Auto-reply OFF for this customer:
-            // - Do NOT send to AI
-            // - Just log to inbox and let human chat
-            await logInboundMessageToInbox({
-              orgId: org.id,
-              from,
-              text,
-              msgId,
-            });
+           
 
             await logFlowEvent({
               orgId: org.id,
@@ -1049,23 +1681,20 @@ waba.post("/", async (req, res) => {
 
           const lowerText = text.toLowerCase().trim();
 
-          console.log("---------- WABA DEBUG START ----------");
-          console.log("TEXT:", text);
-          console.log("FROM:", from);
-          console.log(
-            "HAS ACTIVE ORDER:",
-            Boolean(await findActiveOrderForPhone(org.id, from))
-          );
-          console.log("IS EDIT-LIKE:", isLikelyEditRequest(text));
-          console.log("LOOKS LIKE ADD:", looksLikeAddToExisting(text));
-          console.log("---------- WABA DEBUG END ----------");
+// 🔹 Compute active order ONCE per message
+const activeOrder = await findActiveOrderForPhone(org.id, from);
+const activeOrderId = activeOrder?.id || null;
 
-          console.log("[WABA][IN]", {
-            org_id: org.id,
-            from,
-            msgId,
-            text,
-          });
+wabaDebug("ROUTER HIT", req.method, req.path);
+wabaDebug("RAW BODY", JSON.stringify(req.body));
+
+wabaDebug("MSG DEBUG", {
+    text,
+    from,
+    hasActiveOrder: Boolean(activeOrder),
+    isEditLike: isLikelyEditRequest(text),
+    looksLikeAdd: looksLikeAddToExisting(text),
+  });
 
           // 0.15) If we are waiting for the user to choose WHICH order to cancel
           const lastCmd = lastCommandByPhone.get(from);
@@ -1151,16 +1780,24 @@ waba.post("/", async (req, res) => {
             }
           }
 
+          const needsAddressForOrg = orgNeedsDeliveryAddress(org);
+
           // 0) If we’re in clarify/address session → consume here and SKIP ingestCore
           const handledByClarify = await maybeHandleClarifyReply({
             org_id: org.id,
             phoneNumberId,
             from,
             text,
+            needsAddress: needsAddressForOrg,
           });
 
+
+          if (handledByClarify) {
+            continue;
+          }
+
           // 0.15) Commands menu: help / menu / commands / options
-          if (/^(help|menu|commands|options)$/i.test(lowerText)) {
+          if (/^(help|commands|options)$/i.test(lowerText)) {
             await sendWabaText({
               phoneNumberId,
               to: from,
@@ -1185,9 +1822,7 @@ waba.post("/", async (req, res) => {
             continue;
           }
 
-          if (handledByClarify) {
-            continue;
-          }
+          
 
           // 0.1) "order summary" → show ALL active (pending/paid) orders
           if (
@@ -1503,10 +2138,7 @@ waba.post("/", async (req, res) => {
           }
 
           // 0.8) Edit-like messages while an order is open → safe fallback (no auto edit in V1)
-          const activeOrderForEdit = await findActiveOrderForPhone(
-            org.id,
-            from
-          );
+          const activeOrderForEdit = activeOrder;
           if (activeOrderForEdit && isLikelyEditRequest(text)) {
             await logFlowEvent({
               orgId: org.id,
@@ -1530,15 +2162,18 @@ waba.post("/", async (req, res) => {
           }
 
           // 1) Normal path: parse + store
-          const result: any = await ingestCoreFromMessage({
-            org_id: org.id,
-            text,
-            ts,
-            from_phone: from,
-            from_name: null,
-            msg_id: msgId,
-            source: "waba",
-          });
+const result: any = await ingestCoreFromMessage({
+    org_id: org.id,
+    text,
+    ts,
+    from_phone: from,
+    from_name: null,
+    msg_id: msgId,
+    source: "waba",
+  
+    // 🔹 NEW: tell core which order is currently active (if any)
+    active_order_id: activeOrderId || undefined,
+  });
 
           console.log("[WABA][INGEST-RESULT]", {
             org_id: org.id,
@@ -1568,25 +2203,77 @@ waba.post("/", async (req, res) => {
             },
           });
 
+
+
+                    // ─────────────────────────────
+          // MENU HEURISTIC: convert to inquiry:menu when appropriate
+          // ─────────────────────────────
+          const menuRegex =
+            /\b(menu|price list|pricelist|rate card|ratecard|services list|service menu)\b/i;
+
+          const looksLikeMenu = menuRegex.test(lowerText);
+
+          if (looksLikeMenu && result.kind !== "order") {
+            result.kind = "inquiry";
+            if (!result.inquiry && !result.inquiry_type) {
+              (result as any).inquiry_type = "menu";
+            }
+          }
+
+           // ─────────────────────────────
+          // NEW: snapshot last inquiry for Inbox center card
+          // ─────────────────────────────
+          try {
+            if (result && result.kind === "inquiry") {
+              const phoneKey = normalizePhoneForKey(from);
+
+              // Normalize inquiry type ("availability", "price", "menu", etc.)
+              const inquiryRaw = result.inquiry || result.inquiry_type || null;
+              const inquiryType = inquiryRaw
+                ? String(inquiryRaw).toLowerCase()
+                : null;
+
+              // Try to guess a canonical name for the product being asked about
+              let canonical: string | null = null;
+
+              if (typeof (result as any).inquiry_canonical === "string") {
+                canonical = (result as any).inquiry_canonical;
+              } else if (typeof (result as any).canonical === "string") {
+                canonical = (result as any).canonical;
+              } else if (typeof result.reason === "string") {
+                // e.g. "inq:availability:paneer biryani"
+                const m = result.reason.match(/^inq:[^:]+:(.+)$/i);
+                if (m && m[1]) {
+                  canonical = m[1];
+                }
+              }
+
+              await supa
+                .from("org_customer_settings")
+                .upsert(
+                  {
+                    org_id: org.id,
+                    customer_phone: phoneKey,
+                    last_inquiry_text: text,                     // "Do you have panner biriyani"
+                    last_inquiry_kind: inquiryType,              // "availability" / "price" / "menu" / ...
+                    last_inquiry_canonical: canonical,           // "paneer biryani" (best effort)
+                    last_inquiry_at: new Date().toISOString(),
+                    last_inquiry_status: "unresolved",
+                  },
+                  { onConflict: "org_id,customer_phone" }
+                );
+            }
+          } catch (e: any) {
+            console.warn(
+              "[WABA][inquiry snapshot upsert err]",
+              e?.message || e
+            );
+          }
+
+
           //   if (!org.auto_reply_enabled) continue;
 
-          // NEW: org-level + per-customer auto-reply gate
-          const autoReplyAllowed = await isAutoReplyEnabledForCustomer({
-            orgId: org.id,
-            phoneRaw: from,
-            orgAutoReplyEnabled: !!org.auto_reply_enabled,
-          });
-
-          console.log("[WABA][AUTO-REPLY-GATE]", {
-            org_id: org.id,
-            from,
-            autoReplyAllowed,
-          });
-
-          if (!autoReplyAllowed) {
-            // Parsing + storing is already done above; we just skip auto-reply.
-            continue;
-          }
+         
 
           let reply: string | null = null;
 
@@ -1664,56 +2351,87 @@ waba.post("/", async (req, res) => {
           if (result.kind === "order" && result.stored && result.order_id) {
             lastCommandByPhone.delete(from);
             const items = (result.items || []) as any[];
-
-            const alreadyHasAddress = await hasAddressForOrder(
-              org.id,
-              from,
-              result.order_id
-            );
-
+          
+            const needsAddress = needsAddressForOrg;
+          
             const clarifyStart = await startClarifyForOrder({
               org_id: org.id,
               order_id: result.order_id,
               from_phone: from,
             });
-
+          
             if (clarifyStart) {
               reply = clarifyStart;
             } else {
               const summary = formatOrderSummary(items);
-
-              if (alreadyHasAddress) {
-                // customer already shared address → never ask again
-                reply = "✅ Updated order:\n" + summary;
+          
+              // If this org does NOT need address → simple confirmation, no address flow
+              if (!needsAddress) {
+                reply = "✅ We’ve got your order:\n" + summary;
               } else {
-                // ask address only if never given
-                await startAddressSessionForOrder({
-                  org_id: org.id,
-                  order_id: result.order_id,
-                  from_phone: from,
-                });
-
-                reply =
-                  "✅ We’ve got your order:\n" +
-                  summary +
-                  "\n\n📍 Please share your delivery address (or send location) if you haven’t already.";
+                const alreadyHasAddress = await hasAddressForOrder(
+                  org.id,
+                  from,
+                  result.order_id
+                );
+          
+                if (alreadyHasAddress) {
+                  reply = "✅ Updated order:\n" + summary;
+                } else {
+                  await startAddressSessionForOrder({
+                    org_id: org.id,
+                    order_id: result.order_id,
+                    from_phone: from,
+                  });
+          
+                  reply =
+                    "✅ We’ve got your order:\n" +
+                    summary +
+                    "\n\n📍 Please share your delivery address (or send location) if you haven’t already.";
+                }
               }
             }
           }
 
           // 3) Inquiry path → smart price/availability
-          if (!reply && result.kind === "inquiry") {
-            const inquiryType = result.inquiry || result.inquiry_type || null;
-            reply = await buildSmartInquiryReply({
-              org_id: org.id,
-              text,
-              inquiryType,
-            });
-            if (!reply) {
-              reply =
-                "💬 Got your question. We’ll confirm the details shortly.";
-            }
-          }
+                    // 3) Inquiry path → MENU or smart price/availability
+                    if (!reply && result.kind === "inquiry") {
+                        const inquiryRaw = result.inquiry || result.inquiry_type || null;
+                        const inquiryType = inquiryRaw
+                          ? String(inquiryRaw).toLowerCase()
+                          : null;
+            
+                        const menuRegex =
+                          /\b(menu|price list|pricelist|rate card|ratecard|services list|service menu)\b/i;
+                        const looksLikeMenu = menuRegex.test(lowerText);
+            
+                        // 3a) MENU / RATE CARD / PRICE LIST
+                        if (inquiryType === "menu" || looksLikeMenu) {
+                          const menuText = await buildMenuReply({
+                            org_id: org.id,
+                            text,
+                            businessType: normalizeBusinessType(
+                              org.primary_business_type
+                            ),
+                          });
+            
+                          reply =
+                            menuText ||
+                            "📋 Our menu / price list changes often. We’ll share the latest options with you shortly.";
+                        } else {
+                          // 3b) Normal smart inquiry (price / availability / etc.)
+                          reply = await buildSmartInquiryReply({
+                            org_id: org.id,
+                            text,
+                            inquiryType,
+                          });
+            
+                          if (!reply) {
+                            reply =
+                              "💬 Got your question. We’ll confirm the details shortly.";
+                          }
+                        }
+                      }
 
           // 4) Heuristic question fallback
           if (
@@ -1732,11 +2450,52 @@ waba.post("/", async (req, res) => {
             reply = null;
           }
 
-          // 6) Final fail-soft ack (polite default)
-          if (!reply) {
-            reply =
-              "✅ Thanks! We’ve got your order. We’ll follow up if we need any clarification.";
-          }
+// 6) Final fail-soft ack (safe + generic + commands)
+if (!reply) {
+    const phoneKey = normalizePhoneForKey(from);
+    const alreadySawTip = commandsTipShown.has(phoneKey);
+  
+    if (result.kind === "order") {
+      // Only when parser really saw an order
+      reply =
+        "✅ We’ve received your order. We’ll follow up if anything needs clarification.";
+    } else if (result.reason === "dropped:greeting_ack") {
+      // short messages like "hi", "ok", "thanks"
+      if (activeOrderId) {
+        // 🔇 After an order is already active: don't spam another intro
+        console.log(
+          "[WABA][AUTO-REPLY] greeting_ack with active order → no reply"
+        );
+        reply = null; // no WhatsApp message
+      } else {
+        // First-time greeting (no active order) → behave like intro
+        if (!alreadySawTip) {
+          commandsTipShown.add(phoneKey);
+          reply =
+            "Hi 👋 How can I help you today?\n\n" +
+            "• To place an order, just type what you want in one message.\n" +
+            "• To see your orders, type: order summary\n" +
+            "• To talk to a human, type: agent\n" +
+            "• To cancel your last order, type: cancel";
+        } else {
+          reply = "Hi 👋 How can I help you today?";
+        }
+      }
+    } else {
+      // Other non-order, non-greeting messages → keep old generic behaviour
+      if (!alreadySawTip) {
+        commandsTipShown.add(phoneKey);
+        reply =
+          "Hi 👋 How can I help you today?\n\n" +
+          "• To place an order, just type what you want in one message.\n" +
+          "• To see your orders, type: order summary\n" +
+          "• To talk to a human, type: agent\n" +
+          "• To cancel your last order, type: cancel";
+      } else {
+        reply = "Hi 👋 How can I help you today?";
+      }
+    }
+  }
 
           if (reply) {
             await sendWabaText({

@@ -103,6 +103,43 @@ webhook.post('/whatsapp', async (req, res) => {
     console.log('[WH] from=', msg.from, 'type=', msg.type, 'hasText=', !!msg.text?.body);
     const from = msg.from; // customer phone
     const type = msg.type; // 'text' | 'audio' | 'voice' | etc.
+
+        // 🔹 Normalize phone exactly like Dashboard / /api/inbox/auto_reply
+        const phoneKey = String(from || '').replace(/[^\d]/g, '');
+
+        // 🔹 Check per-customer + org-level auto-reply flags
+        // 1) Try customer-specific org_customer_settings
+        const { data: custSettings, error: custErr } = await supaQuery
+          .from('org_customer_settings')
+          .select('auto_reply_enabled')
+          .eq('org_id', org.id)
+          .eq('phone_key', phoneKey)
+          .maybeSingle();
+    
+        let allowAutoReply: boolean;
+    
+        if (!custErr && custSettings) {
+          // per-customer setting exists
+          allowAutoReply = !!custSettings.auto_reply_enabled;
+        } else {
+          // 2) Fallback to org-level default (orgs.auto_reply_enabled)
+          const { data: orgRow, error: orgErr2 } = await supaQuery
+            .from('orgs')
+            .select('auto_reply_enabled')
+            .eq('id', org.id)
+            .maybeSingle();
+    
+          if (orgErr2) throw orgErr2;
+          // default ON if not set
+          allowAutoReply = orgRow?.auto_reply_enabled ?? true;
+        }
+    
+        // 🔹 If auto-reply is OFF for this customer/org:
+        //     → DO NOT parse into orders, just acknowledge to WhatsApp.
+        if (!allowAutoReply) {
+          console.log('[WH] auto-reply disabled, skipping parse for', phoneKey);
+          return res.sendStatus(200);
+        }
     
 
     if (msg.text?.body) {                        // ✅ key change

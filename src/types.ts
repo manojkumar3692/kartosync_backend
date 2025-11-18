@@ -21,6 +21,8 @@ export type Order = {
   created_at: string;
 };
 
+export type InquiryKind = "price" | "availability";
+
 // ─────────────────────────────────────────────
 // Ingest types (backend shared)
 // ─────────────────────────────────────────────
@@ -52,8 +54,13 @@ type IngestCommon = {
   org_id?: string;
   order_id?: string;
 
+  // Generic inquiry fields (string-level)
   inquiry?: string;
   inquiry_type?: string;
+  inquiry_canonical?: string;  // ✅ add this
+
+  // Backend can send a reply such as price, availability, etc.
+  reply?: string;
 };
 
 type IngestError = IngestCommon & {
@@ -73,12 +80,21 @@ type IngestOrder = IngestCommon & {
   edited_order_id?: string;
 };
 
-type IngestInquiry = IngestCommon & {
+export type IngestInquiry = IngestCommon & {
   ok: true;
   kind: "inquiry";
   used: "inquiry";
-  stored: boolean; // true when inserted, false on dedupe
+  stored: boolean;
   order_id?: string;
+
+  // Already used by UI / callers
+  reply?: string;
+  reason?: string;
+
+  // 🔥 NEW: what waba.ts needs (narrowed to InquiryKind)
+  inquiry?: InquiryKind;          // "availability" | "price" | etc.
+  inquiry_type?: InquiryKind;     // same, for backwards-compat
+  inquiry_canonical?: string;     // e.g. "Chicken Biryani Today"
 };
 
 type IngestNone = IngestCommon & {
@@ -102,4 +118,6 @@ export type IngestInput = {
   msg_id?: string | null;
   edited_at?: number | null;
   source?: IngestSource;
+  // NEW:
+  active_order_id?: string | null;
 };
