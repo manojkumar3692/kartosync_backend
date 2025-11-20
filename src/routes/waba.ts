@@ -4,7 +4,6 @@ import axios from "axios";
 import { supa } from "../db";
 import { ingestCoreFromMessage } from "./ingestCore";
 import { getLatestPrice } from "../util/products";
-import { findBestProductForTextV2 } from "../util/productMatcher";
 import { classifyMessage } from "../ai/nlu";
 import {
   getToneFromOrg,
@@ -17,16 +16,52 @@ import {
   clearConversationStage,
   type ConversationStage,
 } from "../util/conversationState";
-import { BusinessType, normalizeBusinessType, orgNeedsDeliveryAddress } from "../routes/waba/business";
+import {
+  normalizeBusinessType,
+  orgNeedsDeliveryAddress,
+} from "../routes/waba/business";
+import {
+  normalizeProductText,
+  extractCatalogUnmatched,
+  extractCatalogUnmatchedOnly,
+  findProductOptionsForText,
+  formatPriceLine,
+  prettyLabelFromText,
+  extractMenuKeywords,
+  buildMenuReply,
+} from "../routes/waba/productInquiry";
+
+import {
+  startAddressSessionForOrder,
+  formatOrderSummary,
+  itemsToOrderText,
+  normalizePhoneForKey,
+  UserCommand,
+  hasAddressForOrder,
+  findAmbiguousItemsForOrder,
+  buildClarifyQuestionText,
+  lastCommandByPhone,
+  maybeHandleClarifyReply,
+  learnAliasFromInquiry,
+  isAutoReplyEnabledForCustomer,
+  looksLikeAddToExisting,
+  findActiveOrderForPhone,
+  findActiveOrderForPhoneExcluding,
+  logInboundMessageToInbox,
+  findAllActiveOrdersForPhone,
+} from "../routes/waba/clarifyAddress";
+
 export const waba = express.Router();
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || "";
 const META_WA_BASE = "https://graph.facebook.com/v21.0";
 waba.all("/ping", (_req, res) => res.json({ ok: true, where: "waba" }));
 // Simple hit logger so you can confirm mount path
 waba.use((req, _res, next) => {
-  console.log("[WABA][ROUTER HIT]", req.method, req.path);
+  wabaDebug("[WABA][ROUTER HIT]", req.method, req.path);
   next();
 });
+
+console.log("VERSION 12AAAA --------");
 
 // ─────────────────────────────
 // 1) Webhook verification (GET)
@@ -51,85 +86,11 @@ waba.get("/", (req, res) => {
 });
 
 const WABA_DEBUG = process.env.WABA_DEBUG === "1";
+
 function wabaDebug(...args: any[]) {
   if (!WABA_DEBUG) return;
   console.log("[WABA-DEBUG]", ...args);
 }
-
-// ─────────────────────────────
-// Spelling / synonym normalizer for product text (Layer 7)
-// ─────────────────────────────
-const PRODUCT_NORMALIZE_MAP: Record<string, string> = {
-  // Biryani spellings
-  biriyani: "biryani",
-  briyani: "biryani",
-  biryani: "biryani", // idempotent
-  biriyaniy: "biryani",
-  // Paneer spellings
-  panner: "paneer",
-  paner: "paneer",
-  paneer: "paneer", // idempotent
-  panir: "paneer",
-  // Common Indian words
-  chiken: "chicken",
-  chikn: "chicken",
-  // Pharmacy
-  paracetmol: "paracetamol",
-  paracetemol: "paracetamol",
-  dolo: "paracetamol 650", // helps “dolo” map to that product if you name it that
-  crocin: "paracetamol", // optional
-  // Units & forms (helps keywords)
-  ltr: "liter",
-  ltrs: "liter",
-  litre: "liter",
-  litres: "liter",
-  kg: "kg",
-  gms: "gram",
-  g: "gram",
-  ml: "ml",
-  mls: "ml",
-  // Misc
-  curd: "yogurt",
-};
-
-function normalizeProductText(raw: string): string {
-  if (!raw) return "";
-  // lower-case + basic cleanup
-  let txt = raw.toLowerCase();
-  // remove weird punctuation, keep letters/numbers/spaces
-  txt = txt.replace(/[^a-z0-9\s]/gi, " ");
-  const words = txt
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((w) => PRODUCT_NORMALIZE_MAP[w] || w);
-  return words.join(" ");
-}
-// ─────────────────────────────
-// Helper: extract catalog_unmatched items from parse_reason
-// ─────────────────────────────
-function extractCatalogUnmatched(reason?: string | null): string[] {
-  if (!reason) return [];
-  const r = String(reason);
-  // Look for "catalog_unmatched:..." up to the next ';'
-  const m = /catalog_unmatched:([^;]+)/.exec(r);
-  if (!m || !m[1]) return [];
-  return m[1]
-    .split("|")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-// Helper: detect the "only unmatched" case (no valid items at all)
-function extractCatalogUnmatchedOnly(reason?: string | null): string[] {
-  if (!reason) return [];
-  const r = String(reason);
-  const m = /catalog_unmatched_only:([^;]+)/.exec(r);
-  if (!m || !m[1]) return [];
-  return m[1]
-    .split("|")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
 // ─────────────────────────────
 // Helper: product options + prices for a text
 // ─────────────────────────────
@@ -150,245 +111,11 @@ type ProductOptionsResult = {
   };
   options: ProductPriceOption[];
 };
-/**
- * Given a free-text like "price of onion",
- *  1) find the best matching product,
- *  2) then fetch all variants of that canonical for this org,
- *  3) attach latest price for each.
- *
- * If anything fails, we fall back gracefully.
- */
-async function findProductOptionsForText(
-  org_id: string,
-  text: string
-): Promise<ProductOptionsResult | null> {
-  // 1) Try your existing fuzzy matcher first
-  let best: any = await findBestProductForTextV2(org_id, text);
-  // ─────────────────────────────────────────────
-  // 1b) GENERIC FALLBACK: token-based search
-  //     (for spelling differences like biriyani vs biryani,
-  //      works for any vertical: grocery, salon, pharmacy, etc.)
-  // ─────────────────────────────────────────────
-  if (!best || !best.id) {
-    try {
-      // 🔹 Layer 7: normalised version for product matching
-      const raw = normalizeProductText(text || "");
-      const words = raw.split(/\s+/).filter(Boolean);
-      const stopwords = new Set([
-        "hi",
-        "hello",
-        "hey",
-        "what",
-        "whats",
-        "is",
-        "the",
-        "a",
-        "an",
-        "of",
-        "for",
-        "to",
-        "do",
-        "you",
-        "have",
-        "any",
-        "today",
-        "please",
-        "pls",
-        "kindly",
-        "how",
-        "much",
-        "price",
-        "rate",
-        "cost",
-        "available",
-        "availability",
-        "stock",
-        "there",
-      ]);
-      const keywords = words.filter((w) => !stopwords.has(w) && w.length >= 3);
-      if (!keywords.length) {
-        // nothing meaningful left → give up, keep old behaviour
-        return null;
-      }
-      // Fetch candidate products for this org (generic, all business types)
-      const { data, error } = await supa
-        .from("products")
-        .select("id, canonical, display_name, base_unit")
-        .eq("org_id", org_id);
 
-      if (error || !data || !data.length) {
-        return null;
-      }
-      // Very simple token-overlap scoring (generic across domains)
-      let bestRow: any | null = null;
-      let bestScore = 0;
-      for (const row of data) {
-        const name = String(
-          row.display_name || row.canonical || ""
-        ).toLowerCase();
-        const nameTokens = name.split(/\s+/).filter(Boolean);
-        if (!nameTokens.length) continue;
-        const overlap = nameTokens.filter((t) => keywords.includes(t));
-        let score = overlap.length;
-        // Slight bonus if the product name contains the raw keyword string
-        const joined = keywords.join(" ");
-        if (joined && name.includes(joined)) {
-          score += 0.5;
-        }
-        if (score > bestScore) {
-          bestScore = score;
-          bestRow = row;
-        }
-      }
-      // Require at least some overlap to avoid random matches
-      if (!bestRow || bestScore <= 0) {
-        return null; // fall back to your existing generic text
-      }
-
-      // Map fallback row to the "best" shape your code expects
-      best = {
-        id: bestRow.id,
-        display_name: bestRow.display_name || bestRow.canonical || "item",
-        canonical: bestRow.canonical || null,
-        base_unit: bestRow.base_unit || null,
-      };
-    } catch (e: any) {
-      console.warn("[WABA][fallback product search err]", e?.message || e);
-      return null;
-    }
-  }
-  const canon = (best.canonical || best.display_name || "").toString().trim();
-  if (!canon) {
-    // we still return best, but no extra options
-    return {
-      best: {
-        id: best.id,
-        display_name: best.display_name || canon || "item",
-        canonical: best.canonical || null,
-        base_unit: best.base_unit || null,
-      },
-      options: [],
-    };
-  }
-
-  // 2) Fetch all products with same canonical in this org
-  const { data, error } = await supa
-    .from("products")
-    .select("id, canonical, variant, base_unit, display_name, price_per_unit")
-    .eq("org_id", org_id)
-    .ilike("canonical", canon);
-
-  if (error) {
-    console.warn("[WABA][productOptions err]", error.message);
-    // fall back to just 'best' product
-    return {
-      best: {
-        id: best.id,
-        display_name: best.display_name || canon || "item",
-        canonical: best.canonical || null,
-        base_unit: best.base_unit || null,
-      },
-      options: [],
-    };
-  }
-
-  const rows = (data || []) as any[];
-
-  // If nothing else is configured, still return best as an option
-  if (!rows.length) {
-    return {
-      best: {
-        id: best.id,
-        display_name: best.display_name || canon || "item",
-        canonical: best.canonical || null,
-        base_unit: best.base_unit || null,
-      },
-      options: [],
-    };
-  }
-
-  const options: ProductPriceOption[] = [];
-
-  for (const row of rows) {
-    const id = row.id;
-    if (!id) continue;
-
-    const latest = await getLatestPrice(org_id, id).catch((e: any) => {
-      console.warn("[WABA][latestPrice err]", e?.message || e);
-      return null;
-    });
-
-    // ✅ NEW: fall back to price_per_unit when there is no latest price
-    const price =
-      latest && typeof latest.price === "number"
-        ? latest.price
-        : typeof row.price_per_unit === "number"
-        ? row.price_per_unit
-        : null;
-
-    const currency = latest ? latest.currency : null;
-
-    options.push({
-      productId: id,
-      name:
-        row.display_name ||
-        row.canonical ||
-        best.display_name ||
-        canon ||
-        "item",
-      variant: row.variant ? String(row.variant).trim() || null : null,
-      unit: row.base_unit || best.base_unit || "unit",
-      price, // ✅ now includes static price_per_unit fallback
-      currency, // may be null
-    });
-  }
-
-  return {
-    best: {
-      id: best.id,
-      display_name: best.display_name || canon || "item",
-      canonical: best.canonical || null,
-      base_unit: best.base_unit || null,
-    },
-    options,
-  };
-}
-/** Format a single line like:
- *   "Onion Nashik – 7.00 AED / kg"
- */
-function formatPriceLine(opt: ProductPriceOption): string {
-  const label = opt.variant ? `${opt.name} ${opt.variant}`.trim() : opt.name;
-
-  // ✅ allow price even if currency is null
-  if (opt.price != null) {
-    const cur = opt.currency || "";
-    const curPart = cur ? ` ${cur}` : "";
-    return `${label} – ${opt.price}${curPart} / ${opt.unit}`;
-  }
-
-  // price missing → softer wording
-  return `${label} – price varies, we’ll confirm the exact price.`;
-}
-
-function prettyLabelFromText(text: string): string {
-  const trimmed = (text || "").trim();
-  if (!trimmed) return "this item";
-
-  // Try to grab text after "have"
-  const m = trimmed.match(/have\s+(.+)$/i);
-  const candidate = m && m[1] ? m[1].trim() : trimmed;
-
-  const lower = candidate.toLowerCase();
-  const words = lower
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1));
-
-  return words.join(" ");
-}
 // ─────────────────────────────
 // Helper: smart reply for price / availability inquiries
 // ─────────────────────────────
+
 async function buildSmartInquiryReply(opts: {
   org_id: string;
   text: string;
@@ -763,491 +490,8 @@ async function buildSmartInquiryReply(opts: {
 }
 
 // ─────────────────────────────
-// Helper: MENU / RATE CARD / PRICE LIST
+// L11: AI-learned alias helpers
 // ─────────────────────────────
-
-function extractMenuKeywords(text: string): string[] {
-  // 🔹 Layer 7: normalize spellings before extracting keywords
-  const raw = normalizeProductText(text || "");
-  const parts = raw.split(/\s+/).filter(Boolean);
-
-  const stopwords = new Set([
-    "hi",
-    "hello",
-    "hey",
-    "please",
-    "pls",
-    "kindly",
-    "what",
-    "whats",
-    "is",
-    "the",
-    "a",
-    "an",
-    "of",
-    "for",
-    "to",
-    "me",
-    "you",
-    "your",
-    "today",
-    "todays",
-    "menu",
-    "list",
-    "price",
-    "prices",
-    "rate",
-    "card",
-    "ratecard",
-    "services",
-    "service",
-    "send",
-    "show",
-    "give",
-    "need",
-    "want",
-    "can",
-    "could",
-    "tell",
-    "my",
-    "our",
-    "this",
-    "that",
-  ]);
-
-  const kws = parts.filter((w) => !stopwords.has(w) && w.length >= 3);
-  return Array.from(new Set(kws)); // unique
-}
-
-async function buildMenuReply(opts: {
-  org_id: string;
-  text: string;
-  businessType?: BusinessType | null;
-}): Promise<string | null> {
-  const { org_id, text } = opts;
-  const businessType = opts.businessType || "generic";
-
-  try {
-    // 1) Fetch all products for this org
-    const { data, error } = await supa
-      .from("products")
-      .select("id, display_name, canonical, variant, base_unit, price_per_unit")
-      .eq("org_id", org_id);
-
-    if (error) {
-      console.warn("[WABA][menu products err]", error.message);
-      return null;
-    }
-
-    const rows = (data || []) as any[];
-    if (!rows.length) return null;
-
-    // 2) Try to filter by keywords from the text (veg, hair, fish, etc.)
-    const keywords = extractMenuKeywords(text);
-    let filtered = rows;
-
-    if (keywords.length) {
-      filtered = rows.filter((row) => {
-        const name = String(
-          row.display_name || row.canonical || ""
-        ).toLowerCase();
-        const variant = String(row.variant || "").toLowerCase();
-
-        return keywords.some((kw) => name.includes(kw) || variant.includes(kw));
-      });
-
-      // If filter killed everything, fall back to full list
-      if (!filtered.length) {
-        filtered = rows;
-      }
-    }
-
-    if (!filtered.length) return null;
-
-    // 3) Build ProductPriceOption[] with latest prices
-    const options: ProductPriceOption[] = [];
-    const MAX_ITEMS = 15;
-
-    for (const row of filtered.slice(0, MAX_ITEMS)) {
-      const id = row.id;
-      if (!id) continue;
-
-      const latest = await getLatestPrice(org_id, id).catch((e: any) => {
-        console.warn("[WABA][menu latestPrice err]", e?.message || e);
-        return null;
-      });
-
-      const price =
-        latest && typeof latest.price === "number"
-          ? latest.price
-          : typeof row.price_per_unit === "number"
-          ? row.price_per_unit
-          : null;
-
-      const currency = latest ? latest.currency : null;
-
-      options.push({
-        productId: id,
-        name: row.display_name || row.canonical || "item",
-        variant: row.variant ? String(row.variant).trim() || null : null,
-        unit: row.base_unit || "unit",
-        price,
-        currency,
-      });
-    }
-
-    if (!options.length) return null;
-
-    // 4) Choose header based on business type + whether it was filtered
-    const isFiltered = keywords.length > 0;
-    let header: string;
-
-    if (businessType === "restaurant" || businessType === "cloud_kitchen") {
-      header = isFiltered
-        ? "📋 Here’s the menu you asked for:\n"
-        : "📋 Here’s today’s main menu:\n";
-    } else if (businessType === "salon") {
-      header = isFiltered
-        ? "📋 Here are the services you asked for:\n"
-        : "📋 Here’s our main services menu:\n";
-    } else {
-      header = isFiltered
-        ? "📋 Here are the items you asked for:\n"
-        : "📋 Here’s our main list:\n";
-    }
-
-    const lines = options.map((opt, idx) => {
-      const num = idx + 1;
-      const line = formatPriceLine(opt); // e.g. "Onion Nashik – 7 AED / kg"
-      return `${num}) ${line}`;
-    });
-
-    const footer =
-      "\nIf you’d like to order, please reply with the item names and quantities.";
-
-    // Extra hint if it was a generic menu (no filter)
-    const filterHint = !isFiltered
-      ? "\n\nYou can also ask for a specific list, for example “veg menu”, “hair services menu”, or “fruits price list”."
-      : "";
-
-    return header + lines.join("\n") + "\n" + footer + filterHint;
-  } catch (e: any) {
-    console.warn("[WABA][buildMenuReply err]", e?.message || e);
-    return null;
-  }
-}
-
-// ─────────────────────────────
-// Clarify + Address + Memory helpers
-// ─────────────────────────────
-
-type VariantChoice = {
-  index: number; // item index in order.items
-  label: string; // canonical/name (e.g. "Onion")
-  variants: string[];
-};
-
-// Normalize phone for session key
-function normalizePhoneForKey(raw: string): string {
-  return String(raw || "").replace(/[^\d]/g, "");
-}
-
-async function isAutoReplyEnabledForCustomer(opts: {
-  orgId: string;
-  phoneRaw: string;
-  orgAutoReplyEnabled: boolean;
-}): Promise<boolean> {
-  const { orgId, phoneRaw, orgAutoReplyEnabled } = opts;
-
-  // 1) Org-level master switch
-  if (!orgAutoReplyEnabled) return false;
-
-  const phoneKey = normalizePhoneForKey(phoneRaw);
-  if (!phoneKey) return true; // default ON if we can't normalise
-
-  try {
-    const { data, error } = await supa
-      .from("org_customer_settings")
-      .select("auto_reply_enabled")
-      .eq("org_id", orgId)
-      .eq("customer_phone", phoneKey) // ✅ HERE
-      .maybeSingle();
-
-    if (error) {
-      console.warn("[WABA][cust auto-reply lookup err]", error.message);
-      return true; // fail-open
-    }
-
-    if (!data || typeof data.auto_reply_enabled !== "boolean") {
-      return true; // no override row → default ON
-    }
-
-    return data.auto_reply_enabled;
-  } catch (e: any) {
-    console.warn("[WABA][cust auto-reply catch]", e?.message || e);
-    return true;
-  }
-}
-
-// Find ambiguous items (2+ variants configured) for this order
-async function findAmbiguousItemsForOrder(
-  org_id: string,
-  items: any[]
-): Promise<VariantChoice[]> {
-  const out: VariantChoice[] = [];
-  const seenCanon = new Set<string>();
-
-  for (let i = 0; i < (items || []).length; i++) {
-    const it = items[i] || {};
-    const labelRaw = String(it.canonical || it.name || "")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (!labelRaw) continue;
-
-    const canonKey = labelRaw.toLowerCase();
-    if (seenCanon.has(canonKey)) continue;
-    seenCanon.add(canonKey);
-
-    const { data, error } = await supa
-      .from("products")
-      .select("canonical, variant")
-      .eq("org_id", org_id)
-      .ilike("canonical", labelRaw); // case-insensitive
-
-    if (error) {
-      console.warn("[WABA][ambig products err]", error.message);
-      continue;
-    }
-
-    const unique = Array.from(
-      new Set(
-        (data || [])
-          .map((r: any) => String(r?.variant || "").trim())
-          .filter(Boolean)
-      )
-    );
-
-    if (unique.length >= 2) {
-      out.push({
-        index: i,
-        label: labelRaw,
-        variants: unique,
-      });
-    }
-  }
-
-  return out;
-}
-
-// Build a question text for one item
-function buildClarifyQuestionText(choice: VariantChoice): string {
-  const pretty = choice.label;
-  return (
-    "Thanks! Just need a quick confirmation:\n" +
-    `• ${pretty}: which one do you prefer? (${choice.variants.join(", ")})`
-  );
-}
-
-// Format summary list for final confirmation
-function formatOrderSummary(items: any[]): string {
-  const lines = (items || []).map((it: any) => {
-    const qty = it.qty ?? 1;
-    const unit = it.unit ? ` ${it.unit}` : "";
-    const name = it.canonical || it.name || "item";
-    const brand = it.brand ? ` · ${it.brand}` : "";
-    const variant = it.variant ? ` · ${it.variant}` : "";
-    return `* ${qty}${unit} ${name}${brand}${variant}`.trim();
-  });
-  return lines.join("\n");
-}
-
-// Build a synthetic text line from order items, e.g.
-//  "2kg onion, 1L milk, 1 Chicken Biryani"
-function itemsToOrderText(items: any[]): string {
-  return (items || [])
-    .map((it: any) => {
-      const qty = it.qty ?? 1;
-      const unit = it.unit ? String(it.unit).trim() : "";
-      const name = String(it.canonical || it.name || "").trim();
-      const variant = it.variant ? String(it.variant).trim() : "";
-      if (!name) return "";
-
-      const qtyPart = unit ? `${qty}${unit}` : `${qty}`;
-      const variantPart = variant ? ` ${variant}` : "";
-      return `${qtyPart} ${name}${variantPart}`.trim();
-    })
-    .filter(Boolean)
-    .join(", ");
-}
-
-// Last-variant memory: find last chosen variant for this customer+canonical
-async function getCustomerLastVariant(
-  org_id: string,
-  from_phone: string,
-  canonical: string
-): Promise<string | null> {
-  try {
-    const canonKey = canonical.toLowerCase().trim();
-
-    const { data, error } = await supa
-      .from("orders")
-      .select("items")
-      .eq("org_id", org_id)
-      .eq("source_phone", from_phone) // IMPORTANT: orders.source_phone, not customer_phone
-      .order("created_at", { ascending: false });
-
-    if (error) {
-      console.warn("[WABA][lastVariant err]", error.message);
-      return null;
-    }
-    if (!data || !data.length) return null;
-
-    for (const row of data) {
-      const items = (row as any).items || [];
-      for (const it of items) {
-        const labelRaw = String(it?.canonical || it?.name || "")
-          .toLowerCase()
-          .trim();
-        if (labelRaw === canonKey && it?.variant) {
-          return String(it.variant);
-        }
-      }
-    }
-    return null;
-  } catch (e: any) {
-    console.warn("[WABA][lastVariant catch]", e?.message || e);
-    return null;
-  }
-}
-
-// 🔹 check if we already captured address for this customer (any order)
-// Once address_done exists for a phone, we never ask again.
-async function hasAddressForOrder(
-  org_id: string,
-  from_phone: string,
-  order_id: string
-): Promise<boolean> {
-  // 1) Prefer checking the order itself
-  try {
-    const { data: orderRow, error: orderErr } = await supa
-      .from("orders")
-      .select("shipping_address")
-      .eq("id", order_id)
-      .single();
-
-    if (!orderErr && orderRow) {
-      const addr = (orderRow as any).shipping_address;
-      if (addr && String(addr).trim().length > 0) {
-        return true;
-      }
-    }
-  } catch (e: any) {
-    console.warn("[WABA][hasAddress order check err]", e?.message || e);
-  }
-
-  // 2) Fallback: legacy session-based check
-  try {
-    const phoneKey = normalizePhoneForKey(from_phone);
-
-    const { data, error } = await supa
-      .from("order_clarify_sessions")
-      .select("id")
-      .eq("org_id", org_id)
-      .eq("customer_phone", phoneKey)
-      .eq("status", "address_done")
-      .limit(1);
-
-    if (error) {
-      console.warn("[WABA][hasAddress err]", error.message);
-      return false;
-    }
-    return !!(data && data.length);
-  } catch (e: any) {
-    console.warn("[WABA][hasAddress catch]", e?.message || e);
-    return false;
-  }
-}
-
-// Active open order per customer (for reference / edit decisions)
-async function findActiveOrderForPhone(
-  org_id: string,
-  from_phone: string
-): Promise<any | null> {
-  try {
-    const { data, error } = await supa
-      .from("orders")
-      .select("id, items, status, source_phone, created_at")
-      .eq("org_id", org_id)
-      .eq("source_phone", from_phone)
-      .in("status", ["pending", "paid"]) // treat shipped as closed
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (error) {
-      console.warn("[WABA][activeOrder err]", error.message);
-      return null;
-    }
-    return data || null;
-  } catch (e: any) {
-    console.warn("[WABA][activeOrder catch]", e?.message || e);
-    return null;
-  }
-}
-
-// Active open order but excluding a specific order_id (for merge)
-async function findActiveOrderForPhoneExcluding(
-  org_id: string,
-  from_phone: string,
-  excludeOrderId: string
-): Promise<any | null> {
-  try {
-    const { data, error } = await supa
-      .from("orders")
-      .select("id, items, status, source_phone, created_at")
-      .eq("org_id", org_id)
-      .eq("source_phone", from_phone)
-      .neq("id", excludeOrderId)
-      .in("status", ["pending", "paid"])
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (error) {
-      console.warn("[WABA][activeOrderExcl err]", error.message);
-      return null;
-    }
-    return data || null;
-  } catch (e: any) {
-    console.warn("[WABA][activeOrderExcl catch]", e?.message || e);
-    return null;
-  }
-}
-
-// All active orders for a phone (pending + paid), newest first
-async function findAllActiveOrdersForPhone(
-  org_id: string,
-  from_phone: string
-): Promise<any[]> {
-  try {
-    const { data, error } = await supa
-      .from("orders")
-      .select("id, items, status, source_phone, created_at")
-      .eq("org_id", org_id)
-      .eq("source_phone", from_phone)
-      .in("status", ["pending", "paid"])
-      .order("created_at", { ascending: false });
-
-    if (error) {
-      console.warn("[WABA][allActiveOrders err]", error.message);
-      return [];
-    }
-    return data || [];
-  } catch (e: any) {
-    console.warn("[WABA][allActiveOrders catch]", e?.message || e);
-    return [];
-  }
-}
 
 // Most recent order for a customer (ANY status)
 // Used as a fallback for cancel if nothing is "active"
@@ -1274,17 +518,6 @@ async function findMostRecentOrderForPhone(
     console.warn("[WABA][mostRecentOrder catch]", e?.message || e);
     return null;
   }
-}
-
-function shortOrderLine(order: any, index: number): string {
-  const items = (order.items || []) as any[];
-  const first = items[0];
-  const firstName = first
-    ? (first.canonical || first.name || "item").toString()
-    : "item";
-  const extraCount = Math.max(items.length - 1, 0);
-  const extraText = extraCount > 0 ? ` + ${extraCount} more` : "";
-  return `${index}. ${firstName}${extraText}`;
 }
 
 // ─────────────────────────────
@@ -1318,7 +551,6 @@ async function logFlowEvent(opts: {
 }
 
 // Start MULTI-TURN CLARIFY session (for items)
-// - applies last-variant memory first
 // - returns first question text, or null if nothing to clarify.
 async function startClarifyForOrder(opts: {
   org_id: string;
@@ -1339,35 +571,12 @@ async function startClarifyForOrder(opts: {
     return null;
   }
 
-  let items = ((orderRow as any).items || []) as any[];
-  let modified = false;
+  const items = ((orderRow as any).items || []) as any[];
 
-  // 1) Apply last variant memory
-  for (let i = 0; i < items.length; i++) {
-    const it = items[i] || {};
-    if (it.variant) continue;
+  // 🔹 No more auto-filling variants from history here.
+  // If the catalog has 2+ variants for a canonical,
+  // we will ALWAYS clarify instead of guessing.
 
-    const labelRaw = String(it.canonical || it.name || "")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (!labelRaw) continue;
-
-    const lastVariant = await getCustomerLastVariant(
-      org_id,
-      from_phone,
-      labelRaw
-    );
-    if (lastVariant) {
-      modified = true;
-      items[i] = { ...it, variant: lastVariant };
-    }
-  }
-
-  if (modified) {
-    await supa.from("orders").update({ items }).eq("id", order_id);
-  }
-
-  // 2) Find remaining ambiguous items
   let choices = await findAmbiguousItemsForOrder(org_id, items);
   choices = choices.filter((c) => !items[c.index].variant);
 
@@ -1400,445 +609,9 @@ async function startClarifyForOrder(opts: {
 }
 // Start ADDRESS session (no more item clarifications needed)
 // - next text from this customer will be treated as address, not order.
-async function startAddressSessionForOrder(opts: {
-  org_id: string;
-  order_id: string;
-  from_phone: string;
-}) {
-  const { org_id, order_id, from_phone } = opts;
-  const phoneKey = normalizePhoneForKey(from_phone);
-
-  // close prior sessions
-  await supa
-    .from("order_clarify_sessions")
-    .update({ status: "closed", updated_at: new Date().toISOString() })
-    .eq("org_id", org_id)
-    .eq("customer_phone", phoneKey)
-    .eq("status", "open");
-
-  const { error } = await supa.from("order_clarify_sessions").insert({
-    org_id,
-    order_id,
-    customer_phone: phoneKey,
-    status: "open",
-    current_index: -1, // SPECIAL: -1 = waiting for address
-  });
-
-  // L9: mark stage as waiting for address
-  await setConversationStage(org_id, from_phone, "awaiting_address", {
-    active_order_id: order_id,
-    last_action: "ask_address",
-  });
-
-  if (error) {
-    console.warn("[WABA][address session insert err]", error.message);
-  }
-}
-
-function looksLikeOrderLineText(raw: string): boolean {
-  const text = (raw || "").toLowerCase().trim();
-
-  if (!text) return false;
-
-  // Has a number (1, 2, 3…)
-  const hasNumber = /\d/.test(text);
-
-  // Has common units / item markers
-  const hasUnit =
-    /kg|g|gram|gm|ml|ltr|liter|litre|piece|pc|pcs|pack|plate|bottle|box|dozen/i.test(
-      text
-    );
-
-  // Has a comma-separated list (often "1kg onion, 2L milk")
-  const hasCommaList = text.includes(",");
-
-  // If it has a number and a typical unit OR comma list,
-  // it's *very* likely to be items, not an address.
-  if ((hasNumber && hasUnit) || hasCommaList) return true;
-
-  return false;
-}
 
 // Handle a message while clarify/address session is open
 // Returns true if the message was consumed by this handler.
-async function maybeHandleClarifyReply(opts: {
-  org_id: string;
-  phoneNumberId: string;
-  from: string;
-  text: string;
-  needsAddress?: boolean;
-}): Promise<boolean> {
-  const { org_id, phoneNumberId, from, text, needsAddress = true } = opts;
-  const phoneKey = normalizePhoneForKey(from);
-  const lower = text.toLowerCase().trim();
-
-  // Look up latest open session
-  const { data: session, error: sessErr } = await supa
-    .from("order_clarify_sessions")
-    .select("id, order_id, current_index, status")
-    .eq("org_id", org_id)
-    .eq("customer_phone", phoneKey)
-    .eq("status", "open")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (sessErr) {
-    console.warn("[WABA][clarify session err]", sessErr.message);
-    return false;
-  }
-  if (!session) return false;
-
-  // Escape hatch during clarify / address flow
-  if (/cancel|ignore previous|new order/i.test(lower)) {
-    await supa
-      .from("order_clarify_sessions")
-      .update({ status: "closed", updated_at: new Date().toISOString() })
-      .eq("id", session.id);
-
-    await sendWabaText({
-      phoneNumberId,
-      to: from,
-      text: "No problem 👍 You can send a new order whenever you’re ready.",
-      orgId: org_id,
-    });
-
-    return true;
-  }
-
-  if (/talk to agent|talk to human/i.test(lower)) {
-    await supa
-      .from("order_clarify_sessions")
-      .update({ status: "closed", updated_at: new Date().toISOString() })
-      .eq("id", session.id);
-
-    await sendWabaText({
-      phoneNumberId,
-      to: from,
-      text:
-        "👨‍💼 Okay, we’ll connect you to a store agent.\n" +
-        "Please wait a moment — a human will reply.",
-      orgId: org_id,
-    });
-
-    return true;
-  }
-
-  // ──────────────────────
-  // ADDRESS STAGE (current_index === -1)
-  // ──────────────────────
-  if (session.current_index === -1) {
-    if (looksLikeOrderLineText(text)) {
-      console.log("[WABA][ADDRESS GUARD] looks like items, not address", {
-        org_id,
-        order_id: session.order_id,
-        customer: from,
-        text,
-      });
-
-      // Keep the clarify session OPEN (status still 'open', current_index = -1)
-      // so the NEXT message can still be a real address.
-      //
-      // Just gently tell the user what's happening:
-      await sendWabaText({
-        phoneNumberId,
-        to: from,
-        orgId: org_id,
-        text:
-          "Looks like you’re adding more items 👍\n" +
-          "I’ll add these to your order.\n" +
-          "After that, please send your delivery address in a separate message.",
-      });
-
-      // IMPORTANT:
-      // returning false → the main WABA handler will continue
-      // and pass this text into ingestCore as an order line.
-      return false;
-    }
-
-    // ✅ Normal path: treat it as address
-    console.log("[WABA][ADDRESS CAPTURE]", {
-      org_id,
-      order_id: session.order_id,
-      customer: from,
-      address: text,
-    });
-
-    // 1) Mark session as address_done
-    await supa
-      .from("order_clarify_sessions")
-      .update({ status: "address_done", updated_at: new Date().toISOString() })
-      .eq("id", session.id);
-
-    // 2) Persist address on the order itself
-    try {
-      await supa
-        .from("orders")
-        .update({ shipping_address: text })
-        .eq("id", session.order_id);
-    } catch (e: any) {
-      console.warn("[WABA][address save err]", e?.message || e);
-    }
-
-    // 3) Mark that we JUST finished an address flow
-    lastCommandByPhone.set(from, "address_done");
-
-    // L9: stage = building_order (order + address present, can add more items)
-    await setConversationStage(org_id, from, "building_order", {
-      active_order_id: session.order_id,
-      last_action: "address_captured",
-    });
-
-    // 4) Acknowledge to customer
-    await sendWabaText({
-      phoneNumberId,
-      to: from,
-      text:
-        "📍 Thanks! We’ve noted your address.\n" +
-        "If you’d like to add more items, just send them here.",
-      orgId: org_id,
-    });
-
-    return true;
-  }
-  // ──────────────────────
-  // ITEM VARIANT CLARIFY STAGE
-  // ──────────────────────
-  const { data: orderRow, error: orderErr } = await supa
-    .from("orders")
-    .select("id, items")
-    .eq("id", session.order_id)
-    .single();
-
-  if (orderErr || !orderRow) {
-    console.warn("[WABA][clarify reply] order not found", orderErr?.message);
-
-    // Close the stale session and LET the main handler treat this
-    // as a fresh message (no confusing error to customer)
-    await supa
-      .from("order_clarify_sessions")
-      .update({ status: "closed", updated_at: new Date().toISOString() })
-      .eq("id", session.id);
-
-    return false;
-  }
-
-  const order: any = orderRow;
-  const items: any[] = order.items || [];
-  if (
-    !Array.isArray(items) ||
-    session.current_index < 0 ||
-    session.current_index >= items.length
-  ) {
-    await supa
-      .from("order_clarify_sessions")
-      .update({ status: "closed", updated_at: new Date().toISOString() })
-      .eq("id", session.id);
-
-    await sendWabaText({
-      phoneNumberId,
-      to: from,
-      text:
-        "Sorry, something went wrong with that confirmation. " +
-        "Please send your order again.",
-      orgId: org_id,
-    });
-    return true;
-  }
-
-  const currentIndex = session.current_index;
-  const currentItem = items[currentIndex] || {};
-  const labelRaw = String(
-    currentItem.canonical || currentItem.name || ""
-  ).trim();
-  const labelKey = labelRaw.toLowerCase();
-
-  // Load variants for this item
-  const { data: productRows, error: prodErr } = await supa
-    .from("products")
-    .select("canonical, variant")
-    .eq("org_id", org_id)
-    .ilike("canonical", labelRaw);
-
-  if (prodErr) {
-    console.warn("[WABA][clarify reply products err]", prodErr.message);
-  }
-  const variants = Array.from(
-    new Set(
-      (productRows || [])
-        .map((r: any) => String(r?.variant || "").trim())
-        .filter(Boolean)
-    )
-  );
-
-  if (!variants.length) {
-    // nothing to choose, stop clarify and fall back to manual
-    await supa
-      .from("order_clarify_sessions")
-      .update({ status: "closed", updated_at: new Date().toISOString() })
-      .eq("id", session.id);
-
-    await sendWabaText({
-      phoneNumberId,
-      to: from,
-      text:
-        "Got your message 👍 We’ll adjust the order manually for this item " +
-        "and continue processing.",
-      orgId: org_id,
-    });
-    return true;
-  }
-
-  // Try to match answer to one of the variants
-  const answer = lower;
-  let chosen: string | null = null;
-
-  for (const v of variants) {
-    const vLower = v.toLowerCase();
-    if (answer === vLower || answer.includes(vLower)) {
-      chosen = v;
-      break;
-    }
-  }
-
-  if (!chosen) {
-    const optionsStr = variants.join(" / ");
-    await sendWabaText({
-      phoneNumberId,
-      to: from,
-      text: `Sorry, I didn’t catch that. Please reply with one of: ${optionsStr}`,
-      orgId: org_id,
-    });
-    return true;
-  }
-
-  // Update variant in order items
-  items[currentIndex] = {
-    ...currentItem,
-    variant: chosen,
-  };
-
-  const { error: updErr } = await supa
-    .from("orders")
-    .update({ items })
-    .eq("id", order.id);
-
-  if (updErr) {
-    console.warn("[WABA][clarify reply update err]", updErr.message);
-    await sendWabaText({
-      phoneNumberId,
-      to: from,
-      text:
-        "I couldn’t update that item just now. " +
-        "We’ll adjust it manually and confirm your order.",
-      orgId: org_id,
-    });
-    return true;
-  }
-
-  // Check if more ambiguous items remain (still without variant)
-  const remainingChoices = await findAmbiguousItemsForOrder(org_id, items);
-  const stillAmbiguous = remainingChoices.filter((c) => {
-    const it = items[c.index];
-    return !it || !it.variant;
-  });
-
-  if (!stillAmbiguous.length) {
-    // All clarified → close clarify session
-    await supa
-      .from("order_clarify_sessions")
-      .update({ status: "closed", updated_at: new Date().toISOString() })
-      .eq("id", session.id);
-
-    const summary = formatOrderSummary(items);
-
-    // Should this org ask for address at all?
-    if (!needsAddress) {
-      const finalText = "✅ Order confirmed:\n" + summary;
-
-      // L9: post_order, no address needed
-      await setConversationStage(org_id, from, "post_order", {
-        active_order_id: order.id,
-        last_action: "clarify_done_no_address",
-      });
-
-      await sendWabaText({
-        phoneNumberId,
-        to: from,
-        text: finalText,
-        orgId: org_id,
-      });
-
-      return true;
-    }
-
-    // Check if customer already provided address (any previous address_done)
-    const alreadyHasAddress = await hasAddressForOrder(org_id, from, order.id);
-
-    if (alreadyHasAddress) {
-      const finalText = "✅ Updated order:\n" + summary;
-
-      // L9: order fully known + address present → post_order
-      await setConversationStage(org_id, from, "post_order", {
-        active_order_id: order.id,
-        last_action: "clarify_done_address_already",
-      });
-
-      await sendWabaText({
-        phoneNumberId,
-        to: from,
-        text: finalText,
-        orgId: org_id,
-      });
-
-      return true;
-    }
-
-    // If no address yet → open address session ONCE
-    await startAddressSessionForOrder({
-      org_id,
-      order_id: order.id,
-      from_phone: from,
-    });
-
-    const finalText =
-      "✅ Order confirmed:\n" +
-      summary +
-      "\n\n📍 Please share your delivery address (or send location) if you haven’t already.";
-
-    await sendWabaText({
-      phoneNumberId,
-      to: from,
-      text: finalText,
-      orgId: org_id,
-    });
-
-    return true;
-  }
-
-  // Move to next item and ask again
-  const next = stillAmbiguous[0];
-  await supa
-    .from("order_clarify_sessions")
-    .update({
-      current_index: next.index,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", session.id);
-
-  const prettyCurrent = labelRaw || labelKey || "item";
-  const confirmLine = `Got it: ${prettyCurrent} → ${chosen} ✅`;
-  const nextQuestion = buildClarifyQuestionText(next);
-
-  await sendWabaText({
-    phoneNumberId,
-    to: from,
-    text: `${confirmLine}\n\n${nextQuestion}`,
-    orgId: org_id,
-  });
-
-  return true;
-}
 
 // Edit-like messages we *don’t* support in V1 (we answer safely)
 function isLikelyEditRequest(text: string): boolean {
@@ -1851,21 +624,24 @@ function isLikelyEditRequest(text: string): boolean {
   if (lower.startsWith("no ")) return true;
   if (lower.includes("reduce ")) return true;
   if (lower.includes("increase ")) return true;
+
+  // NEW patterns for "only X", "stop adding", etc.
+  if (lower.includes("only biryani") || lower.includes("only biriyani"))
+    return true;
+  if (lower.includes("only this")) return true;
+  if (lower.includes("dont add") || lower.includes("don't add")) return true;
+  if (lower.includes("no need") && lower.includes("item")) return true;
+  if (lower.includes("wrong") && lower.includes("order")) return true;
+  if (
+    lower.includes("why are u adding") ||
+    lower.includes("why are you adding")
+  )
+    return true;
+
   return false;
 }
 
 // Looks like "add more items to existing order"
-function looksLikeAddToExisting(text: string): boolean {
-  const lower = text.toLowerCase();
-  if (lower.includes("add ")) return true;
-  if (lower.includes("add on")) return true;
-  if (lower.includes("add one more")) return true;
-  if (lower.includes("also")) return true;
-  if (lower.includes("too")) return true;
-  if (lower.includes("more")) return true;
-  if (lower.includes("extra")) return true;
-  return false;
-}
 
 function isPureGreetingText(raw: string): boolean {
   const lower = (raw || "").toLowerCase().replace(/[^a-z0-9\s]/gi, " "); // keep only letters/numbers/spaces
@@ -1913,20 +689,6 @@ function isPureGreetingText(raw: string): boolean {
 // Explicit user commands: NEW / CANCEL / UPDATE / AGENT
 // ─────────────────────────────
 
-type UserCommand =
-  | "new"
-  | "cancel"
-  | "update"
-  | "agent"
-  | "address_done"
-  | "cancel_select"
-  | "cancel_pending"
-  | "repeat"
-  | null;
-
-// last action per phone (in-memory, per Node process)
-const lastCommandByPhone = new Map<string, UserCommand>();
-
 // when we show "you have multiple active orders, reply 1/2/3",
 // we store the order IDs here for that phone
 const pendingCancelOptions = new Map<string, { orderIds: string[] }>();
@@ -1936,30 +698,6 @@ const commandsTipShown = new Set<string>();
 
 // For soft-cancel flow (L8): phone → target order id
 const pendingSoftCancel = new Map<string, string>();
-
-async function maybeSendCommandsTip(opts: {
-  phoneNumberId: string;
-  to: string;
-  orgId?: string;
-}) {
-  const key = normalizePhoneForKey(opts.to || "");
-  if (!key) return;
-
-  if (commandsTipShown.has(key)) return;
-  commandsTipShown.add(key);
-
-  await sendWabaText({
-    phoneNumberId: opts.phoneNumberId,
-    to: opts.to,
-    orgId: opts.orgId,
-    text:
-      "📝 Tip: You can use quick commands anytime:\n" +
-      "• *new* – start a fresh order\n" +
-      "• *cancel* – cancel your last order\n" +
-      "• *agent* – talk to a human\n" +
-      "• *order summary* – see your last order",
-  });
-}
 
 function detectUserCommand(text: string): UserCommand {
   const lower = text.toLowerCase().trim();
@@ -2058,9 +796,6 @@ function detectSoftCancelIntent(text: string): boolean {
 // ─────────────────────────────
 waba.post("/", async (req, res) => {
   try {
-    console.log("🔥 WABA HANDLER v10 LIVE", { path: __filename });
-    console.log("[WABA][RAW BODY]", JSON.stringify(req.body));
-
     const body = req.body;
     if (!body || !body.entry) {
       console.log("[WABA] no entry in body");
@@ -2075,18 +810,22 @@ waba.post("/", async (req, res) => {
         const metadata = value.metadata || {};
         const phoneNumberId = metadata.phone_number_id as string | undefined;
 
-        console.log("[WABA][ENTRY]", {
-          phoneNumberId,
-          messages_len: messages.length,
-        });
-
         if (!phoneNumberId || messages.length === 0) continue;
 
         // Find org by WABA phone_number_id
         const { data: orgs, error: orgErr } = await supa
           .from("orgs")
           .select(
-            "id, name, ingest_mode, auto_reply_enabled, primary_business_type, supports_delivery"
+            `
+    id,
+    name,
+    ingest_mode,
+    auto_reply_enabled,
+    primary_business_type,
+    supports_delivery,
+    wa_menu_image_url,
+    wa_menu_caption
+  `
           )
           .eq("wa_phone_number_id", phoneNumberId)
           .limit(1);
@@ -2521,7 +1260,7 @@ waba.post("/", async (req, res) => {
           }
           // 0.1) "order summary" → show ALL active (pending/paid) orders
           if (
-            /order summary|my order|my orders|show my order|show my orders/i.test(
+            /\b(my orders|orders summary|active orders|show my orders)\b/i.test(
               lowerText
             )
           ) {
@@ -2640,9 +1379,10 @@ waba.post("/", async (req, res) => {
 
           // 0.18) Show last order summary (read-only)
           if (
-            /order summary/i.test(lowerText) ||
-            /show (my )?order/i.test(lowerText) ||
-            /last order/i.test(lowerText)
+            /\border summary\b/i.test(lowerText) ||
+            /\bshow (my )?order\b/i.test(lowerText) ||
+            /\blast order\b/i.test(lowerText) ||
+            /\bprevious order\b/i.test(lowerText)
           ) {
             const last = await findMostRecentOrderForPhone(org.id, from);
 
@@ -2740,43 +1480,32 @@ waba.post("/", async (req, res) => {
             }
 
             if (activeOrders.length === 1) {
-              // Same behaviour as before (Option A) – cancel the single active order
+              // 🔹 Use the same soft-cancel YES/NO flow even for explicit "cancel"
               const activeOrderForCancel = activeOrders[0];
-
-              await supa
-                .from("orders")
-                .update({ status: "cancelled_by_customer" })
-                .eq("id", activeOrderForCancel.id);
 
               const summary = formatOrderSummary(
                 activeOrderForCancel.items || []
               );
 
-              const textOut =
-                "❌ Your last order has been cancelled:\n" +
-                summary +
-                "\n\nIf this was a mistake, you can send a new order.";
+              const promptText =
+                "⚠️ Are you sure you want to cancel this order?\n" +
+                (summary || "(no items found)") +
+                "\n\nReply *YES* to cancel it, or *NO* to keep it.";
+
+              pendingSoftCancel.set(from, activeOrderForCancel.id);
+              lastCommandByPhone.set(from, "cancel_pending");
 
               await sendWabaText({
                 phoneNumberId,
                 to: from,
-                text: textOut,
+                text: promptText,
                 orgId: org.id,
               });
-
-              await maybeSendCommandsTip({
-                phoneNumberId,
-                to: from,
-                orgId: org.id,
-              });
-
-              // remember last action (if you still want it)
-              lastCommandByPhone.set(from, "cancel");
 
               await logFlowEvent({
                 orgId: org.id,
                 from,
-                event: "command_cancel_single",
+                event: "command_cancel_single_prompt",
                 msgId,
                 orderId: activeOrderForCancel.id,
                 text,
@@ -2951,13 +1680,39 @@ waba.post("/", async (req, res) => {
             continue;
           }
           // ─────────────────────────────
-          // LAYER 1: NLU classifier
+          // LAYER 1: NLU classifier (safe)
           // ─────────────────────────────
-          const nlu = await classifyMessage(text);
-          console.log("[WABA][NLU]", {
-            intent: nlu.intent,
-            conf: nlu.confidence,
-          });
+          let nlu: {
+            intent: string;
+            confidence: number;
+            canonical?: string | null;
+          };
+
+          try {
+            nlu = await classifyMessage(text);
+            console.log("[WABA][NLU]", {
+              intent: nlu.intent,
+              conf: nlu.confidence,
+            });
+          } catch (e: any) {
+            console.warn("[WABA][NLU_ERR]", e?.message || e);
+
+            // Fail-soft default
+            nlu = {
+              intent: "unknown",
+              confidence: 0,
+              canonical: null,
+            };
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "nlu_exception",
+              msgId,
+              text,
+              result: { error: e?.message || String(e) },
+            });
+          }
           // Greeting detection → only short-circuit for *pure* greeting/thanks/ok
           if (nlu.intent === "greeting" && isPureGreetingText(text)) {
             await sendWabaText({
@@ -2990,44 +1745,192 @@ waba.post("/", async (req, res) => {
               result: { intent: nlu.intent },
             });
           }
-          // 1) Normal path: parse + store
-          const result: any = await ingestCoreFromMessage({
-            org_id: org.id,
-            text,
-            ts,
-            from_phone: from,
-            from_name: null,
-            msg_id: msgId,
-            source: "waba",
-            // 🔹 NEW: tell core which order is currently active (if any)
-            active_order_id: activeOrderId || undefined,
-          });
-          console.log("[WABA][INGEST-RESULT]", {
-            org_id: org.id,
-            from,
-            msgId,
-            used: result.used,
-            kind: result.kind,
-            inquiry: result.inquiry || result.inquiry_type,
-            order_id: result.order_id,
-            reason: result.reason,
-            stored: result.stored,
-          });
-          await logFlowEvent({
-            orgId: org.id,
-            from,
-            event: "ingest_result",
-            msgId,
-            orderId: result.order_id || null,
-            text,
-            result,
-            meta: {
+          /// ─────────────────────────────
+          // LAYER 12: ingestCore (safe)
+          // ─────────────────────────────
+          let result: any;
+
+          try {
+            result = await ingestCoreFromMessage({
+              org_id: org.id,
+              text,
+              ts,
+              from_phone: from,
+              from_name: null,
+              msg_id: msgId,
+              source: "waba",
+              active_order_id: activeOrderId || undefined,
+            });
+
+            console.log("[WABA][INGEST-RESULT]", {
+              org_id: org.id,
+              from,
+              msgId,
+              used: result.used,
               kind: result.kind,
+              inquiry: result.inquiry || result.inquiry_type,
+              order_id: result.order_id,
               reason: result.reason,
               stored: result.stored,
-              lastCmd,
-            },
-          });
+            });
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "ingest_result",
+              msgId,
+              orderId: result.order_id || null,
+              text,
+              result,
+              meta: {
+                kind: result.kind,
+                reason: result.reason,
+                stored: result.stored,
+                lastCmd,
+              },
+            });
+          } catch (e: any) {
+            console.error("[WABA][INGEST_EXCEPTION]", e?.message || e);
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "ingest_exception",
+              msgId,
+              orderId: null,
+              text,
+              result: { error: e?.message || String(e) },
+            });
+
+            // Fail-soft message to customer
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              orgId: org.id,
+              text:
+                "⚠️ There was a technical issue while processing your message.\n" +
+                "The team will reply shortly.",
+            });
+
+            // Skip everything below (NO auto reply, NO logic)
+            continue;
+          }
+
+          // L11: learn aliases from inquiries (user text → canonical)
+          try {
+            if (result && result.kind === "inquiry") {
+              await learnAliasFromInquiry({
+                org_id: org.id,
+                text,
+                result,
+              });
+            }
+          } catch (e: any) {
+            console.warn("[L11][learnAliasFromInquiry err]", e?.message || e);
+          }
+
+          // ─────────────────────────────
+          // ADDRESS UPDATE FLOW (human-like)
+          // ─────────────────────────────
+          if (
+            result &&
+            result.kind === "none" &&
+            typeof result.reason === "string" &&
+            (result.reason.includes("address update request") ||
+              result.reason.includes("request for address update") ||
+              result.reason.includes("update my address"))
+          ) {
+            // Pick target order: prefer active, else most recent
+            const targetOrder =
+              activeOrder || (await findMostRecentOrderForPhone(org.id, from));
+
+            if (!targetOrder) {
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                orgId: org.id,
+                text:
+                  "📍 Got your message about the address.\n" +
+                  "We don’t see any recent order to update right now, " +
+                  "but the store will note your new address for future orders.",
+              });
+              await logFlowEvent({
+                orgId: org.id,
+                from,
+                event: "address_update_no_order",
+                msgId,
+                orderId: null,
+                text,
+                result,
+              });
+              continue;
+            }
+
+            await startAddressSessionForOrder({
+              org_id: org.id,
+              order_id: targetOrder.id,
+              from_phone: from,
+            });
+
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              orgId: org.id,
+              text:
+                "📍 Sure, please send your correct delivery address now " +
+                "(building, street, area). We’ll update it for your current order.",
+            });
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "address_update_requested",
+              msgId,
+              orderId: targetOrder.id,
+              text,
+              result,
+            });
+
+            continue; // ✅ stop normal flow
+          }
+
+          let reply: string | null = null;
+
+          // ─────────────────────────────
+          // SIMPLE PREFERENCE NOTE FALLBACK
+          // (e.g. "some spice to my biriyani")
+          // ─────────────────────────────
+          if (
+            !reply &&
+            activeOrderId &&
+            result &&
+            result.kind === "none" &&
+            /spice|spicy|no onion|less oil|less chilli|no chilli/i.test(
+              lowerText
+            )
+          ) {
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              orgId: org.id,
+              text:
+                "👍 Got it — we’ve noted your special request for the store.\n" +
+                "They’ll adjust your order accordingly.",
+            });
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "preference_note_manual",
+              msgId,
+              orderId: activeOrderId,
+              text,
+              result,
+            });
+
+            continue; // ✅ don't treat as new order/inquiry
+          }
+
           // ─────────────────────────────
           // MENU HEURISTIC: convert to inquiry:menu when appropriate
           // ─────────────────────────────
@@ -3089,9 +1992,210 @@ waba.post("/", async (req, res) => {
             );
           }
 
-          //   if (!org.auto_reply_enabled) continue;
+          // ─────────────────────────────
+          // PREFERENCE / SPECIAL REQUEST FLOW
+          // (e.g. "make the biriyani spicy", "no onion in biriyani")
+          // ─────────────────────────────
+          if (
+            result &&
+            result.kind === "order" &&
+            typeof result.reason === "string" &&
+            result.reason.toLowerCase().includes("preference") &&
+            activeOrderId &&
+            Array.isArray(result.items) &&
+            result.items.length === 1
+          ) {
+            const prefItem = result.items[0] || {};
+            const prefCanonical = String(
+              prefItem.canonical || prefItem.name || ""
+            )
+              .toLowerCase()
+              .trim();
+            const prefNotes = String(prefItem.notes || "").trim();
 
-          let reply: string | null = null;
+            if (!prefCanonical || !prefNotes) {
+              // Not enough info → just treat as manual note for store
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                orgId: org.id,
+                text:
+                  "👍 Got it — we’ve noted your request for the store.\n" +
+                  "They’ll adjust your order accordingly.",
+              });
+
+              await logFlowEvent({
+                orgId: org.id,
+                from,
+                event: "preference_note_no_details",
+                msgId,
+                orderId: activeOrderId,
+                text,
+                result,
+              });
+
+              continue;
+            }
+
+            const { data: ordRow, error: ordErr } = await supa
+              .from("orders")
+              .select("id, items")
+              .eq("id", activeOrderId)
+              .single();
+
+            if (ordErr || !ordRow) {
+              console.warn(
+                "[WABA][preference_update order load err]",
+                ordErr?.message
+              );
+
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                orgId: org.id,
+                text: "👍 Got your preference. The store will review it with your order.",
+              });
+
+              await logFlowEvent({
+                orgId: org.id,
+                from,
+                event: "preference_note_order_missing",
+                msgId,
+                orderId: activeOrderId,
+                text,
+                result,
+              });
+
+              continue;
+            }
+
+            const itemsArr: any[] = (ordRow as any).items || [];
+            let chosenIndex = -1;
+
+            // 1) Try exact canonical match
+            for (let i = 0; i < itemsArr.length; i++) {
+              const it = itemsArr[i] || {};
+              const canon = String(it.canonical || it.name || "")
+                .toLowerCase()
+                .trim();
+              if (canon === prefCanonical) {
+                chosenIndex = i;
+                break;
+              }
+            }
+
+            // 2) If not found, try partial match (e.g. "biryani" vs "Mutton Biryani")
+            if (chosenIndex === -1 && prefCanonical.length >= 3) {
+              for (let i = 0; i < itemsArr.length; i++) {
+                const it = itemsArr[i] || {};
+                const canon = String(it.canonical || it.name || "")
+                  .toLowerCase()
+                  .trim();
+                if (
+                  canon.includes(prefCanonical) ||
+                  prefCanonical.includes(canon)
+                ) {
+                  chosenIndex = i;
+                  break;
+                }
+              }
+            }
+
+            if (chosenIndex === -1) {
+              // Can't safely map to a single line → keep it as manual note
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                orgId: org.id,
+                text:
+                  "👍 Got it — we’ve added this note for the store to see.\n" +
+                  "They’ll adjust your order accordingly.",
+              });
+
+              await logFlowEvent({
+                orgId: org.id,
+                from,
+                event: "preference_note_unmapped",
+                msgId,
+                orderId: activeOrderId,
+                text,
+                result,
+              });
+
+              continue;
+            }
+
+            const targetItem = itemsArr[chosenIndex] || {};
+            const existingNotes = String(targetItem.notes || "").trim();
+            const newNotes = existingNotes
+              ? `${existingNotes}; ${prefNotes}`
+              : prefNotes;
+
+            itemsArr[chosenIndex] = {
+              ...targetItem,
+              notes: newNotes,
+            };
+
+            const { error: updErr } = await supa
+              .from("orders")
+              .update({ items: itemsArr })
+              .eq("id", activeOrderId);
+
+            if (updErr) {
+              console.warn(
+                "[WABA][preference_update save err]",
+                updErr.message
+              );
+
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                orgId: org.id,
+                text: "👍 Got your preference. The store will review it with your order.",
+              });
+
+              await logFlowEvent({
+                orgId: org.id,
+                from,
+                event: "preference_note_save_failed",
+                msgId,
+                orderId: activeOrderId,
+                text,
+                result,
+              });
+
+              continue;
+            }
+
+            const itemName =
+              targetItem.canonical || targetItem.name || "that item";
+
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              orgId: org.id,
+              text: `👍 Got it — we’ll make your ${itemName} ${prefNotes}.`,
+            });
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "preference_note_attached",
+              msgId,
+              orderId: activeOrderId,
+              text,
+              result: {
+                prefCanonical,
+                prefNotes,
+                updatedIndex: chosenIndex,
+              },
+            });
+
+            // IMPORTANT: do NOT treat this as a fresh order below
+            continue;
+          }
+
+          //   if (!org.auto_reply_enabled) continue;
 
           const unmatchedOnly = extractCatalogUnmatchedOnly(result.reason);
 
@@ -3289,23 +2393,68 @@ waba.post("/", async (req, res) => {
               ? String(inquiryRaw).toLowerCase()
               : null;
 
+            // keep these in this scope so we can use them everywhere in this block
             const menuRegex =
               /\b(menu|price list|pricelist|rate card|ratecard|services list|service menu)\b/i;
             const looksLikeMenu = menuRegex.test(lowerText);
 
-            // 3a) MENU / RATE CARD / PRICE LIST
-            if (inquiryType === "menu" || looksLikeMenu) {
+            // Quick special case: delivery time questions
+            if (
+              /deliver|delivery time|how much time.*deliver/i.test(lowerText)
+            ) {
+              reply =
+                "⏱️ Delivery time depends on your area and current orders. The store will confirm an approximate time.";
+            }
+
+            // (A) --- MENU FLOW ---
+            else if (inquiryType === "menu" || looksLikeMenu) {
               const menuText = await buildMenuReply({
                 org_id: org.id,
                 text,
                 businessType: normalizeBusinessType(org.primary_business_type),
               });
 
-              reply =
+              const fallbackText =
                 menuText ||
                 "📋 Our menu / price list changes often. We’ll share the latest options with you shortly.";
-            } else {
-              // 3b) Normal smart inquiry (price / availability / etc.)
+
+              const menuImageUrl = (org as any).wa_menu_image_url as
+                | string
+                | null;
+              const menuCaption = (org as any).wa_menu_caption as string | null;
+
+              if (menuImageUrl) {
+                // Send menu image + caption
+                await sendWabaText({
+                  phoneNumberId,
+                  to: from,
+                  orgId: org.id,
+                  image: menuImageUrl,
+                  caption: menuCaption || fallbackText,
+                });
+
+                await logFlowEvent({
+                  orgId: org.id,
+                  from,
+                  event: "menu_image_sent",
+                  msgId,
+                  text,
+                  result: {
+                    image: menuImageUrl,
+                    caption: menuCaption || fallbackText,
+                  },
+                });
+
+                // We already replied with the image
+                reply = null;
+              } else {
+                // No image configured → text-only menu
+                reply = fallbackText;
+              }
+            }
+
+            // (B) --- SMART INQUIRY FLOW (price / availability / generic) ---
+            else {
               reply = await buildSmartInquiryReply({
                 org_id: org.id,
                 text,
@@ -3352,6 +2501,16 @@ waba.post("/", async (req, res) => {
           ) {
             reply = null;
           }
+
+          // 5.5) If there is an active order and user text looks like "add more"
+          // but parser didn't recognise it as a proper order,
+          // guide them instead of sending a generic greeting.
+          if (!reply && activeOrderId && looksLikeAddToExisting(text)) {
+            reply =
+              "👍 Got it — you want to add more items to your current order.\n" +
+              "Please send the new items and quantities in one message";
+          }
+
           // 6) Final fail-soft ack (safe + generic + commands)
           if (!reply) {
             const phoneKey = normalizePhoneForKey(from);
@@ -3365,9 +2524,6 @@ waba.post("/", async (req, res) => {
               // short messages like "hi", "ok", "thanks"
               if (activeOrderId) {
                 // 🔇 After an order is already active: don't spam another intro
-                console.log(
-                  "[WABA][AUTO-REPLY] greeting_ack with active order → no reply"
-                );
                 reply = null; // no WhatsApp message
               } else {
                 // First-time greeting (no active order) → behave like intro
@@ -3435,83 +2591,6 @@ waba.post("/", async (req, res) => {
 });
 
 // Log inbound-only message (when auto-reply is OFF for this customer)
-async function logInboundMessageToInbox(opts: {
-  orgId: string;
-  from: string; // customer phone (raw)
-  text: string;
-  msgId?: string;
-}) {
-  try {
-    const { orgId, from, text } = opts;
-    const phonePlain = normalizePhoneForKey(from); // digits only
-    const phonePlus = phonePlain ? `+${phonePlain}` : "";
-    // Find existing conversation by phone
-    const { data: conv1 } = await supa
-      .from("conversations")
-      .select("id")
-      .eq("org_id", orgId)
-      .eq("customer_phone", phonePlain)
-      .limit(1)
-      .maybeSingle();
-
-    let conversationId = conv1?.id || null;
-
-    if (!conversationId) {
-      const { data: conv2 } = await supa
-        .from("conversations")
-        .select("id")
-        .eq("org_id", orgId)
-        .eq("customer_phone", phonePlus)
-        .limit(1)
-        .maybeSingle();
-      conversationId = conv2?.id || null;
-    }
-    // If still nothing, create a new conversation row
-    if (!conversationId) {
-      const { data: inserted, error: convErr } = await supa
-        .from("conversations")
-        .insert({
-          org_id: orgId,
-          customer_phone: phonePlain,
-          customer_name: null,
-          source: "waba",
-          last_message_at: new Date().toISOString(),
-          last_message_preview: text.slice(0, 120),
-        })
-        .select("id")
-        .single();
-
-      if (convErr) {
-        console.warn("[INBOX][inbound conv insert err]", convErr.message);
-        return;
-      }
-      conversationId = inserted.id;
-    } else {
-      // bump preview if conv exists
-      await supa
-        .from("conversations")
-        .update({
-          last_message_at: new Date().toISOString(),
-          last_message_preview: text.slice(0, 120),
-        })
-        .eq("id", conversationId)
-        .eq("org_id", orgId);
-    }
-
-    // Insert inbound message row
-    await supa.from("messages").insert({
-      org_id: orgId,
-      conversation_id: conversationId,
-      direction: "in",
-      sender_type: "customer",
-      channel: "waba",
-      body: text,
-      wa_msg_id: opts.msgId || null,
-    });
-  } catch (e: any) {
-    console.warn("[INBOX][inbound log err]", e?.message || e);
-  }
-}
 
 // ─────────────────────────────
 // Send via Cloud API + log to inbox
@@ -3570,13 +2649,6 @@ async function sendWabaText(opts: {
         },
       }
     );
-
-    console.log("[WABA][SEND]", {
-      to: toNorm,
-      type: opts.image ? "image" : "text",
-      text: opts.text,
-      image: opts.image,
-    });
 
     // ------------------------------------------------
     // FLOW LOG (unchanged)

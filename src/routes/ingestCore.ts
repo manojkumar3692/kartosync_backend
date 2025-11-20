@@ -222,7 +222,7 @@ async function validateItemsAgainstCatalog(
 
     return { matched, unmatched };
   } catch (e: any) {
-    console.warn("[INGEST][catalog_check] unexpected err", e?.message || e);
+    console.warn("[INGEST][catalog_check] unexpected err]", e?.message || e);
     return null;
   }
 }
@@ -403,7 +403,7 @@ async function findOrderByMsgId(
     if (!error && data && data[0]) return data[0];
   } catch (e: any) {
     console.warn(
-      "[INGEST][findOrderByMsgId] column path failed, trying legacy like()",
+      "[INGEST][findOrderByMsgId] column path failed, trying legacy like()]",
       e?.message || e
     );
   }
@@ -538,7 +538,6 @@ async function enrichWithPrefs(
   return { items: out, applied };
 }
 
-
 // ───────────────── SMART PRODUCT ROUTER (Layer 6) ─────────────────
 // Uses AI router to:
 //  - resolve synonyms → canonical product
@@ -567,10 +566,7 @@ async function hydrateProductsWithRouter(
         rawName: label,
       });
     } catch (e: any) {
-      console.warn(
-        "[INGEST][product_router call warn]",
-        e?.message || e
-      );
+      console.warn("[INGEST][product_router call warn]", e?.message || e);
       out.push(base);
       continue;
     }
@@ -580,8 +576,9 @@ async function hydrateProductsWithRouter(
       continue;
     }
 
-    const candidateName =
-      String(routed.display_name || routed.canonical || "").trim();
+    const candidateName = String(
+      routed.display_name || routed.canonical || ""
+    ).trim();
     if (!candidateName) {
       out.push(base);
       continue;
@@ -596,13 +593,65 @@ async function hydrateProductsWithRouter(
       continue;
     }
 
+    // ──────────────────────────────────────
+    // NEW: variant ambiguity guard
+    // If multiple variants exist for this canonical and user text
+    // does NOT mention any of them, DO NOT auto-pick variant/product_id.
+    // ──────────────────────────────────────
+    let routedProductId: string | null = routed.product_id ?? null;
+    let routedVariant: string | null = routed.variant
+      ? String(routed.variant)
+      : null;
+
+    if (routed.canonical && routedProductId) {
+      try {
+        const { data: siblings, error: siblingsErr } = await supa
+          .from("products")
+          .select("id, variant")
+          .eq("org_id", orgId)
+          .eq("canonical", routed.canonical);
+
+        if (!siblingsErr && siblings && siblings.length) {
+          const variants = new Set(
+            siblings
+              .map((s: any) =>
+                String(s.variant || "").toLowerCase().trim()
+              )
+              .filter(Boolean)
+          );
+
+          if (variants.size > 1) {
+            const labelLower = label.toLowerCase();
+            const mentionsVariant = Array.from(variants).some(
+              (v) => v && labelLower.includes(v)
+            );
+
+            // Example:
+            //  - products: "regular", "boneless"
+            //  - text: "mutton biriyani"
+            // → variants.size = 2, mentionsVariant = false
+            // → keep canonical but drop variant + product_id
+            if (!mentionsVariant) {
+              routedProductId = null;
+              routedVariant = null;
+            }
+          }
+        }
+      } catch (e: any) {
+        console.warn(
+          "[INGEST][product_router variant_ambiguity warn]",
+          e?.message || e
+        );
+      }
+    }
+
     // Build updated item, but never destroy explicit user inputs
     const updated = { ...base };
 
     let changed = false;
 
-    if (routed.product_id && !updated.product_id) {
-      (updated as any).product_id = routed.product_id;
+    if (routedProductId && !updated.product_id) {
+      (updated as any).product_id = routedProductId;
       changed = true;
     }
 
@@ -621,8 +670,8 @@ async function hydrateProductsWithRouter(
       changed = true;
     }
 
-    if (!updated.variant && routed.variant) {
-      updated.variant = routed.variant;
+    if (!updated.variant && routedVariant) {
+      updated.variant = routedVariant;
       changed = true;
     }
 
@@ -1083,6 +1132,49 @@ export async function ingestCoreFromMessage(
       };
     }
 
+        // ─────────────────────────────
+    // 6b) ADDRESS UPDATE (handle in WABA, not as order)
+    // ─────────────────────────────
+    if (nlu.intent === "address_update") {
+      // We DON'T create/append any order here.
+      // WABA will see this and update the address on the last open order / customer profile.
+      return {
+        ok: true,
+        stored: false,
+        kind: "none",
+        used: "none",
+        reason: "nlu:address_update",
+      };
+    }
+
+    // ─────────────────────────────
+    // 6c) ORDER CORRECTION / MODIFIER (Option C)
+    // ─────────────────────────────
+    if (nlu.intent === "order_correction" || nlu.intent === "modifier") {
+      // Example texts:
+      //  - "make biriyani spicy"
+      //  - "only boneless"
+      //  - "remove coke"
+      //
+      // We don't touch DB here. We just tell the caller:
+      //   "this is a modifier-type message"
+      // and WABA will adjust the last order (change qty, notes, remove item, etc.).
+      return {
+        ok: true,
+        stored: false,
+        kind: "modifier",       // 🔴 you'll add this to IngestResult.kind union
+        used: "none",
+        reason: `nlu:${nlu.intent}`,
+      };
+    }
+
+    // ─────────────────────────────
+    // 7) ORDER INTENT → continue to AI/rule pipeline
+    // ─────────────────────────────
+    if (nlu.intent === "order") {
+      console.log("[NLU] intent=order → continue with parse pipeline");
+    }
+
     // ─────────────────────────────
     // 7) ORDER INTENT → continue to AI/rule pipeline
     // ─────────────────────────────
@@ -1311,7 +1403,7 @@ export async function ingestCoreFromMessage(
       console.warn("[INGEST][prefs_enrich warn]", e?.message || e);
     }
 
-        // ⬇️ LAYER 6: product router (synonyms / aliases → canonical product)
+    // ⬇️ LAYER 6: product router (synonyms / aliases → canonical product)
     // This is where "panner biriyani" can be snapped to the right menu item,
     // as long as token overlap is strong.
     try {
@@ -1324,9 +1416,6 @@ export async function ingestCoreFromMessage(
     } catch (e: any) {
       console.warn("[INGEST][product_router warn]", e?.message || e);
     }
-
-
-    // ⬆️ INSERTION POINT: right after items exist, before append/new decision.
 
     // ⛑ SAFETY NET:
     // If, after AI + rules + list fallback + qty fallback + prefs enrich,
@@ -1362,11 +1451,10 @@ export async function ingestCoreFromMessage(
         // do NOT create/append any order.
         if (!matched.length && unmatched.length) {
           const missingNames = unmatched
-          .map((it) => trim(it.name || it.canonical || ""))
-          .filter(Boolean);
+            .map((it) => trim(it.name || it.canonical || ""))
+            .filter(Boolean);
 
-          const tag =
-            "catalog_unmatched_only:" + missingNames.join("|");
+          const tag = "catalog_unmatched_only:" + missingNames.join("|");
 
           console.log("[INGEST][core][catalog_unmatched_only]", {
             orgId,
@@ -1377,7 +1465,7 @@ export async function ingestCoreFromMessage(
             ok: true,
             stored: false,
             kind: "inquiry",
-            used: "inquiry",                  // <- fixed
+            used: "inquiry",
             order_id: undefined,
             inquiry: "availability", // InquiryKind
             inquiry_type: "availability",

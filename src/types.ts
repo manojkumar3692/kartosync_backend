@@ -57,7 +57,7 @@ type IngestCommon = {
   // Generic inquiry fields (string-level)
   inquiry?: string;
   inquiry_type?: string;
-  inquiry_canonical?: string;  // ✅ add this
+  inquiry_canonical?: string;
 
   // Backend can send a reply such as price, availability, etc.
   reply?: string;
@@ -91,10 +91,10 @@ export type IngestInquiry = IngestCommon & {
   reply?: string;
   reason?: string;
 
-  // 🔥 NEW: what waba.ts needs (narrowed to InquiryKind)
-  inquiry?: InquiryKind;          // "availability" | "price" | etc.
-  inquiry_type?: InquiryKind;     // same, for backwards-compat
-  inquiry_canonical?: string;     // e.g. "Chicken Biryani Today"
+  // 🔥 What waba.ts needs (narrowed to InquiryKind)
+  inquiry?: InquiryKind;       // "availability" | "price"
+  inquiry_type?: InquiryKind;  // same, for backwards-compat
+  inquiry_canonical?: string;  // e.g. "Chicken Biryani Today"
 };
 
 type IngestNone = IngestCommon & {
@@ -103,11 +103,20 @@ type IngestNone = IngestCommon & {
   stored: false;
 };
 
+// 🔹 NEW: Modifier result for Option C
+// "This message is a correction / modifier, let WABA update the order"
+type IngestModifier = IngestCommon & {
+  ok: true;
+  kind: "modifier";
+  stored: false;
+};
+
 export type IngestResult =
   | IngestError
   | IngestOrder
   | IngestInquiry
-  | IngestNone;
+  | IngestNone
+  | IngestModifier;
 
 export type IngestInput = {
   org_id: string;

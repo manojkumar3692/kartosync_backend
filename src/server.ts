@@ -55,7 +55,7 @@ app.options('*', cors());
 // Global request logger (top of chain)
 // ─────────────────────────────
 app.use((req, _res, next) => {
-  console.log('[SERVER HIT]', req.method, req.originalUrl);
+  // console.log('[SERVER HIT]', req.method, req.originalUrl);
   next();
 });
 

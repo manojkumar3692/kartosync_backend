@@ -8,18 +8,22 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 // ─────────────────────────────
 export type NLUIntent =
   | "order"
+  | "other"
+  | "order_correction"
+  | "modifier"
+  | "address_update"
+  | "cancel_request"
+  | "greeting"
+  | "smalltalk"
+  | "complaint"
   | "price_inquiry"
   | "availability_inquiry"
-  | "menu_inquiry"
-  | "greeting"
-  | "complaint"
-  | "smalltalk"
-  | "other";
+  | "menu_inquiry";
 
 export type NLUResult = {
   intent: NLUIntent;
   confidence: number;
-  canonical?: string | null;   // optional normalized product/item
+  canonical?: string | null;
 };
 
 // ─────────────────────────────
