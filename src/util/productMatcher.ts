@@ -1,53 +1,120 @@
 import { supa } from "../db";
 import Fuse from "fuse.js";
 
-export async function findBestProductForTextV2(org_id: string, text: string) {
-  const clean = text.toLowerCase();
+// ─────────────────────────────────────────────
+// Generic helpers (no domain hardcoding)
+// ─────────────────────────────────────────────
 
-  // 1) Load org business type
+function normalize(text: any): string {
+  if (!text) return "";
+  return String(text)
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenize(text: string): string[] {
+  if (!text) return [];
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/i)
+    .filter(Boolean);
+}
+
+export async function findBestProductForTextV2(
+  org_id: string,
+  text: string
+) {
+  const clean = normalize(text);
+  if (!clean) return null;
+
+  const queryTokens = tokenize(clean);
+
+  // 1) Load org business type (same as your original)
   const { data: orgData } = await supa
     .from("orgs")
     .select("business_type")
     .eq("id", org_id)
     .single();
 
-  const businessType = orgData?.business_type || "grocery";
+  const businessType: string = orgData?.business_type || "grocery";
 
-  // 2) Load all products for org
-  const { data: products } = await supa
+  // 2) Load all active products for this org
+  const { data: products, error: productsErr } = await supa
     .from("products")
     .select("*")
     .eq("org_id", org_id)
     .eq("active", true);
 
+  if (productsErr) {
+    console.warn("[productMatcher] products error", productsErr.message);
+  }
+
   if (!products || products.length === 0) return null;
 
-  // 3) Strong match: find canonical name in text
-  const directMatch = products.find((p) =>
-    clean.includes(p.canonical.toLowerCase())
-  );
+  // 3) Strong direct match: canonical/display_name fully inside text
+  const directMatch = (products as any[]).find((p) => {
+    const canonNorm = normalize(p.canonical);
+    const displayNorm = normalize(p.display_name);
+
+    if (canonNorm && clean.includes(canonNorm)) return true;
+    if (displayNorm && clean.includes(displayNorm)) return true;
+    return false;
+  });
+
   if (directMatch) return directMatch;
 
-  // 4) Business-Type Boost
-  let scored = products.map((p) => {
+  // 4) Generic scoring: token overlap + your businessType boosts
+  const scored = (products as any[]).map((p) => {
     let score = 0;
 
-    const canon = p.canonical.toLowerCase();
+    const canonNorm = normalize(p.canonical);
+    const displayNorm = normalize(p.display_name);
+    const categoryNorm = normalize(p.category);
+    const unitNorm = normalize(p.unit || p.base_unit); // support both names
+    const productTypeNorm = normalize(p.product_type);
 
-    // Simple substring
-    if (clean.includes(canon)) score += 50;
+    // Combine name fields into one search string
+    const nameCombined = [canonNorm, displayNorm].filter(Boolean).join(" ");
+    const nameTokens = tokenize(nameCombined);
 
-    // Category boost (restaurants: main course, starters, etc.)
-    if (p.category && clean.includes(p.category.toLowerCase())) score += 20;
+    // 4a) Token overlap (generic – works for any vertical)
+    if (nameTokens.length && queryTokens.length) {
+      const qSet = new Set(queryTokens);
+      let overlapCount = 0;
+      for (const t of nameTokens) {
+        if (qSet.has(t)) overlapCount++;
+      }
+      if (overlapCount > 0) {
+        score += overlapCount * 12; // each matching token gives weight
+      }
+    }
 
-    // Unit boost
-    if (p.unit && clean.includes(p.unit.toLowerCase())) score += 10;
+    // 4b) Simple substring matches (after normalization)
+    if (canonNorm && clean.includes(canonNorm)) score += 40;
+    if (displayNorm && clean.includes(displayNorm)) score += 30;
 
-    // Business-Type weight
-    if (businessType === "restaurant" && p.unit === "plate") score += 30;
-    if (businessType === "salon" && p.product_type === "service") score += 40;
-    if (businessType === "meat" && p.category?.includes("Chicken")) score += 20;
-    if (businessType === "grocery") score += 10;
+    // 4c) Category & unit hints (still fully generic)
+    if (categoryNorm && clean.includes(categoryNorm)) score += 15;
+    if (unitNorm && clean.includes(unitNorm)) score += 10;
+
+    // 4d) Light businessType-based weights (from your original logic)
+    if (businessType === "restaurant" && unitNorm === "plate") {
+      score += 30;
+    }
+    if (businessType === "salon" && productTypeNorm === "service") {
+      score += 40;
+    }
+    if (
+      businessType === "meat" &&
+      categoryNorm &&
+      categoryNorm.includes("chicken")
+    ) {
+      score += 20;
+    }
+    if (businessType === "grocery") {
+      score += 10;
+    }
 
     return { p, score };
   });
@@ -55,12 +122,21 @@ export async function findBestProductForTextV2(org_id: string, text: string) {
   scored.sort((a, b) => b.score - a.score);
   const best = scored[0];
 
-  if (best.score > 10) return best.p;
+  // Require minimum signal to trust this match
+  if (best && best.score > 10) {
+    return best.p;
+  }
 
-  // 5) Fuzzy fallback
-  const fuse = new Fuse(products, { keys: ["canonical"], threshold: 0.4 });
-  const fuzzy = fuse.search(clean);
-  if (fuzzy.length > 0) return fuzzy[0].item;
+  // 5) Fuzzy fallback (extended to display_name as well)
+  const fuse = new Fuse(products as any[], {
+    keys: ["canonical", "display_name"],
+    threshold: 0.4,
+  });
+
+  const fuzzy = fuse.search(clean || text || "");
+  if (fuzzy.length > 0) {
+    return fuzzy[0].item;
+  }
 
   return null;
 }

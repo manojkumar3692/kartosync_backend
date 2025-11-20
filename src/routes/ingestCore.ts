@@ -7,7 +7,7 @@ import {
   isPureGreetingOrAck,
   isNotOrderMessage,
 } from "../util/notOrder";
-
+import { routeProductText } from "../ai/productRouter";
 import {
   IngestInput,
   IngestResult,
@@ -18,7 +18,7 @@ import {
 import { decideLinking } from "./ingestCore/linking"; // ⬅️ linking decision (append vs new)
 import { findBestProductForTextV2 } from "../util/productMatcher";
 import { formatInquiryReply } from "../util/inquiryReply"; // NEW
-
+import { classifyMessage, NLUResult } from "../ai/nlu";
 // ─────────────────────────────────────────────────────────
 // Optional AI parser hook (safe if missing → rules fallback)
 // ─────────────────────────────────────────────────────────
@@ -125,7 +125,6 @@ function splitAndCleanLines(textRaw: string): string[] {
     .filter(Boolean);
 }
 
-
 // Simple token overlap between query and product name
 function hasStrongTokenOverlap(query: string, candidate: string): boolean {
   const norm = (s: string) =>
@@ -150,6 +149,81 @@ function hasStrongTokenOverlap(query: string, candidate: string): boolean {
     return overlapCount >= 2;
   } else {
     return overlapCount >= 1;
+  }
+}
+
+// ─────────────────────────────────────────
+// Layer 2: Catalog sanity check
+// ─────────────────────────────────────────
+
+type CatalogCheckResult = {
+  matched: IngestItem[];
+  unmatched: IngestItem[];
+};
+
+/**
+ * Check each parsed item against the org's product catalog.
+ *
+ * - Uses simple token overlap on canonical/name vs product display_name/canonical.
+ * - If products table is empty or query fails → returns null (no blocking).
+ * - We only *tag* unmatched items; we don't block orders in this layer.
+ */
+async function validateItemsAgainstCatalog(
+  orgId: string,
+  items: IngestItem[]
+): Promise<CatalogCheckResult | null> {
+  try {
+    if (!items || !items.length) return null;
+
+    const { data, error } = await supa
+      .from("products")
+      .select("id, canonical, display_name")
+      .eq("org_id", orgId);
+
+    if (error) {
+      console.warn("[INGEST][catalog_check] products err", error.message);
+      return null;
+    }
+    if (!data || !data.length) {
+      // No catalog configured for this org → don't enforce anything
+      return null;
+    }
+
+    const products = data as any[];
+
+    const matched: IngestItem[] = [];
+    const unmatched: IngestItem[] = [];
+
+    for (const it of items) {
+      const label = trim(it.canonical || it.name || "");
+      if (!label) {
+        // no name → don't mark as unmatched, just let it flow
+        matched.push(it);
+        continue;
+      }
+
+      let found = false;
+      for (const p of products) {
+        const pName = trim(p.display_name || p.canonical || "");
+        if (!pName) continue;
+
+        if (hasStrongTokenOverlap(label, pName)) {
+          found = true;
+          break;
+        }
+      }
+
+      if (found) {
+        matched.push(it);
+      } else {
+        unmatched.push(it);
+      }
+    }
+
+    return { matched, unmatched };
+  } catch (e: any) {
+    console.warn("[INGEST][catalog_check] unexpected err", e?.message || e);
+    return null;
   }
 }
 
@@ -460,6 +534,106 @@ async function enrichWithPrefs(
 
     out.push(base);
   }
+
+  return { items: out, applied };
+}
+
+
+// ───────────────── SMART PRODUCT ROUTER (Layer 6) ─────────────────
+// Uses AI router to:
+//  - resolve synonyms → canonical product
+//  - attach product_id / unit / variant when safe
+//  - but only when overlap with user text is strong
+async function hydrateProductsWithRouter(
+  orgId: string,
+  items: any[]
+): Promise<{ items: any[]; applied: number }> {
+  const out: any[] = [];
+  let applied = 0;
+
+  for (const it of items || []) {
+    const base = { ...it };
+
+    const label = trim(base.canonical || base.name || "");
+    if (!label) {
+      out.push(base);
+      continue;
+    }
+
+    let routed: any = null;
+    try {
+      routed = await routeProductText({
+        org_id: orgId,
+        rawName: label,
+      });
+    } catch (e: any) {
+      console.warn(
+        "[INGEST][product_router call warn]",
+        e?.message || e
+      );
+      out.push(base);
+      continue;
+    }
+
+    if (!routed || !routed.canonical) {
+      out.push(base);
+      continue;
+    }
+
+    const candidateName =
+      String(routed.display_name || routed.canonical || "").trim();
+    if (!candidateName) {
+      out.push(base);
+      continue;
+    }
+
+    // Safety: only trust router if text tokens overlap strongly
+    const strongOverlap = hasStrongTokenOverlap(label, candidateName);
+
+    if (!strongOverlap) {
+      // Ex: user: "paneer biryani" vs product: "chicken biryani" → reject
+      out.push(base);
+      continue;
+    }
+
+    // Build updated item, but never destroy explicit user inputs
+    const updated = { ...base };
+
+    let changed = false;
+
+    if (routed.product_id && !updated.product_id) {
+      (updated as any).product_id = routed.product_id;
+      changed = true;
+    }
+
+    if (!updated.canonical && routed.canonical) {
+      updated.canonical = routed.canonical;
+      changed = true;
+    }
+
+    if (!updated.name && routed.display_name) {
+      updated.name = routed.display_name;
+      changed = true;
+    }
+
+    if (!updated.unit && routed.base_unit) {
+      updated.unit = routed.base_unit;
+      changed = true;
+    }
+
+    if (!updated.variant && routed.variant) {
+      updated.variant = routed.variant;
+      changed = true;
+    }
+
+    if (changed) applied++;
+    out.push(updated);
+  }
+
+  console.log("[L6][product_router] applied=", applied, {
+    inCount: (items || []).length,
+    outSample: out.slice(0, 3),
+  });
 
   return { items: out, applied };
 }
@@ -805,6 +979,119 @@ export async function ingestCoreFromMessage(
     }
 
     // ─────────────────────────────────────────
+    // LAYER 1: NLU ROUTER (INTENT FIRST)
+    // ─────────────────────────────────────────
+    let nlu: NLUResult | null = null;
+
+    try {
+      nlu = await classifyMessage(textRaw);
+      console.log("[NLU]", nlu);
+    } catch (e) {
+      console.warn("[NLU error]", e);
+    }
+
+    // SAFETY: default
+    nlu = nlu || { intent: "other", confidence: 0, canonical: null };
+
+    // ─────────────────────────────
+    // 1) GREETING → no order
+    // ─────────────────────────────
+    if (nlu.intent === "greeting") {
+      return {
+        ok: true,
+        stored: false,
+        kind: "none",
+        used: "none",
+        reason: "nlu:greeting",
+      };
+    }
+
+    // ─────────────────────────────
+    // 2) SMALLTALK → ignore
+    // ─────────────────────────────
+    if (nlu.intent === "smalltalk") {
+      return {
+        ok: true,
+        stored: false,
+        kind: "none",
+        used: "none",
+        reason: "nlu:smalltalk",
+      };
+    }
+
+    // ─────────────────────────────
+    // 3) COMPLAINT (store as none)
+    // ─────────────────────────────
+    if (nlu.intent === "complaint") {
+      return {
+        ok: true,
+        stored: false,
+        kind: "none",
+        used: "none",
+        reason: "nlu:complaint",
+      };
+    }
+
+    // ─────────────────────────────
+    // 4) MENU INQUIRY
+    // ─────────────────────────────
+    if (nlu.intent === "menu_inquiry") {
+      return {
+        ok: true,
+        stored: false,
+        kind: "inquiry",
+        used: "inquiry",
+        inquiry: "availability",
+        inquiry_type: "availability",
+        inquiry_canonical: "menu",
+        reply: "Here is the menu 👇\n(Your business can auto-fill this)",
+        reason: "nlu:menu_inquiry",
+      };
+    }
+
+    // ─────────────────────────────
+    // 5) PRICE INQUIRY
+    // ─────────────────────────────
+    if (nlu.intent === "price_inquiry") {
+      return {
+        ok: true,
+        stored: false,
+        kind: "inquiry",
+        used: "inquiry",
+        inquiry: "price",
+        inquiry_type: "price",
+        inquiry_canonical: nlu.canonical || "",
+        reply: "Let me check the price…",
+        reason: "nlu:price_inquiry",
+      };
+    }
+
+    // ─────────────────────────────
+    // 6) AVAILABILITY INQUIRY
+    // ─────────────────────────────
+    if (nlu.intent === "availability_inquiry") {
+      return {
+        ok: true,
+        stored: false,
+        kind: "inquiry",
+        used: "inquiry",
+        inquiry: "availability",
+        inquiry_type: "availability",
+        inquiry_canonical: nlu.canonical || "",
+        reply: "Let me check availability…",
+        reason: "nlu:availability_inquiry",
+      };
+    }
+
+    // ─────────────────────────────
+    // 7) ORDER INTENT → continue to AI/rule pipeline
+    // ─────────────────────────────
+    if (nlu.intent === "order") {
+      console.log("[NLU] intent=order → continue with parse pipeline");
+    }
+    // ─────────────────────────────────────────
+
+    // ─────────────────────────────────────────
     // [INBOX] Record inbound message for unified view
     // ─────────────────────────────────────────
     await upsertConversationAndInboundMessage({
@@ -878,184 +1165,263 @@ export async function ingestCoreFromMessage(
       }
     }
 
-        // Let AI hint that this is an inquiry even if our regex misses slang
-        const aiTaggedInquiry =
-        typeof parsed.reason === "string" &&
-        /^inq:/.test(parsed.reason.toLowerCase());
-  
-      // Only treat as "inquiry" when the text clearly looks like a question
-      // (we now support both "do you have" and "do u have"/"hv", etc.)
-      const looksLikeQuestion =
-        /(\?|do you have|do u have|have stock|in stock|available|availability|price|rate|how much|stock)/i.test(
-          textFlat
-        ) ||
-        /\b(can i get|can i have|is there|you have|u have)\b/i.test(textFlat);
-  
-      // 🔍 Diagnostic log — extremely helpful
-      console.log("[INGEST][core][inquiry-guard-check]", {
-        text: textFlat,
-        parsedItems: parsed.items?.length || 0,
-        hasListShape,
-        looksLikeQuestion,
-        aiTaggedInquiry,
-        parsedReason: parsed.reason,
-      });
-  
+    // Let AI hint that this is an inquiry even if our regex misses slang
+    const aiTaggedInquiry =
+      typeof parsed.reason === "string" &&
+      /^inq:/.test(parsed.reason.toLowerCase());
+
+    // Only treat as "inquiry" when the text clearly looks like a question
+    // (we now support both "do you have" and "do u have"/"hv", etc.)
+    const looksLikeQuestion =
+      /(\?|do you have|do u have|have stock|in stock|available|availability|price|rate|how much|stock)/i.test(
+        textFlat
+      ) ||
+      /\b(can i get|can i have|is there|you have|u have)\b/i.test(textFlat);
+
+    // 🔍 Diagnostic log — extremely helpful
+    console.log("[INGEST][core][inquiry-guard-check]", {
+      text: textFlat,
+      parsedItems: parsed.items?.length || 0,
+      hasListShape,
+      looksLikeQuestion,
+      aiTaggedInquiry,
+      parsedReason: parsed.reason,
+    });
+
+    if (
+      (!parsed.items || parsed.items.length === 0) &&
+      !hasListShape &&
+      (looksLikeQuestion || aiTaggedInquiry)
+    ) {
+      console.log("[INGEST][core] → considering inquiry detection");
+
+      // Small helper type for what detectInquiry returns
+      type DetectedInquiry = {
+        kind: InquiryKind; // "availability" | "price" | etc.
+        canonical: string;
+        confidence?: number;
+      };
+
+      let detected: DetectedInquiry | null = null;
+
+      // 1️⃣ Try to derive inquiry directly from AI reason, e.g.
+      //    "inq:availability:Paneer Biryani" or "inq:price:onion"
       if (
-        (!parsed.items || parsed.items.length === 0) &&
-        !hasListShape &&
-        (looksLikeQuestion || aiTaggedInquiry)
+        typeof parsed.reason === "string" &&
+        /^inq:/.test(parsed.reason.toLowerCase())
       ) {
-        console.log("[INGEST][core] → considering inquiry detection");
-  
-        // Small helper type for what detectInquiry returns
-        type DetectedInquiry = {
-          kind: InquiryKind;      // "availability" | "price" | etc.
-          canonical: string;
-          confidence?: number;
-        };
-  
-        let detected: DetectedInquiry | null = null;
-  
-        // 1️⃣ Try to derive inquiry directly from AI reason, e.g.
-        //    "inq:availability:Paneer Biryani" or "inq:price:onion"
-        if (
-          typeof parsed.reason === "string" &&
-          /^inq:/.test(parsed.reason.toLowerCase())
-        ) {
-          const m =
-            /^inq:(price|availability)(?::(.+))?/i.exec(parsed.reason) || null;
-          if (m) {
-            const kind = m[1].toLowerCase() as InquiryKind;
-            const canonical = (m[2] || "").trim() || textFlat;
-            detected = { kind, canonical, confidence: 0.9 };
-            console.log("[INGEST][core][inquiry-from-ai-reason]", detected);
-          }
+        const m =
+          /^inq:(price|availability)(?::(.+))?/i.exec(parsed.reason) || null;
+        if (m) {
+          const kind = m[1].toLowerCase() as InquiryKind;
+          const canonical = (m[2] || "").trim() || textFlat;
+          detected = { kind, canonical, confidence: 0.9 };
+          console.log("[INGEST][core][inquiry-from-ai-reason]", detected);
         }
-  
-        // 2️⃣ Fallback to regex-based detector if AI did not give us a clean hint
-        if (!detected) {
-          const d = detectInquiry(textFlat) as any;
-          if (d && d.kind && d.canonical) {
-            detected = {
-              kind: d.kind as InquiryKind,
-              canonical: d.canonical,
-              confidence: d.confidence,
-            };
-          }
-        }
-  
-        console.log("[INGEST][core][detectInquiry]", detected);
-  
-        if (detected) {
-          const base: IngestResult = {
-            ok: true,
-            kind: "inquiry",
-            used: "inquiry",
-            stored: false,
-            order_id: undefined,
-  
-            // 🔥 These match your IngestInquiry type exactly:
-            inquiry: detected.kind,              // InquiryKind
-            inquiry_type: detected.kind,         // backwards compatibility
-            inquiry_canonical: detected.canonical,
-          };
-  
-          let matched: any = null;
-          try {
-            matched = await findBestProductForTextV2(orgId, detected.canonical);
-            console.log("[INGEST][core][inquiry-match-success]", matched);
-          } catch (e: any) {
-            console.log(
-              "[INGEST][core][inquiry-match-error]",
-              e?.message || e
-            );
-          }
-  
-          if (matched) {
-            // 🔍 Take the best product name we have
-            const candidateName = String(
-              matched.display_name || matched.canonical || ""
-            ).trim();
-        
-            const queryName = String(detected.canonical || "").trim();
-        
-            // If similarity is weak (e.g. "paneer biryani" vs "chicken biryani"),
-            // treat as NO MATCH → this will trigger inquiry_no_match + auto-pause.
-            const strongEnough = hasStrongTokenOverlap(queryName, candidateName);
-        
-            console.log("[INGEST][core][inquiry-match-overlap]", {
-              queryName,
-              candidateName,
-              strongEnough,
-            });
-        
-            if (strongEnough) {
-              return {
-                ...base,
-                reply: formatInquiryReply(matched, detected.kind),
-                reason: "inquiry_detected",
-              };
-            }
-        
-            // fall through to no-match below
-          }
-  
-          return {
-            ...base,
-            reply: `I could not find "${detected.canonical}". Please send exact product name.`,
-            reason: "inquiry_no_match",
+      }
+
+      // 2️⃣ Fallback to regex-based detector if AI did not give us a clean hint
+      if (!detected) {
+        const d = detectInquiry(textFlat) as any;
+        if (d && d.kind && d.canonical) {
+          detected = {
+            kind: d.kind as InquiryKind,
+            canonical: d.canonical,
+            confidence: d.confidence,
           };
         }
       }
 
-        // 8) ORDER path starts here
+      console.log("[INGEST][core][detectInquiry]", detected);
+
+      if (detected) {
+        const base: IngestResult = {
+          ok: true,
+          kind: "inquiry",
+          used: "inquiry",
+          stored: false,
+          order_id: undefined,
+
+          // 🔥 These match your IngestInquiry type exactly:
+          inquiry: detected.kind, // InquiryKind
+          inquiry_type: detected.kind, // backwards compatibility
+          inquiry_canonical: detected.canonical,
+        };
+
+        let matched: any = null;
+        try {
+          matched = await findBestProductForTextV2(orgId, detected.canonical);
+          console.log("[INGEST][core][inquiry-match-success]", matched);
+        } catch (e: any) {
+          console.log("[INGEST][core][inquiry-match-error]", e?.message || e);
+        }
+
+        if (matched) {
+          // 🔍 Take the best product name we have
+          const candidateName = String(
+            matched.display_name || matched.canonical || ""
+          ).trim();
+
+          const queryName = String(detected.canonical || "").trim();
+
+          // If similarity is weak (e.g. "paneer biryani" vs "chicken biryani"),
+          // treat as NO MATCH → this will trigger inquiry_no_match + auto-pause.
+          const strongEnough = hasStrongTokenOverlap(queryName, candidateName);
+
+          console.log("[INGEST][core][inquiry-match-overlap]", {
+            queryName,
+            candidateName,
+            strongEnough,
+          });
+
+          if (strongEnough) {
+            return {
+              ...base,
+              reply: formatInquiryReply(matched, detected.kind),
+              reason: "inquiry_detected",
+            };
+          }
+
+          // fall through to no-match below
+        }
+
+        return {
+          ...base,
+          reply: `I could not find "${detected.canonical}". Please send exact product name.`,
+          reason: "inquiry_no_match",
+        };
+      }
+    }
+
+    // 8) ORDER path starts here
 
     // ⬇️ NEW: BEFORE anything, hydrate brand/variant from prefs (auto-learned)
     // WHY: If we can resolve brand/variant, we want to avoid sending clarify at all.
     try {
-        const { items: hydrated, applied } = await enrichWithPrefs(
-          orgId,
-          phoneNorm,
-          parsed.items || []
-        );
-        if (applied > 0) {
-          parsed.items = hydrated;
-          parsed.reason = ((parsed.reason || "") + "; prefs_hydrated").trim();
-        }
-      } catch (e: any) {
-        console.warn("[INGEST][prefs_enrich warn]", e?.message || e);
+      const { items: hydrated, applied } = await enrichWithPrefs(
+        orgId,
+        phoneNorm,
+        parsed.items || []
+      );
+      if (applied > 0) {
+        parsed.items = hydrated;
+        parsed.reason = ((parsed.reason || "") + "; prefs_hydrated").trim();
       }
-      // ⬆️ INSERTION POINT: right after items exist, before append/new decision.
-  
-      // ⛑ SAFETY NET:
-      // If, after AI + rules + list fallback + qty fallback + prefs enrich,
-      // we STILL have no items, do NOT create or update an order.
-      if (!parsed.items || parsed.items.length === 0) {
-        console.log("[INGEST][core] no items after parse + enrich; treating as none", {
+    } catch (e: any) {
+      console.warn("[INGEST][prefs_enrich warn]", e?.message || e);
+    }
+
+        // ⬇️ LAYER 6: product router (synonyms / aliases → canonical product)
+    // This is where "panner biriyani" can be snapped to the right menu item,
+    // as long as token overlap is strong.
+    try {
+      const { items: routedItems, applied: prodApplied } =
+        await hydrateProductsWithRouter(orgId, parsed.items || []);
+      if (prodApplied > 0) {
+        parsed.items = routedItems;
+        parsed.reason = ((parsed.reason || "") + "; product_routed").trim();
+      }
+    } catch (e: any) {
+      console.warn("[INGEST][product_router warn]", e?.message || e);
+    }
+
+
+    // ⬆️ INSERTION POINT: right after items exist, before append/new decision.
+
+    // ⛑ SAFETY NET:
+    // If, after AI + rules + list fallback + qty fallback + prefs enrich,
+    // we STILL have no items, do NOT create or update an order.
+    if (!parsed.items || parsed.items.length === 0) {
+      console.log(
+        "[INGEST][core] no items after parse + enrich; treating as none",
+        {
           reason: parsed.reason || "—",
           text: textFlat,
-        });
-  
-        return {
-          ok: true,
-          stored: false,
-          kind: "none",
-          used: parsed.used,
-          reason: `no_items_after_parse:${parsed.reason || ""}`.trim(),
-        };
+        }
+      );
+
+      return {
+        ok: true,
+        stored: false,
+        kind: "none",
+        used: parsed.used,
+        reason: `no_items_after_parse:${parsed.reason || ""}`.trim(),
+      };
+    }
+
+    // ─────────────────────────────────────────
+    // LAYER 2: catalog sanity + "unmatched-only" guard
+    // ─────────────────────────────────────────
+    try {
+      const check = await validateItemsAgainstCatalog(orgId, parsed.items);
+      if (check) {
+        const matched = check.matched || [];
+        const unmatched = check.unmatched || [];
+
+        // 📌 CASE A: ALL items are unmatched → treat as availability inquiry,
+        // do NOT create/append any order.
+        if (!matched.length && unmatched.length) {
+          const missingNames = unmatched
+          .map((it) => trim(it.name || it.canonical || ""))
+          .filter(Boolean);
+
+          const tag =
+            "catalog_unmatched_only:" + missingNames.join("|");
+
+          console.log("[INGEST][core][catalog_unmatched_only]", {
+            orgId,
+            missingNames,
+          });
+
+          return {
+            ok: true,
+            stored: false,
+            kind: "inquiry",
+            used: "inquiry",                  // <- fixed
+            order_id: undefined,
+            inquiry: "availability", // InquiryKind
+            inquiry_type: "availability",
+            inquiry_canonical: missingNames[0] || "",
+            reason: tag,
+          };
+        }
+
+        // 📌 CASE B: Some matched, some unmatched → keep only matched in order
+        if (matched.length) {
+          parsed.items = matched;
+        }
+
+        // Tag the unmatched ones so WABA can show a ⚠️ line if it wants
+        if (unmatched.length) {
+          const missingNames = unmatched
+            .map((it) => trim(it.canonical || it.name || ""))
+            .filter(Boolean);
+
+          if (missingNames.length) {
+            const tag = `catalog_unmatched:${missingNames.join("|")}`;
+            parsed.reason = parsed.reason ? `${parsed.reason}; ${tag}` : tag;
+
+            console.log("[INGEST][core][catalog_unmatched]", {
+              orgId,
+              missingNames,
+            });
+          }
+        }
       }
-  
-      // Ignore seller-style money messages (heuristic)
-      if (/\b(aed|dirham|dh|dhs|price|₹|rs|\$)\b/i.test(textFlat)) {
-        return {
-          ok: true,
-          stored: false,
-          kind: "none",
-          used: parsed.used,
-          reason: "seller_money_message",
-        };
-      }
+    } catch (e: any) {
+      console.warn("[INGEST][core][catalog_tag warn]", e?.message || e);
+    }
+
+    // Ignore seller-style money messages (heuristic)
+    if (/\b(aed|dirham|dh|dhs|price|₹|rs|\$)\b/i.test(textFlat)) {
+      return {
+        ok: true,
+        stored: false,
+        kind: "none",
+        used: parsed.used,
+        reason: "seller_money_message",
+      };
+    }
 
     // If there is a recent inquiry and this isn't explicit confirmation, don't auto-place
     const recentInq = await findRecentInquiry(
@@ -1160,7 +1526,7 @@ export async function ingestCoreFromMessage(
       }
     }
 
-        // ─────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────
     // Forced append when caller passes active_order_id
     // (e.g., WABA knows there is an active pending order)
     // ─────────────────────────────────────────────────────────
@@ -1192,9 +1558,7 @@ export async function ingestCoreFromMessage(
           ].includes(status);
 
           if (matchesPhone && isOpen) {
-            const prevItems = Array.isArray(target.items)
-              ? target.items
-              : [];
+            const prevItems = Array.isArray(target.items) ? target.items : [];
             const newItems = [...prevItems, ...(parsed.items || [])];
 
             const { error: upErr } = await supa
@@ -1226,25 +1590,18 @@ export async function ingestCoreFromMessage(
                   p_variant: variant,
                   p_inc: 1,
                 });
-                if (eb)
-                  console.warn("[INGEST][core][bvs err]", eb.message);
+                if (eb) console.warn("[INGEST][core][bvs err]", eb.message);
                 if (phoneNorm) {
-                  const { error: ec } = await supa.rpc(
-                    "upsert_customer_pref",
-                    {
-                      p_org_id: orgId,
-                      p_phone: phoneNorm,
-                      p_canonical: canon,
-                      p_brand: brand,
-                      p_variant: variant,
-                      p_inc: 1,
-                    }
-                  );
+                  const { error: ec } = await supa.rpc("upsert_customer_pref", {
+                    p_org_id: orgId,
+                    p_phone: phoneNorm,
+                    p_canonical: canon,
+                    p_brand: brand,
+                    p_variant: variant,
+                    p_inc: 1,
+                  });
                   if (ec)
-                    console.warn(
-                      "[INGEST][core][custpref err]",
-                      ec.message
-                    );
+                    console.warn("[INGEST][core][custpref err]", ec.message);
                 }
               }
             } catch (e: any) {
@@ -1275,10 +1632,7 @@ export async function ingestCoreFromMessage(
           }
         }
       } catch (e: any) {
-        console.warn(
-          "[INGEST][core][forced_append warn]",
-          e?.message || e
-        );
+        console.warn("[INGEST][core][forced_append warn]", e?.message || e);
         // if anything fails, we simply fall through to normal append/new logic
       }
     }
