@@ -30,6 +30,7 @@ import {
 import { formatInquiryReply } from "../util/inquiryReply"; // NEW
 import { classifyMessage, NLUResult as CoreNluResult } from "../ai/nlu";
 import { fuzzyCharOverlapScore } from "../util/fuzzy"; // ⬅️ add at top
+import { getOrgMenuIndex, matchMenuItem } from "../menu/menuIndex";
 
 // ─────────────────────────────────────────────────────────
 // Optional AI parser hook (safe if missing → rules fallback)
@@ -203,6 +204,87 @@ function hasStrongTokenOverlap(query: string, candidate: string): boolean {
   }
 }
 
+async function validateAndAppendItemsWithMenu(options: {
+  org_id: string;
+  order_id: string;
+  phone: string;
+  items: any[]; // whatever aiParseOrder returns per item
+  sendWhatsAppText: (phone: string, msg: string) => Promise<void> | void;
+  appendItemsToOrder: (order_id: string, items: any[]) => Promise<void>;
+}) {
+  const {
+    org_id,
+    order_id,
+    phone,
+    items,
+    sendWhatsAppText,
+    appendItemsToOrder,
+  } = options;
+
+  const menu = await getOrgMenuIndex(org_id);
+
+  // if we fail to load menu, or menu empty -> keep old behaviour
+  if (!menu.length) {
+    await appendItemsToOrder(order_id, items);
+    return;
+  }
+
+  const finalItems: any[] = [];
+  const unresolved: { raw: string; match: any }[] = [];
+
+  for (const it of items) {
+    const rawName = String(it.name || "").trim();
+    if (!rawName) continue;
+
+    const match = matchMenuItem(rawName, menu);
+
+    if (match.type === "exact" || match.type === "fuzzy_one") {
+      // normalize the name to menu's display_name / canonical
+      const p = match.product;
+      finalItems.push({
+        ...it,
+        product_id: p.id,
+        name: p.display_name || p.canonical,
+      });
+    } else {
+      unresolved.push({ raw: rawName, match });
+    }
+  }
+
+  if (unresolved.length > 0) {
+    const first = unresolved[0];
+
+    if (first.match.type === "ambiguous") {
+      const opts = first.match.suggestions.slice(0, 4); // top few options
+      const lines = opts.map((p: any) => `• ${p.display_name || p.canonical}`);
+
+      await sendWhatsAppText(
+        phone,
+        `You asked for: "${first.raw}".\n` +
+          `I found similar items in the menu:\n` +
+          lines.join("\n") +
+          `\n\nPlease reply with your choice (or type "menu" for more options).`
+      );
+    } else {
+      // type === "none"
+      await sendWhatsAppText(
+        phone,
+        `I couldn't find "${first.raw}" in the menu.\n` +
+          `Please retype the item name or send "menu" to see options.`
+      );
+    }
+
+    // ❗ VERY IMPORTANT: Do NOT append unresolved items.
+    // Existing items in that order remain untouched.
+    return;
+  }
+
+  // all items mapped to real menu products → proceed as before
+  if (finalItems.length > 0) {
+    await appendItemsToOrder(order_id, finalItems);
+  }
+}
+
 // ─────────────────────────────────────────
 // Layer 2: Catalog sanity check
 // ─────────────────────────────────────────
@@ -260,28 +342,8 @@ async function validateItemsAgainstCatalog(
         const pName = normalizeNameForMatch(pNameRaw);
         if (!pName) continue;
 
-        // 1️⃣ First try strict overlap (used elsewhere too)
+        // 1️⃣ Only strict overlap now
         if (hasStrongTokenOverlap(label, pName)) {
-          found = true;
-          break;
-        }
-
-        // 🔴 NEW 2️⃣ Lenient overlap just for catalog sanity:
-        // allow a single shared token to count as "exists in catalog"
-        const norm = (s: string) =>
-          s
-            .toLowerCase()
-            .replace(/[^a-z0-9\s]/gi, " ")
-            .split(/\s+/)
-            .filter(Boolean);
-
-        const qTokens = norm(label);
-        const pTokens = norm(pName);
-        if (!qTokens.length || !pTokens.length) continue;
-
-        const overlapCount = qTokens.filter((t) => pTokens.includes(t)).length;
-
-        if (overlapCount >= 1) {
           found = true;
           break;
         }
@@ -1123,7 +1185,7 @@ export async function ingestCoreFromMessage(
     const source = input.source || "other";
     const activeOrderId = trim(input.active_order_id || "");
 
-        // 🔒 EARLY msg_id dedupe guard
+    // 🔒 EARLY msg_id dedupe guard
     // If this exact WhatsApp message was already attached to an order,
     // skip re-processing entirely (avoid extra GPT + double append).
     //
