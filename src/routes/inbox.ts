@@ -3,6 +3,10 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import axios from "axios";
 import { supa } from "../db";
+import { interpretMessage } from "../ai/interpreter";
+import { normalizePhoneForKey } from "./waba/clarifyAddress";
+import { findActiveOrderForPhone } from "./waba/clarifyAddress";
+import { getConversationState } from "../util/conversationState";
 
 export const inbox = express.Router();
 
@@ -43,9 +47,9 @@ function normE164(s: string): string {
 }
 
 // NEW: digits-only normalizer for customer phone keys
-function normalizePhoneForKey(raw: string): string {
-  return String(raw || "").replace(/[^\d]/g, "");
-}
+// function normalizePhoneForKey(raw: string): string {
+//   return String(raw || "").replace(/[^\d]/g, "");
+// }
 
 // ───────────────── GET /conversations ─────────────────
 // Source of truth: conversations table (created by ingest upserts)
@@ -566,5 +570,161 @@ inbox.post("/inquiry_resolved", express.json(), async (req, res) => {
       .json({ ok: false, error: "inquiry_resolved_failed" });
   }
 });
+
+
+// GET /api/inbox/ai_insight?org_id=...&phone=...
+inbox.get("/ai_insight", async (req, res) => {
+  try {
+    const orgId = String(req.query.org_id || "").trim();
+    const phoneRaw = String(req.query.phone || "").trim();
+
+    if (!orgId || !phoneRaw) {
+      return res.status(400).json({ error: "org_id and phone are required" });
+    }
+
+    const phoneKey = normalizePhoneForKey(phoneRaw);
+
+    // 1) Find conversation for this org + phone
+    const { data: conv, error: convErr } = await supa
+      .from("conversations")
+      .select("id")
+      .eq("org_id", orgId)
+      .eq("customer_phone", phoneKey)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (convErr) {
+      console.warn("[INBOX][ai_insight conv err]", convErr.message);
+    }
+
+    if (!conv) {
+      // No conversation yet → no insight
+      return res.json({ insight: null });
+    }
+
+    // 2) Load last ~30 messages for that conversation
+    const { data: msgs, error: msgErr } = await supa
+      .from("messages")
+      .select("id, created_at, direction, body")
+      .eq("org_id", orgId)
+      .eq("conversation_id", conv.id)
+      .order("created_at", { ascending: false })
+      .limit(30);
+
+    if (msgErr) {
+      console.warn("[INBOX][ai_insight msg err]", msgErr.message);
+      return res.json({ insight: null });
+    }
+
+    if (!msgs || !msgs.length) {
+      return res.json({ insight: null });
+    }
+
+    // Sort ascending for interpreter context, and pick last message as "current"
+    const sorted = [...msgs].sort(
+      (a, b) =>
+        new Date(a.created_at).getTime() -
+        new Date(b.created_at).getTime()
+    );
+
+    const lastMsg = sorted[sorted.length - 1];
+
+    // 3) Check active order + conversation stage
+    const activeOrder = await findActiveOrderForPhone(orgId, phoneKey);
+    const convoState = await getConversationState(orgId, phoneKey);
+    const stage = (convoState?.stage as
+      | "idle"
+      | "awaiting_clarification"
+      | "awaiting_address"
+      | "post_order"
+      | undefined) || "idle";
+
+    // 4) Ask interpreter for a high-level read of this situation
+    const interpretation = await interpretMessage({
+      orgId,
+      phone: phoneKey,
+      text: lastMsg.body || "",
+      hasOpenOrder: !!activeOrder,
+      lastOrderStatus: activeOrder?.status ?? null,
+      lastOrderCreatedAt: activeOrder?.created_at ?? null,
+      state: stage,
+      channel: "waba", // or "local_bridge" depending on your source
+    });
+
+    const insight = {
+      org_id: orgId,
+      customer_phone: phoneKey,
+      last_msg_id: lastMsg.id,
+      last_msg_at: lastMsg.created_at,
+      kind: interpretation.kind ?? "unknown",     // ← use kind
+      confidence: interpretation.confidence ?? null,
+      summary: interpretation.summary ?? null,    // if summary exists on the type
+      raw: interpretation,
+    };
+
+    return res.json({ insight });
+  } catch (e: any) {
+    console.error("[INBOX][ai_insight ERR]", e?.message || e);
+    return res.json({ insight: null });
+  }
+});
+
+
+// GET /api/inbox/customer-insight?org_id=...&phone=...
+inbox.get("/customer-insight", async (req, res) => {
+  try {
+    const org_id = String(req.query.org_id || "");
+    const phoneRaw = String(req.query.phone || "").trim();
+
+    if (!org_id || !phoneRaw) {
+      return res.status(400).json({ error: "org_id and phone are required" });
+    }
+
+    const phoneKey = normalizePhoneForKey(phoneRaw);
+
+    // 1) Latest AI insight row
+    const { data: insight, error: insightErr } = await supa
+    .from("ai_insights")
+    .select(
+      "id, kind, confidence, reason, raw_text, created_at"
+    )
+    .eq("org_id", org_id)
+    .eq("customer_phone", phoneKey)   // 🔹 use existing column
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+    if (insightErr) {
+      console.warn("[INBOX][customer-insight ai_insights err]", insightErr.message);
+    }
+
+    // 2) Snapshot from org_customer_settings (last inquiry info)
+    const { data: custSettings, error: custErr } = await supa
+      .from("org_customer_settings")
+      .select(
+        "last_inquiry_text, last_inquiry_kind, last_inquiry_canonical, last_inquiry_at, last_inquiry_status"
+      )
+      .eq("org_id", org_id)
+      .eq("customer_phone", phoneKey)
+      .maybeSingle();
+
+    if (custErr) {
+      console.warn(
+        "[INBOX][customer-insight settings err]",
+        custErr.message
+      );
+    }
+
+    return res.json({
+      insight: insight || null,
+      lastInquiry: custSettings || null,
+    });
+  } catch (e: any) {
+    console.error("[INBOX][customer-insight ERR]", e?.message || e);
+    return res.status(500).json({ error: "internal_error" });
+  }
+});
+
 
 export default inbox;

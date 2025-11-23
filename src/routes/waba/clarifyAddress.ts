@@ -2,6 +2,9 @@ import { supa } from "../../db";
 import { sendWabaText } from "../../routes/waba";
 import { setConversationStage } from "../../util/conversationState";
 import { prettyLabelFromText } from "../../routes/waba/productInquiry";
+import { detectAddress } from "../../ai/address"; // ⬅️ NEW
+import { recordAliasConfirmation } from "./aliasEngine";
+
 export type VariantChoice = {
   index: number; // item index in order.items
   label: string; // canonical/name (e.g. "Onion")
@@ -29,136 +32,136 @@ function wabaDebug(...args: any[]) {
 }
 
 export async function findAllActiveOrdersForPhone(
-    org_id: string,
-    from_phone: string
-  ): Promise<any[]> {
-    try {
-      const { data, error } = await supa
-        .from("orders")
-        .select("id, items, status, source_phone, created_at")
-        .eq("org_id", org_id)
-        .eq("source_phone", from_phone)
-        .in("status", ["pending", "paid"])
-        .order("created_at", { ascending: false });
-  
-      if (error) {
-        console.warn("[WABA][allActiveOrders err]", error.message);
-        return [];
-      }
-      return data || [];
-    } catch (e: any) {
-      console.warn("[WABA][allActiveOrders catch]", e?.message || e);
+  org_id: string,
+  from_phone: string
+): Promise<any[]> {
+  try {
+    const { data, error } = await supa
+      .from("orders")
+      .select("id, items, status, source_phone, created_at")
+      .eq("org_id", org_id)
+      .eq("source_phone", from_phone)
+      .in("status", ["pending", "paid"])
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.warn("[WABA][allActiveOrders err]", error.message);
       return [];
     }
+    return data || [];
+  } catch (e: any) {
+    console.warn("[WABA][allActiveOrders catch]", e?.message || e);
+    return [];
   }
-
+}
 
 export async function logInboundMessageToInbox(opts: {
-    orgId: string;
-    from: string; // customer phone (raw)
-    text: string;
-    msgId?: string;
-  }) {
-    try {
-      const { orgId, from, text } = opts;
-      const phonePlain = normalizePhoneForKey(from); // digits only
-      const phonePlus = phonePlain ? `+${phonePlain}` : "";
-      // Find existing conversation by phone
-      const { data: conv1 } = await supa
+  orgId: string;
+  from: string; // customer phone (raw)
+  text: string;
+  msgId?: string;
+}) {
+  try {
+    const { orgId, from, text } = opts;
+    const phonePlain = normalizePhoneForKey(from); // digits only
+    const phonePlus = phonePlain ? `+${phonePlain}` : "";
+    // Find existing conversation by phone
+    const { data: conv1 } = await supa
+      .from("conversations")
+      .select("id")
+      .eq("org_id", orgId)
+      .eq("customer_phone", phonePlain)
+      .limit(1)
+      .maybeSingle();
+
+    let conversationId = conv1?.id || null;
+
+    if (!conversationId) {
+      const { data: conv2 } = await supa
         .from("conversations")
         .select("id")
         .eq("org_id", orgId)
-        .eq("customer_phone", phonePlain)
+        .eq("customer_phone", phonePlus)
         .limit(1)
         .maybeSingle();
-  
-      let conversationId = conv1?.id || null;
-  
-      if (!conversationId) {
-        const { data: conv2 } = await supa
-          .from("conversations")
-          .select("id")
-          .eq("org_id", orgId)
-          .eq("customer_phone", phonePlus)
-          .limit(1)
-          .maybeSingle();
-        conversationId = conv2?.id || null;
-      }
-      // If still nothing, create a new conversation row
-      if (!conversationId) {
-        const { data: inserted, error: convErr } = await supa
-          .from("conversations")
-          .insert({
-            org_id: orgId,
-            customer_phone: phonePlain,
-            customer_name: null,
-            source: "waba",
-            last_message_at: new Date().toISOString(),
-            last_message_preview: text.slice(0, 120),
-          })
-          .select("id")
-          .single();
-  
-        if (convErr) {
-          console.warn("[INBOX][inbound conv insert err]", convErr.message);
-          return;
-        }
-        conversationId = inserted.id;
-      } else {
-        // bump preview if conv exists
-        await supa
-          .from("conversations")
-          .update({
-            last_message_at: new Date().toISOString(),
-            last_message_preview: text.slice(0, 120),
-          })
-          .eq("id", conversationId)
-          .eq("org_id", orgId);
-      }
-  
-      // Insert inbound message row
-      await supa.from("messages").insert({
-        org_id: orgId,
-        conversation_id: conversationId,
-        direction: "in",
-        sender_type: "customer",
-        channel: "waba",
-        body: text,
-        wa_msg_id: opts.msgId || null,
-      });
-    } catch (e: any) {
-      console.warn("[INBOX][inbound log err]", e?.message || e);
+      conversationId = conv2?.id || null;
     }
+    // If still nothing, create a new conversation row
+    if (!conversationId) {
+      const { data: inserted, error: convErr } = await supa
+        .from("conversations")
+        .insert({
+          org_id: orgId,
+          customer_phone: phonePlain,
+          customer_name: null,
+          source: "waba",
+          last_message_at: new Date().toISOString(),
+          last_message_preview: text.slice(0, 120),
+        })
+        .select("id")
+        .single();
+
+      if (convErr) {
+        console.warn("[INBOX][inbound conv insert err]", convErr.message);
+        return;
+      }
+      conversationId = inserted.id;
+    } else {
+      // bump preview if conv exists
+      await supa
+        .from("conversations")
+        .update({
+          last_message_at: new Date().toISOString(),
+          last_message_preview: text.slice(0, 120),
+        })
+        .eq("id", conversationId)
+        .eq("org_id", orgId);
+    }
+
+    // Insert inbound message row
+    await supa.from("messages").insert({
+      org_id: orgId,
+      conversation_id: conversationId,
+      direction: "in",
+      sender_type: "customer",
+      channel: "waba",
+      body: text,
+      wa_msg_id: opts.msgId || null,
+    });
+  } catch (e: any) {
+    console.warn("[INBOX][inbound log err]", e?.message || e);
   }
+}
+
 
 
 export async function findActiveOrderForPhoneExcluding(
-    org_id: string,
-    from_phone: string,
-    excludeOrderId: string
-  ): Promise<any | null> {
-    try {
-      const { data, error } = await supa
-        .from("orders")
-        .select("id, items, status, source_phone, created_at")
-        .eq("org_id", org_id)
-        .eq("source_phone", from_phone)
-        .neq("id", excludeOrderId)
-        .in("status", ["pending", "paid"])
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-  
-      if (error) {
-        console.warn("[WABA][activeOrderExcl err]", error.message);
-        return null;
-      }
-      return data || null;
-    } catch (e: any) {
-      console.warn("[WABA][activeOrderExcl catch]", e?.message || e);
+  org_id: string,
+  from_phone: string,
+  excludeOrderId: string
+): Promise<any | null> {
+  try {
+    const { data, error } = await supa
+      .from("orders")
+      .select("id, items, status, source_phone, created_at")
+      .eq("org_id", org_id)
+      .eq("source_phone", from_phone)
+      .neq("id", excludeOrderId)
+      .in("status", ["pending", "paid"])
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.warn("[WABA][activeOrderExcl err]", error.message);
       return null;
     }
+    return data || null;
+  } catch (e: any) {
+    console.warn("[WABA][activeOrderExcl catch]", e?.message || e);
+    return null;
   }
+}
 
 export function looksLikeAddToExisting(text: string): boolean {
   const lower = text.toLowerCase();
@@ -216,7 +219,7 @@ export async function isAutoReplyEnabledForCustomer(opts: {
       .from("org_customer_settings")
       .select("auto_reply_enabled")
       .eq("org_id", orgId)
-      .eq("customer_phone", phoneKey) // ✅ HERE
+      .eq("customer_phone", phoneKey)
       .maybeSingle();
 
     if (error) {
@@ -244,58 +247,55 @@ export function normalizeAliasText(raw: string): string {
 
 export async function learnAliasFromInquiry(opts: {
   org_id: string;
+  from_phone: string;
   text: string;
   result: any;
 }) {
-  const { org_id, text, result } = opts;
-
-  // 1) Find canonical we think this inquiry is about
-  let canonical: string | null = null;
-
-  if (typeof result.inquiry_canonical === "string") {
-    canonical = result.inquiry_canonical.trim();
-  } else if (typeof result.canonical === "string") {
-    canonical = result.canonical.trim();
-  } else if (typeof result.reason === "string") {
-    canonical = extractCanonicalFromReason(result.reason);
-  }
-
-  if (!canonical) return;
-
-  // 2) Build alias phrase from the user text (strip generic words)
-  const pretty = prettyLabelFromText(text) || text;
-  const aliasRaw = normalizeAliasText(pretty);
-  const canonicalNorm = normalizeAliasText(canonical);
-
-  if (!aliasRaw || !canonicalNorm) return;
-
-  // Ignore if alias == canonical (no new info)
-  if (aliasRaw === canonicalNorm) return;
-
-  // Very short / very long junk guard
-  if (aliasRaw.length < 3 || aliasRaw.length > 120) return;
+  const { org_id, from_phone, text, result } = opts;
 
   try {
-    // Upsert without touching hit_count (DB default=1 on first insert)
-    await supa.from("product_aliases").upsert(
-      {
-        org_id,
-        canonical: canonicalNorm,
-        alias: aliasRaw,
-        last_used_at: new Date().toISOString(),
-      },
-      {
-        onConflict: "org_id,canonical,alias",
-      }
-    );
+    // Heuristic: only learn when NLU is confident and we have a clear product id
+    const confidence =
+      typeof result.confidence === "number" ? result.confidence : 1.0;
 
-    console.log("[L11][ALIAS_LEARNED]", {
+    if (
+      result.kind !== "inquiry" ||
+      confidence < 0.8
+    ) {
+      return;
+    }
+
+    // You may already be returning product_id in result — adapt this as needed.
+    const productId =
+      (result.inquiry_product_id as string) ||
+      (result.product_id as string) ||
+      null;
+
+    if (!productId) return;
+
+    // "wrong" text: best-effort from reason or text
+    // e.g. reason = "inq:availability:panner biriyani"
+    let wrongText = "";
+    if (typeof result.alias_raw === "string") {
+      wrongText = result.alias_raw;
+    } else if (typeof result.reason === "string") {
+      const m = result.reason.match(/^inq:[^:]+:(.+)$/i);
+      if (m && m[1]) wrongText = m[1];
+    }
+
+    if (!wrongText) {
+      wrongText = text;
+    }
+
+    await recordAliasConfirmation({
       org_id,
-      canonical: canonicalNorm,
-      alias: aliasRaw,
+      customer_phone: from_phone,
+      wrong_text: wrongText,
+      canonical_product_id: productId,
+      confidence,
     });
   } catch (e: any) {
-    console.warn("[L11][ALIAS_UPSERT_ERR]", e?.message || e);
+    console.warn("[learnAliasFromInquiry err]", e?.message || e);
   }
 }
 
@@ -568,8 +568,11 @@ export async function maybeHandleClarifyReply(opts: {
     return true;
   }
 
+  // ─────────────────────────────
+  // ADDRESS STAGE (current_index = -1)
+  // ─────────────────────────────
   if (session.current_index === -1) {
-    // 🔹 1) Tiny acks like "ok", "thanks" should NOT be treated as address
+    // 1) Tiny acks like "ok", "thanks" should NOT be treated as address
     const ackTokens = lower
       .replace(/[^a-z0-9\s]/gi, " ")
       .split(/\s+/)
@@ -598,13 +601,14 @@ export async function maybeHandleClarifyReply(opts: {
         phoneNumberId,
         to: from,
         orgId: org_id,
-        text: "👍 Got it.\nPlease send your full delivery address in one message (building, street, area) so we can complete your order.",
+        text:
+          "👍 Got it.\nPlease send your full delivery address in one message (building, street, area) so we can complete your order.",
       });
       // keep session OPEN, do NOT save address
       return true;
     }
 
-    // 🔹 2) If message clearly looks like more items → let main handler treat it as order lines
+    // 2) If message clearly looks like more items → let main handler treat it as order lines
     if (looksLikeOrderLineText(text)) {
       wabaDebug("[WABA][ADDRESS GUARD] looks like items, not address", {
         org_id,
@@ -627,39 +631,73 @@ export async function maybeHandleClarifyReply(opts: {
       return false;
     }
 
-    // 🔹 3) Otherwise, treat as address and save
-    await supa
-      .from("order_clarify_sessions")
-      .update({ status: "address_done", updated_at: new Date().toISOString() })
-      .eq("id", session.id);
+    // 3) Run Address AI
+    let addrResult: Awaited<ReturnType<typeof detectAddress>> | null = null;
+    try {
+      addrResult = await detectAddress(text);
+    } catch (e: any) {
+      console.warn("[WABA][address AI error]", e?.message || e);
+    }
 
+    const isAiAddress =
+      addrResult &&
+      addrResult.is_address &&
+      (addrResult.confidence ?? 0) >= 0.6;
+
+    if (!isAiAddress) {
+      // Not confident → ask for clearer address (don't save)
+      await sendWabaText({
+        phoneNumberId,
+        to: from,
+        orgId: org_id,
+        text:
+          "I’m not fully sure this is a complete delivery address.\n" +
+          "Please send building name/number, street/area and city in one message.",
+      });
+      return true;
+    }
+
+    const normalized = addrResult!.normalized || text.trim();
+
+    // 4) Save address on the order
     try {
       await supa
         .from("orders")
-        .update({ shipping_address: text })
+        .update({ shipping_address: normalized })
         .eq("id", session.order_id);
     } catch (e: any) {
       console.warn("[WABA][address save err]", e?.message || e);
     }
 
+    // 5) Mark session as address_done
+    await supa
+      .from("order_clarify_sessions")
+      .update({
+        status: "address_done",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", session.id);
+
     lastCommandByPhone.set(from, "address_done");
 
     await setConversationStage(org_id, from, "building_order", {
       active_order_id: session.order_id,
-      last_action: "address_captured",
+      last_action: "address_captured_ai",
     });
 
     await sendWabaText({
       phoneNumberId,
       to: from,
-      text:
-        "📍 Thanks! We’ve noted your address.\n" +
-        "If you’d like to add more items, just send them here.",
       orgId: org_id,
+      text:
+        "📍 Got your address:\n" +
+        normalized +
+        "\n\nIf anything is wrong, please send the correct address.",
     });
 
     return true;
   }
+
   // ──────────────────────
   // ITEM VARIANT CLARIFY STAGE
   // ──────────────────────

@@ -144,6 +144,116 @@ clarify.get('/c/:token', async (req, res) => {
 </html>`);
 });
 
+// GET /api/orders/:id/clarify-prompt
+clarify.get("/:orderId/clarify-prompt", async (req, res) => {
+  try {
+    const org_id = String(req.query.org_id || "");
+    const orderId = String(req.params.orderId || "");
+    if (!org_id || !orderId) {
+      return res.json({ ok: false, text: "" });
+    }
+
+    const { data: order, error } = await supa
+      .from("orders")
+      .select("id, items, source_phone")
+      .eq("org_id", org_id)
+      .eq("id", orderId)
+      .single();
+
+    if (error || !order || !Array.isArray(order.items)) {
+      return res.json({ ok: false, text: "" });
+    }
+
+    const lines: string[] = [];
+    lines.push("Got your order ✅\n");
+
+    for (const it of order.items) {
+      const canon = (it.canonical || it.name || "").trim();
+      if (!canon) continue;
+
+      // Fetch variants for this item
+      const { data: prods } = await supa
+        .from("products")
+        .select("variant")
+        .eq("org_id", org_id)
+        .eq("canonical", canon);
+
+      if (!prods || !prods.length) continue;
+
+      const variants = Array.from(
+        new Set(
+          prods
+            .map((p: any) => String(p.variant || "").trim())
+            .filter(Boolean)
+        )
+      );
+
+      if (variants.length <= 1) {
+        // no real choice → no clarify needed for this item
+        continue;
+      }
+
+      const currentVariant = String(it.variant || "").trim();
+
+      if (!currentVariant) {
+        // Case 1: no variant yet → ask
+        lines.push(
+          `• For *${canon}*, which variant do you prefer? (${variants.join(
+            " / "
+          )})`
+        );
+      } else {
+        // Case 2: variant already chosen (from prefs/router)
+        // Optional: check if this matches user's usual variant
+        let fromUsual = false;
+        if (order.source_phone) {
+          const phonePlain = String(order.source_phone).replace(/^\+/, "");
+          const { data: cp } = await supa
+            .from("customer_prefs")
+            .select("variant")
+            .eq("org_id", org_id)
+            .eq("phone", phonePlain)
+            .eq("canonical", canon)
+            .order("score", { ascending: false })
+            .limit(1);
+
+          if (cp && cp[0] && cp[0].variant) {
+            const usual = String(cp[0].variant).trim().toLowerCase();
+            if (usual && usual === currentVariant.toLowerCase()) {
+              fromUsual = true;
+            }
+          }
+        }
+
+        if (fromUsual) {
+          lines.push(
+            `• For *${canon}*, we used your usual: *${currentVariant}*. ` +
+              `If you want to change, just reply like “make ${canon} ${variants
+                .filter((v) => v !== currentVariant)
+                .join(" / ")}”.`
+          );
+        } else {
+          lines.push(
+            `• For *${canon}*, we selected *${currentVariant}*. ` +
+              `If you want a different variant, just reply “change ${canon} to <variant>”.`
+          );
+        }
+      }
+    }
+
+    if (lines.length <= 1) {
+      // nothing to clarify
+      return res.json({ ok: false, text: "" });
+    }
+
+    const text = lines.join("\n");
+    return res.json({ ok: true, text });
+  } catch (e: any) {
+    console.warn("[clarify-prompt] err", e?.message || e);
+    return res.json({ ok: false, text: "" });
+  }
+});
+
 // -------------- POST /api/clarify --------------
 clarify.post('/api/clarify', express.urlencoded({ extended: false }), async (req, res) => {
   try {

@@ -23,6 +23,7 @@ import analytics from './routes/analytics';
 import path from "path"; // ⬅️ add this
 import adminBusiness from './routes/admin_business';
 import testing from './routes/testing';
+import { customerInsight } from "./routes/customerInsight";
 
 // ─────────────────────────────
 // Boot diagnostics
@@ -114,6 +115,7 @@ app.use('/api/orders', ordersFeedback);
 app.use('/api/payments', payments);
 app.use("/api/ai-corrections", aiCorrections);
 app.use("/api/analytics", analytics);
+app.use("/customer-insight", customerInsight);
 
 // new changes
 app.use("/admin/business", adminBusiness);

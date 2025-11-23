@@ -4,7 +4,25 @@ import axios from "axios";
 import { supa } from "../db";
 import { ingestCoreFromMessage } from "./ingestCore";
 import { getLatestPrice } from "../util/products";
-import { classifyMessage } from "../ai/nlu";
+import {
+  startAddressSessionForOrder,
+  formatOrderSummary,
+  itemsToOrderText,
+  normalizePhoneForKey,
+  UserCommand,
+  hasAddressForOrder,
+  findAmbiguousItemsForOrder,
+  buildClarifyQuestionText,
+  lastCommandByPhone,
+  maybeHandleClarifyReply,
+  learnAliasFromInquiry,
+  isAutoReplyEnabledForCustomer,
+  looksLikeAddToExisting,
+  findActiveOrderForPhone,
+  findActiveOrderForPhoneExcluding,
+  logInboundMessageToInbox,
+  findAllActiveOrdersForPhone,
+} from "../routes/waba/clarifyAddress";
 import {
   getToneFromOrg,
   makeGreeting,
@@ -30,26 +48,10 @@ import {
   extractMenuKeywords,
   buildMenuReply,
 } from "../routes/waba/productInquiry";
-
-import {
-  startAddressSessionForOrder,
-  formatOrderSummary,
-  itemsToOrderText,
-  normalizePhoneForKey,
-  UserCommand,
-  hasAddressForOrder,
-  findAmbiguousItemsForOrder,
-  buildClarifyQuestionText,
-  lastCommandByPhone,
-  maybeHandleClarifyReply,
-  learnAliasFromInquiry,
-  isAutoReplyEnabledForCustomer,
-  looksLikeAddToExisting,
-  findActiveOrderForPhone,
-  findActiveOrderForPhoneExcluding,
-  logInboundMessageToInbox,
-  findAllActiveOrdersForPhone,
-} from "../routes/waba/clarifyAddress";
+import { interpretMessage } from "../ai/interpreter";
+import { saveAiInsight } from "../routes/waba/aiInsights";
+import { resolveActiveOrderIdForCustomer } from "../session/sessionEngine";
+import { resolveAliasForText } from "../routes/waba/aliasEngine";
 
 export const waba = express.Router();
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || "";
@@ -61,7 +63,7 @@ waba.use((req, _res, next) => {
   next();
 });
 
-console.log("VERSION 12AAAA --------");
+console.log("VERSION 18AAAA --------");
 
 // ─────────────────────────────
 // 1) Webhook verification (GET)
@@ -111,6 +113,112 @@ type ProductOptionsResult = {
   };
   options: ProductPriceOption[];
 };
+
+// ─────────────────────────────
+// Fuzzy helpers for spelling / alias suggestions
+// ─────────────────────────────
+
+// Normalize text for fuzzy comparison (lowercase, remove spaces/punctuation)
+function normalizeLabelForFuzzy(raw: string): string {
+  return String(raw || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "") // strip accents
+    .replace(/[^a-z0-9]+/g, "") // keep only a-z0-9
+    .trim();
+}
+
+// Very simple similarity: how many chars overlap vs max length
+function fuzzyCharOverlapScore(a: string, b: string): number {
+  const s1 = normalizeLabelForFuzzy(a);
+  const s2 = normalizeLabelForFuzzy(b);
+  if (!s1 || !s2) return 0;
+
+  const set1 = new Set(s1.split(""));
+  let matches = 0;
+  for (const ch of s2) {
+    if (set1.has(ch)) matches++;
+  }
+  const maxLen = Math.max(s1.length, s2.length);
+  if (!maxLen) return 0;
+  return matches / maxLen; // 0 → no overlap, 1 → perfect
+}
+
+// Look up close product names for a misspelled label
+async function findFuzzyProductSuggestions(opts: {
+  org_id: string;
+  rawLabel: string;
+  customer_phone?: string;
+  limit?: number;
+}): Promise<{ id: string; name: string; score: number }[]> {
+  const { org_id, rawLabel } = opts;
+  const limit = opts.limit ?? 3;
+
+  const labelNorm = normalizeLabelForFuzzy(rawLabel);
+  if (!labelNorm || labelNorm.length < 3) return [];
+
+  // 0️⃣ First try alias memory (customer → org/global)
+  try {
+    const aliasHit = await resolveAliasForText({
+      org_id,
+      customer_phone: opts.customer_phone,
+      wrong_text: rawLabel,
+    });
+
+    if (aliasHit && aliasHit.canonical_product_id) {
+      // Load that exact product and return as a "perfect" suggestion
+      const { data: prod, error: prodErr } = await supa
+        .from("products")
+        .select("id, display_name, canonical")
+        .eq("org_id", org_id)
+        .eq("id", aliasHit.canonical_product_id)
+        .maybeSingle();
+
+      if (!prodErr && prod && prod.id) {
+        const name = String(prod.display_name || prod.canonical || "").trim();
+        if (name) {
+          return [
+            {
+              id: prod.id as string,
+              name,
+              score: 1.0, // treat as perfect match
+            },
+          ];
+        }
+      }
+    }
+  } catch (e: any) {
+    console.warn("[WABA][alias suggestions err]", e?.message || e);
+  }
+
+  // 1️⃣ Fallback to your existing fuzzy catalogue scan
+  try {
+    const { data, error } = await supa
+      .from("products")
+      .select("id, display_name, canonical")
+      .eq("org_id", org_id)
+      .limit(200); // keep it small; we only need top few
+
+    if (error || !data || !data.length) return [];
+
+    const scored = data
+      .map((p: any) => {
+        const name = String(p.display_name || p.canonical || "").trim();
+        if (!name) return null;
+
+        const score = fuzzyCharOverlapScore(rawLabel, name);
+        return { id: p.id as string, name, score };
+      })
+      .filter((x: any) => x && x.score >= 0.4)
+      .sort((a: any, b: any) => b.score - a.score)
+      .slice(0, limit);
+
+    return scored as { id: string; name: string; score: number }[];
+  } catch (e: any) {
+    console.warn("[WABA][fuzzy suggestions err]", e?.message || e);
+    return [];
+  }
+}
 
 // ─────────────────────────────
 // Helper: smart reply for price / availability inquiries
@@ -641,50 +749,6 @@ function isLikelyEditRequest(text: string): boolean {
   return false;
 }
 
-// Looks like "add more items to existing order"
-
-function isPureGreetingText(raw: string): boolean {
-  const lower = (raw || "").toLowerCase().replace(/[^a-z0-9\s]/gi, " "); // keep only letters/numbers/spaces
-  const tokens = lower.split(/\s+/).filter(Boolean);
-  if (!tokens.length) return false;
-  // Allowed tokens that *alone* can form a greeting / ack
-  const allowed = new Set([
-    "hi",
-    "hii",
-    "hello",
-    "hey",
-    "gm",
-    "good",
-    "morning",
-    "afternoon",
-    "evening",
-    "night",
-    "ok",
-    "okay",
-    "k",
-    "kk",
-    "fine",
-    "thanks",
-    "thank",
-    "thankyou",
-    "thankyou",
-    "thankyou",
-    "thankyou",
-    "thx",
-    "tnx",
-    "pls",
-    "please",
-    "yo",
-    "hola", // just in case
-  ]);
-
-  // PURE greeting = *every* token is in this set.
-  // So:
-  //   "hi", "ok", "ok thanks", "hello good morning" → true
-  //   "ok mutton biriyani", "hi 1kg onion" → false
-  return tokens.every((t) => allowed.has(t));
-}
-
 // ─────────────────────────────
 // Explicit user commands: NEW / CANCEL / UPDATE / AGENT
 // ─────────────────────────────
@@ -695,6 +759,63 @@ const pendingCancelOptions = new Map<string, { orderIds: string[] }>();
 
 // Track if we already showed the commands tip for this phone (per process)
 const commandsTipShown = new Set<string>();
+
+// For alias confirmation (per phone)
+type PendingAlias = {
+  orgId: string;
+  customerPhone: string; // raw WhatsApp phone (no +)
+  wrongText: string;
+  normalizedWrong: string;
+  canonicalProductId: string;
+  canonicalName: string;
+};
+
+const pendingAliasConfirm = new Map<string, PendingAlias>();
+
+async function saveAliasConfirmation(alias: PendingAlias) {
+  try {
+    // GLOBAL alias memory (per org)
+    await supa.from("product_aliases").upsert(
+      {
+        org_id: alias.orgId,
+        wrong_text: alias.wrongText,
+        normalized_wrong_text: alias.normalizedWrong,
+        canonical_product_id: alias.canonicalProductId,
+        occurrence_count: 1,
+      },
+      {
+        onConflict: "org_id,normalized_wrong_text",
+      }
+    );
+
+    // CUSTOMER-level alias memory
+    await supa.from("customer_aliases").upsert(
+      {
+        org_id: alias.orgId,
+        customer_phone: alias.customerPhone,
+        wrong_text: alias.wrongText,
+        normalized_wrong_text: alias.normalizedWrong,
+        canonical_product_id: alias.canonicalProductId,
+        occurrence_count: 1,
+      },
+      {
+        onConflict: "org_id,customer_phone,normalized_wrong_text",
+      }
+    );
+  } catch (e: any) {
+    console.warn("[ALIAS][saveAliasConfirmation err]", e?.message || e);
+  }
+}
+
+// Small helper: only ask if wrong ≠ canonical and text is not tiny
+function shouldAskAliasConfirm(wrong: string, canonical: string): boolean {
+  const w = wrong.trim().toLowerCase();
+  const c = canonical.trim().toLowerCase();
+  if (!w || !c) return false;
+  if (w === c) return false;
+  if (w.length < 3) return false;
+  return true;
+}
 
 // For soft-cancel flow (L8): phone → target order id
 const pendingSoftCancel = new Map<string, string>();
@@ -867,6 +988,21 @@ waba.post("/", async (req, res) => {
             msgId,
           });
 
+          // Normalize phone once (for session + AI)
+          const phoneKey = normalizePhoneForKey(from);
+
+          // 🔹 Compute active order row (old helper)…
+          const activeOrder = await findActiveOrderForPhone(org.id, from);
+
+          // 🔹 …but let the session engine decide which order ID is "active"
+          const sessionActiveOrderId =
+            (await resolveActiveOrderIdForCustomer({
+              org_id: org.id,
+              phone_key: phoneKey,
+            })) || null;
+
+          const activeOrderId = sessionActiveOrderId || activeOrder?.id || null;
+
           // 🔹 Check per-customer auto-reply *before* going into AI
           const autoReplyForCustomer = await isAutoReplyEnabledForCustomer({
             orgId: org.id,
@@ -887,16 +1023,11 @@ waba.post("/", async (req, res) => {
           }
 
           const convoState = await getConversationState(org.id, from);
-          const convoStage: ConversationStage = convoState?.stage || "idle";
-          const stageActiveOrderId = convoState?.active_order_id || null;
+          const convoStage = (convoState?.stage as ConversationStage) || "idle";
 
           if (!text) continue;
 
           let lowerText = text.toLowerCase().trim();
-
-          // 🔹 Compute active order ONCE per message
-          const activeOrder = await findActiveOrderForPhone(org.id, from);
-          const activeOrderId = activeOrder?.id || null;
 
           wabaDebug("ROUTER HIT", req.method, req.path);
           wabaDebug("RAW BODY", JSON.stringify(req.body));
@@ -909,7 +1040,260 @@ waba.post("/", async (req, res) => {
             looksLikeAdd: looksLikeAddToExisting(text),
           });
 
+          // 🔹 LAYER X: run high-level AI interpreter (Option C – sidecar only)
+          // Map our broader ConversationStage → interpreter's narrower state
+          const stateForInterpreter:
+            | "idle"
+            | "awaiting_clarification"
+            | "awaiting_address"
+            | "post_order" =
+            convoStage === "awaiting_clarification" ||
+            convoStage === "awaiting_address" ||
+            convoStage === "post_order"
+              ? convoStage
+              : "idle";
+
+          let interpretation: any = null;
+
+          try {
+            interpretation = await interpretMessage({
+              orgId: org.id,
+              phone: phoneKey, // we already computed this above
+              text,
+              hasOpenOrder: !!activeOrder,
+              lastOrderStatus: activeOrder?.status ?? null,
+              lastOrderCreatedAt: activeOrder?.created_at ?? null,
+              state: stateForInterpreter,
+              channel: "waba",
+            });
+
+            // 🧠 1) Log into flow logs (already there)
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "ai_interpretation",
+              msgId,
+              orderId: activeOrderId,
+              text,
+              result: interpretation,
+            });
+
+            // 🧠 2) Snapshot latest AI insight per customer
+            await saveAiInsight({
+              orgId: org.id,
+              phoneKey,
+              msgId,
+              msgAt: new Date(ts),
+              interpretation,
+            });
+          } catch (e: any) {
+            console.warn("[WABA][AI_INTERPRET_ERR]", e?.message || e);
+          }
+
+          // 🔹 AI soft-cancel signal (used later in L8)
+          const aiThinksSoftCancel =
+            interpretation &&
+            typeof interpretation === "object" &&
+            (interpretation.kind === "order_cancel_soft" ||
+              interpretation.kind === "order_cancel_hard") &&
+            typeof interpretation.confidence === "number" &&
+            interpretation.confidence >= 0.8;
+
+          // ---------------------------------------------
+          // 🔹 Shortcut: Pure smalltalk (no active order)
+          // ---------------------------------------------
+          if (
+            interpretation &&
+            interpretation.kind === "smalltalk" &&
+            typeof interpretation.confidence === "number" &&
+            interpretation.confidence >= 0.8 &&
+            !activeOrder
+          ) {
+            const greet = makeGreeting(tone);
+
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              text: greet,
+              orgId: org.id,
+            });
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "ai_smalltalk_handled",
+              msgId,
+              orderId: null,
+              text,
+              result: {
+                kind: interpretation.kind,
+                confidence: interpretation.confidence,
+                reason: (interpretation as any).reason ?? null,
+              },
+            });
+
+            // Stop further processing for this message
+            continue;
+          }
+
+          // ---------------------------------------------
+          // 🔹 AI: detect "talk to human" (meta_handoff)
+          // ---------------------------------------------
+          const wantsHumanByAI =
+            interpretation &&
+            interpretation.kind === "meta_handoff" &&
+            typeof interpretation.confidence === "number" &&
+            interpretation.confidence >= 0.7;
+
+          // 🔹 AI → human handoff executor
+          if (
+            interpretation &&
+            typeof interpretation === "object" &&
+            interpretation.kind === "meta_handoff" &&
+            typeof interpretation.confidence === "number" &&
+            interpretation.confidence >= 0.8
+          ) {
+            // High-confidence "talk to human" intent → same as `agent` command
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              text:
+                "👨‍💼 Okay, we’ll connect you to a store agent.\n" +
+                "Please wait a moment — a human will reply.",
+              orgId: org.id,
+            });
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "ai_meta_handoff_executed",
+              msgId,
+              orderId: activeOrderId,
+              text,
+              result: {
+                kind: interpretation.kind,
+                confidence: interpretation.confidence,
+                reason: (interpretation as any).reason ?? null,
+              },
+            });
+
+            // Don't go through normal flow for this message
+            continue;
+          }
+
           const lastCmd = lastCommandByPhone.get(from);
+
+          // ─────────────────────────────
+          // ALIAS CONFIRMATION YES/NO
+          // ─────────────────────────────
+          const aliasPending = pendingAliasConfirm.get(from);
+          if (aliasPending && !lastCmd) {
+            const ans = lowerText;
+
+            const isYes =
+              ans === "yes" ||
+              ans === "y" ||
+              ans === "ya" ||
+              ans === "yeah" ||
+              ans === "yup" ||
+              ans === "yes please" ||
+              ans.startsWith("yes,") ||
+              ans.startsWith("ok") ||
+              ans === "k" ||
+              ans === "kk";
+
+            const isNo =
+              ans === "no" ||
+              ans === "n" ||
+              ans === "nope" ||
+              ans.startsWith("dont") ||
+              ans.startsWith("don't") ||
+              ans.startsWith("do not") ||
+              ans.includes("no need") ||
+              ans.includes("not now");
+
+            if (!isYes && !isNo) {
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                orgId: org.id,
+                text:
+                  `Please reply *YES* or *NO* for:\n` +
+                  `"${aliasPending.wrongText}" → "${aliasPending.canonicalName}".`,
+              });
+
+              await logFlowEvent({
+                orgId: org.id,
+                from,
+                event: "alias_confirm_ask_again",
+                msgId,
+                orderId: null,
+                text,
+                result: {
+                  wrongText: aliasPending.wrongText,
+                  canonicalName: aliasPending.canonicalName,
+                },
+              });
+
+              continue;
+            }
+
+            // decision made → clear pending
+            pendingAliasConfirm.delete(from);
+
+            if (isNo) {
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                orgId: org.id,
+                text:
+                  "👍 Got it — I won’t remember that spelling.\n" +
+                  "You can always type the item name exactly next time.",
+              });
+
+              await logFlowEvent({
+                orgId: org.id,
+                from,
+                event: "alias_confirm_rejected",
+                msgId,
+                orderId: null,
+                text,
+                result: {
+                  wrongText: aliasPending.wrongText,
+                  canonicalName: aliasPending.canonicalName,
+                },
+              });
+
+              continue;
+            }
+
+            // YES → save alias globally + per customer
+            await saveAliasConfirmation(aliasPending);
+
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              orgId: org.id,
+              text:
+                `✅ Done. When you say *${aliasPending.wrongText}*, ` +
+                `I’ll treat it as *${aliasPending.canonicalName}* for this store.`,
+            });
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "alias_confirm_accepted",
+              msgId,
+              orderId: null,
+              text,
+              result: {
+                wrongText: aliasPending.wrongText,
+                canonicalName: aliasPending.canonicalName,
+              },
+            });
+
+            continue;
+          }
 
           // 0.12) L8: waiting for YES/NO to confirm soft cancel
           if (lastCmd === "cancel_pending") {
@@ -1625,12 +2009,41 @@ waba.post("/", async (req, res) => {
           }
 
           // 0.3) L8 — Soft cancel intent (stop / no need / cancel it pls / don't want)
-          if (!cmd && activeOrderId && detectSoftCancelIntent(text)) {
+          const isSoftCancelByText = detectSoftCancelIntent(text);
+          const isSoftCancelByAI = aiThinksSoftCancel;
+
+          if (
+            !cmd &&
+            activeOrderId &&
+            (isSoftCancelByText || isSoftCancelByAI)
+          ) {
             // Target the latest active order for soft-cancel
             pendingSoftCancel.set(from, activeOrderId);
             lastCommandByPhone.set(from, "cancel_pending");
 
-            const summary = formatOrderSummary(activeOrder.items || []);
+            // Safely load items for summary
+            let itemsForSummary: any[] = [];
+
+            if (activeOrder && Array.isArray(activeOrder.items)) {
+              itemsForSummary = activeOrder.items;
+            } else {
+              try {
+                const { data: ordRow, error: ordErr } = await supa
+                  .from("orders")
+                  .select("items")
+                  .eq("id", activeOrderId)
+                  .single();
+
+                if (!ordErr && ordRow && Array.isArray((ordRow as any).items)) {
+                  itemsForSummary = (ordRow as any).items;
+                }
+              } catch (e: any) {
+                console.warn("[WABA][soft_cancel load err]", e?.message || e);
+              }
+            }
+
+            const summary = formatOrderSummary(itemsForSummary || []);
+
             const promptText =
               "⚠️ It looks like you want to cancel your last order:\n" +
               (summary || "(no items found)") +
@@ -1650,7 +2063,15 @@ waba.post("/", async (req, res) => {
               msgId,
               orderId: activeOrderId,
               text,
-              result: { summary },
+              result: {
+                summary,
+                byText: isSoftCancelByText,
+                byAI: isSoftCancelByAI,
+                aiKind: interpretation ? (interpretation as any).kind : null,
+                aiConfidence: interpretation
+                  ? (interpretation as any).confidence ?? null
+                  : null,
+              },
             });
 
             continue;
@@ -1679,76 +2100,72 @@ waba.post("/", async (req, res) => {
             });
             continue;
           }
-          // ─────────────────────────────
-          // LAYER 1: NLU classifier (safe)
-          // ─────────────────────────────
-          let nlu: {
-            intent: string;
-            confidence: number;
-            canonical?: string | null;
-          };
 
-          try {
-            nlu = await classifyMessage(text);
-            console.log("[WABA][NLU]", {
-              intent: nlu.intent,
-              conf: nlu.confidence,
-            });
-          } catch (e: any) {
-            console.warn("[WABA][NLU_ERR]", e?.message || e);
-
-            // Fail-soft default
-            nlu = {
-              intent: "unknown",
-              confidence: 0,
-              canonical: null,
-            };
-
-            await logFlowEvent({
-              orgId: org.id,
-              from,
-              event: "nlu_exception",
-              msgId,
-              text,
-              result: { error: e?.message || String(e) },
-            });
-          }
-          // Greeting detection → only short-circuit for *pure* greeting/thanks/ok
-          if (nlu.intent === "greeting" && isPureGreetingText(text)) {
-            await sendWabaText({
-              phoneNumberId,
-              to: from,
-              text: makeGreeting(tone),
-              orgId: org.id,
-            });
-
-            await logFlowEvent({
-              orgId: org.id,
-              from,
-              event: "nlu_greeting_pure",
-              msgId,
-              text,
-              result: { intent: nlu.intent },
-            });
-
-            continue; // ← ONLY for pure greeting
-          }
-          // If NLU said "greeting" but message has extra words (e.g. "ok mutton biriyani"),
-          // we just log it and FALL THROUGH to ingestCore.
-          if (nlu.intent === "greeting" && !isPureGreetingText(text)) {
-            await logFlowEvent({
-              orgId: org.id,
-              from,
-              event: "nlu_greeting_but_not_pure",
-              msgId,
-              text,
-              result: { intent: nlu.intent },
-            });
-          }
           /// ─────────────────────────────
           // LAYER 12: ingestCore (safe)
           // ─────────────────────────────
           let result: any;
+
+          // --- Address update detection (override bad parse) ---
+          const looksLikeAddressUpdateText =
+            /address/.test(lowerText) &&
+            /(update|change|correct|new|my address is)/i.test(lowerText);
+
+          if (looksLikeAddressUpdateText && activeOrderId) {
+            const targetOrder =
+              activeOrder || (await findMostRecentOrderForPhone(org.id, from));
+
+            if (!targetOrder) {
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                orgId: org.id,
+                text:
+                  "📍 Got your message about the address.\n" +
+                  "We don’t see any recent order to update right now, " +
+                  "but the store will note your new address for future orders.",
+              });
+
+              await logFlowEvent({
+                orgId: org.id,
+                from,
+                event: "address_update_no_order_text_detected",
+                msgId,
+                orderId: null,
+                text,
+                result,
+              });
+
+              continue;
+            }
+
+            await startAddressSessionForOrder({
+              org_id: org.id,
+              order_id: targetOrder.id,
+              from_phone: from,
+            });
+
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              orgId: org.id,
+              text:
+                "📍 Sure, please send your correct delivery address now " +
+                "(building, street, area). We’ll update it for your current order.",
+            });
+
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "address_update_text_detected",
+              msgId,
+              orderId: targetOrder.id,
+              text,
+              result,
+            });
+
+            continue; // ✅ do not treat this as an item / order
+          }
 
           try {
             result = await ingestCoreFromMessage({
@@ -1821,6 +2238,7 @@ waba.post("/", async (req, res) => {
             if (result && result.kind === "inquiry") {
               await learnAliasFromInquiry({
                 org_id: org.id,
+                from_phone: from,
                 text,
                 result,
               });
@@ -1830,16 +2248,59 @@ waba.post("/", async (req, res) => {
           }
 
           // ─────────────────────────────
+          // ORDER MODIFIER / CORRECTION (Option C from ingestCore NLU)
+          // e.g. "make biriyani spicy", "only boneless", "remove coke"
+          // ─────────────────────────────
+          if (result && result.kind === "modifier") {
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "modifier_message",
+              msgId,
+              orderId: activeOrder?.id || null,
+              text,
+              result,
+            });
+
+            if (!activeOrder) {
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                orgId: org.id,
+                text:
+                  "I got that you want to change something in the order, " +
+                  "but I don’t see any recent order for this number.\n" +
+                  "Please send a new order, or talk to the store directly.",
+              });
+
+              // do NOT fall through to generic flow
+              continue;
+            }
+
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              orgId: org.id,
+              text: "👍 Got your change request. The store will review it and update your current order if possible.",
+            });
+
+            // In V1 we don’t auto-edit line items; we just pass it to store
+            // and stop here.
+            continue;
+          }
+
+          // ─────────────────────────────
           // ADDRESS UPDATE FLOW (human-like)
           // ─────────────────────────────
-          if (
+          const isAddressUpdate =
             result &&
             result.kind === "none" &&
             typeof result.reason === "string" &&
-            (result.reason.includes("address update request") ||
+            (result.reason === "nlu:address_update" ||
+              result.reason.includes("address update request") ||
               result.reason.includes("request for address update") ||
-              result.reason.includes("update my address"))
-          ) {
+              result.reason.includes("update my address"));
+          if (isAddressUpdate) {
             // Pick target order: prefer active, else most recent
             const targetOrder =
               activeOrder || (await findMostRecentOrderForPhone(org.id, from));
@@ -1900,14 +2361,18 @@ waba.post("/", async (req, res) => {
           // SIMPLE PREFERENCE NOTE FALLBACK
           // (e.g. "some spice to my biriyani")
           // ─────────────────────────────
+          const isPreferenceByAI =
+            result &&
+            typeof result.reason === "string" &&
+            result.reason.startsWith("ai:not_order:preference");
+
           if (
             !reply &&
             activeOrderId &&
-            result &&
-            result.kind === "none" &&
-            /spice|spicy|no onion|less oil|less chilli|no chilli/i.test(
-              lowerText
-            )
+            (isPreferenceByAI ||
+              /spice|spicy|no onion|less oil|less chilli|no chilli/i.test(
+                lowerText
+              ))
           ) {
             await sendWabaText({
               phoneNumberId,
@@ -1928,7 +2393,7 @@ waba.post("/", async (req, res) => {
               result,
             });
 
-            continue; // ✅ don't treat as new order/inquiry
+            continue; // ✅ do NOT treat this as order/inquiry
           }
 
           // ─────────────────────────────
@@ -2197,7 +2662,9 @@ waba.post("/", async (req, res) => {
 
           //   if (!org.auto_reply_enabled) continue;
 
-          const unmatchedOnly = extractCatalogUnmatchedOnly(result.reason);
+          const unmatchedOnly = extractCatalogUnmatchedOnly(
+            result?.reason || ""
+          );
 
           // Tiny acks like "ok", "no", "thanks" should not become fake items
           const tinyAckWords = new Set([
@@ -2242,14 +2709,38 @@ waba.post("/", async (req, res) => {
           ) {
             const label = pickNiceUnmatchedLabel(result, unmatchedOnly);
 
-            if (activeOrderId) {
+            // 🔍 Try to suggest close product names (handles biryani/biriyani, sprit/sprite, etc.)
+            const suggestions = await findFuzzyProductSuggestions({
+              org_id: org.id,
+              rawLabel: label,
+              customer_phone: from,
+              limit: 3,
+            });
+
+            if (suggestions.length) {
+              const lines = suggestions.map(
+                (s, idx) => `${idx + 1}) ${s.name}`
+              );
+
               reply =
-                `⚠️ Sorry, I couldn’t find “${label}” in today’s items.\n` +
-                "Your existing order is unchanged — the store will confirm if they can add it or suggest alternatives.";
+                `⚠️ I couldn’t find “${label}” exactly in today’s items.\n` +
+                `Did you mean:\n` +
+                lines.join("\n") +
+                `\n\nIf none of these are correct, please type the exact item name, ` +
+                `or type *agent* to talk to a human.`;
             } else {
-              reply =
-                `⚠️ Sorry, I couldn’t find “${label}” in today’s items.\n` +
-                "Please send a different item name or check the menu, and the store will help you.";
+              // Old fallback + gentle “talk to agent”
+              if (activeOrderId) {
+                reply =
+                  `⚠️ Sorry, I couldn’t find “${label}” in today’s items.\n` +
+                  "Your existing order is unchanged — the store will confirm if they can add it or suggest alternatives.\n\n" +
+                  "If you’d like, type *agent* to talk to a human.";
+              } else {
+                reply =
+                  `⚠️ Sorry, I couldn’t find “${label}” in today’s items.\n` +
+                  "Please send a different item name or check the menu, and the store will help you.\n\n" +
+                  "You can also type *agent* to talk to a human.";
+              }
             }
           }
 
@@ -2467,25 +2958,127 @@ waba.post("/", async (req, res) => {
               }
             }
           }
-          // After answering an inquiry, mark last inquiry as resolved in customer settings
+
+          // ─────────────────────────────
+          // After inquiry reply → ask alias confirmation (if applicable)
+          // ─────────────────────────────
           if (reply && result.kind === "inquiry") {
             try {
-              const phoneKey = normalizePhoneForKey(from);
-              await supa
-                .from("org_customer_settings")
-                .update({
-                  last_inquiry_status: "resolved",
-                  last_inquiry_resolved_at: new Date().toISOString(),
-                })
-                .eq("org_id", org.id)
-                .eq("customer_phone", phoneKey);
+              // What customer actually typed ("mutton biriyani")
+              const requestedLabelRaw = prettyLabelFromText(text);
+              const requestedLabel = requestedLabelRaw
+                ? requestedLabelRaw.trim()
+                : "";
+
+              // If we don't have a usable label, just skip alias learning
+              if (!requestedLabel) {
+                // do nothing, still send reply below
+              } else {
+                let canonical: string | null = null;
+                let productId: string | null = null;
+
+                if (typeof (result as any).inquiry_canonical === "string") {
+                  canonical = (result as any).inquiry_canonical;
+                } else if (typeof (result as any).canonical === "string") {
+                  canonical = (result as any).canonical;
+                }
+
+                if (typeof (result as any).inquiry_product_id === "string") {
+                  productId = (result as any).inquiry_product_id;
+                }
+
+                // If we know nothing about the product, skip alias question
+                if (!canonical && !productId) {
+                  // skip alias prompt
+                } else if (
+                  canonical &&
+                  !shouldAskAliasConfirm(requestedLabel, canonical)
+                ) {
+                  // user text ≈ canonical, no need to ask
+                } else {
+                  // 🔍 Prefer lookup by productId, fallback to canonical search
+                  let prod: any = null;
+                  let prodErr: any = null;
+
+                  if (productId) {
+                    const res = await supa
+                      .from("products")
+                      .select("id, display_name, canonical")
+                      .eq("org_id", org.id)
+                      .eq("id", productId)
+                      .maybeSingle();
+
+                    prod = res.data;
+                    prodErr = res.error;
+                  } else if (canonical) {
+                    const res = await supa
+                      .from("products")
+                      .select("id, display_name, canonical")
+                      .eq("org_id", org.id)
+                      .ilike("canonical", canonical)
+                      .limit(1)
+                      .maybeSingle();
+
+                    prod = res.data;
+                    prodErr = res.error;
+                  }
+
+                  if (!prodErr && prod && prod.id) {
+                    const canonicalName = (
+                      prod.display_name ||
+                      prod.canonical ||
+                      canonical ||
+                      requestedLabel
+                    ).trim();
+
+                    const phoneKey = normalizePhoneForKey(from);
+                    const wrongText = requestedLabel;
+                    const normalizedWrong = normalizeLabelForFuzzy(wrongText);
+
+                    pendingAliasConfirm.set(from, {
+                      orgId: org.id,
+                      customerPhone: phoneKey,
+                      wrongText,
+                      normalizedWrong,
+                      canonicalProductId: prod.id,
+                      canonicalName,
+                    });
+
+                    const aliasPrompt =
+                      `When you say *${wrongText}*, should I treat it as ` +
+                      `*${canonicalName}* from now on? Reply *YES* or *NO*.`;
+
+                    reply = reply + "\n\n" + aliasPrompt;
+
+                    await logFlowEvent({
+                      orgId: org.id,
+                      from,
+                      event: "alias_confirm_prompted",
+                      msgId,
+                      orderId: null,
+                      text,
+                      result: {
+                        wrongText,
+                        canonicalName,
+                        canonicalId: prod.id,
+                      },
+                    });
+                  }
+                }
+              }
             } catch (e: any) {
-              console.warn(
-                "[WABA][inquiry mark resolved err]",
-                e?.message || e
-              );
+              console.warn("[ALIAS][prompt err]", e?.message || e);
             }
           }
+
+          // 3.9) If ingestCore already produced a direct reply, use it as fallback
+          if (!reply && result && typeof result.reply === "string") {
+            const trimmed = result.reply.trim();
+            if (trimmed) {
+              reply = trimmed;
+            }
+          }
+
           // 4) Heuristic question fallback (looks like inquiry but parser didn’t classify cleanly)
           if (
             !reply &&

@@ -15,10 +15,21 @@ import {
   IngestItem,
   InquiryKind,
 } from "../types";
-import { decideLinking } from "./ingestCore/linking"; // ⬅️ linking decision (append vs new)
 import { findBestProductForTextV2 } from "../util/productMatcher";
+
+import {
+  markSessionOnNewOrder,
+  markSessionOnAppendOrder,
+  markSessionOnInquiry,
+  markSessionOnModifier,
+  decideSessionNextStep,
+  type NluResult as SessionNluResult,
+  type ParsedMessage as SessionParsedMessage,
+} from "../session/sessionEngine";
+
 import { formatInquiryReply } from "../util/inquiryReply"; // NEW
-import { classifyMessage, NLUResult } from "../ai/nlu";
+import { classifyMessage, NLUResult as CoreNluResult } from "../ai/nlu";
+
 // ─────────────────────────────────────────────────────────
 // Optional AI parser hook (safe if missing → rules fallback)
 // ─────────────────────────────────────────────────────────
@@ -56,12 +67,51 @@ const asStr = (v: any) =>
   typeof v === "string" ? v : v == null ? "" : String(v);
 const trim = (v: any) => asStr(v).trim();
 
+/** Normalize a product name for catalog matching */
+function normalizeNameForMatch(raw?: string | null): string {
+  return (
+    String(raw || "")
+      .toLowerCase()
+      // strip leading qty like "1", "2x", "3.5 "
+      .replace(/^\s*\d+(\.\d+)?\s*x?\s*/, "")
+      .replace(/\s+/g, " ")
+      .trim()
+  );
+}
+
 function normPhone(raw?: string | null): string | null {
   if (!raw) return null;
   const s = String(raw).trim();
   const plus = s.startsWith("+") ? "+" : "";
   const digits = s.replace(/[^\d]/g, "");
   return digits.length >= 7 ? plus + digits : null;
+}
+
+function mapToSessionIntent(
+  raw: string | undefined | null
+): SessionNluResult["intent"] {
+  switch (raw) {
+    case "greeting":
+      return "greeting";
+    case "smalltalk":
+      return "smalltalk";
+    case "spam":
+      return "spam";
+    case "menu_inquiry":
+    case "price_inquiry":
+    case "availability_inquiry":
+    case "inquiry":
+      return "inquiry";
+    case "modifier":
+    case "order_correction":
+      return "modifier";
+    case "address_update":
+      return "address_update";
+    case "order":
+      return "order";
+    default:
+      return "unknown";
+  }
 }
 
 /** Dedup within the same minute (same org + same text + phone [+ msgId if present]) */
@@ -195,7 +245,8 @@ async function validateItemsAgainstCatalog(
     const unmatched: IngestItem[] = [];
 
     for (const it of items) {
-      const label = trim(it.canonical || it.name || "");
+      const labelRaw = trim(it.canonical || it.name || "");
+      const label = normalizeNameForMatch(labelRaw);
       if (!label) {
         // no name → don't mark as unmatched, just let it flow
         matched.push(it);
@@ -204,10 +255,32 @@ async function validateItemsAgainstCatalog(
 
       let found = false;
       for (const p of products) {
-        const pName = trim(p.display_name || p.canonical || "");
+        const pNameRaw = trim(p.display_name || p.canonical || "");
+        const pName = normalizeNameForMatch(pNameRaw);
         if (!pName) continue;
 
+        // 1️⃣ First try strict overlap (used elsewhere too)
         if (hasStrongTokenOverlap(label, pName)) {
+          found = true;
+          break;
+        }
+
+        // 🔴 NEW 2️⃣ Lenient overlap just for catalog sanity:
+        // allow a single shared token to count as "exists in catalog"
+        const norm = (s: string) =>
+          s
+            .toLowerCase()
+            .replace(/[^a-z0-9\s]/gi, " ")
+            .split(/\s+/)
+            .filter(Boolean);
+
+        const qTokens = norm(label);
+        const pTokens = norm(pName);
+        if (!qTokens.length || !pTokens.length) continue;
+
+        const overlapCount = qTokens.filter((t) => pTokens.includes(t)).length;
+
+        if (overlapCount >= 1) {
           found = true;
           break;
         }
@@ -615,7 +688,9 @@ async function hydrateProductsWithRouter(
           const variants = new Set(
             siblings
               .map((s: any) =>
-                String(s.variant || "").toLowerCase().trim()
+                String(s.variant || "")
+                  .toLowerCase()
+                  .trim()
               )
               .filter(Boolean)
           );
@@ -687,16 +762,131 @@ async function hydrateProductsWithRouter(
   return { items: out, applied };
 }
 
+async function orderHasMultiVariantChoices(
+  orgId: string,
+  items: any[]
+): Promise<boolean> {
+  if (!items || !items.length) return false;
+
+  for (const it of items) {
+    const canon = (it.canonical || it.name || "").trim();
+    if (!canon) continue;
+
+    try {
+      const { data, error } = await supa
+        .from("products")
+        .select("variant")
+        .eq("org_id", orgId)
+        .eq("canonical", canon);
+
+      if (error || !data || !data.length) continue;
+
+      const variants = new Set(
+        data
+          .map((p: any) =>
+            String(p.variant || "")
+              .toLowerCase()
+              .trim()
+          )
+          .filter(Boolean)
+      );
+
+      // If there are 2+ variants for this item,
+      // we consider this item as needing a clarify/confirm.
+      if (variants.size > 1) return true;
+    } catch (e: any) {
+      console.warn(
+        "[INGEST][clarify multi-variant check warn]",
+        e?.message || e
+      );
+    }
+  }
+
+  return false;
+}
+
+type VariantClarifyTarget = {
+  canonical: string;
+  displayName: string;
+  variants: string[];
+};
+
+/**
+ * Find the first item in the parsed order that:
+ *  - has multiple variants in catalog
+ *  - but the user text does NOT clearly specify one of them
+ *  - and item.variant is still empty (AI/router didn't pick safely)
+ */
+async function findFirstVariantClarifyTarget(
+  orgId: string,
+  items: any[]
+): Promise<VariantClarifyTarget | null> {
+  if (!items || !items.length) return null;
+
+  for (const it of items) {
+    const rawName = (it.canonical || it.name || "").trim();
+    if (!rawName) continue;
+
+    // If variant already chosen (by user, prefs, or router), skip
+    const existingVariant = (it.variant || "").toString().trim();
+    if (existingVariant) continue;
+
+    try {
+      const { data, error } = await supa
+        .from("products")
+        .select("display_name, variant, canonical")
+        .eq("org_id", orgId)
+        .eq("canonical", rawName);
+
+      if (error || !data || !data.length) continue;
+
+      const variants = Array.from(
+        new Set(
+          data
+            .map((p: any) =>
+              String(p.variant || "")
+                .toLowerCase()
+                .trim()
+            )
+            .filter(Boolean)
+        )
+      );
+
+      // Only care if there are 2+ variants
+      if (variants.length <= 1) continue;
+
+      // If the user's text ALREADY clearly includes one of the variant names,
+      // we don't ask again.
+      const label = normalizeNameForMatch(rawName);
+      const labelLower = label.toLowerCase();
+
+      const mentionsVariant = variants.some((v) => v && labelLower.includes(v));
+      if (mentionsVariant) continue;
+
+      const displayName = (data.find((p: any) => p.display_name)
+        ?.display_name || rawName) as string;
+
+      return {
+        canonical: rawName,
+        displayName,
+        variants,
+      };
+    } catch (e: any) {
+      console.warn("[INGEST][variant_clarify warn]", e?.message || e);
+    }
+  }
+
+  return null;
+}
+
 async function maybeAutoSendClarify(
   orgId: string,
   orderId: string,
   source: IngestSource
 ) {
   try {
-    // Only WABA should auto-send clarify (avoid spamming via personal WA)
     if (String(source) !== "waba") return;
 
-    // debounce in last 15m
     const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
     try {
       const { data: already } = await supa
@@ -718,12 +908,24 @@ async function maybeAutoSendClarify(
       .single();
 
     if (!order || !Array.isArray(order.items)) return;
-    if (!order.items.some(itemNeedsClarify)) return;
     if (!order.source_phone) return;
 
-    // Build clarify text using your existing clarify-prompt endpoint (internal)
+    // 🔴 NEW:
+    // 1) if any item is missing brand/variant → clarify
+    // 2) OR if any item has multiple variants in catalog → clarify/confirm
+    const missingBrandOrVariant = order.items.some(itemNeedsClarify);
+    const hasMultiVariants = await orderHasMultiVariantChoices(
+      orgId,
+      order.items
+    );
+
+    if (!missingBrandOrVariant && !hasMultiVariants) {
+      // nothing to clarify for this order
+      return;
+    }
+
+    // Build clarify text using existing endpoint
     if (!process.env.BASE_URL || !process.env.INTERNAL_JWT) return;
-    // @ts-ignore (Node 18+ global fetch; otherwise skip)
     const resp = await fetch(
       `${process.env.BASE_URL}/api/orders/${orderId}/clarify-prompt`,
       { headers: { Authorization: `Bearer ${process.env.INTERNAL_JWT}` } }
@@ -732,16 +934,12 @@ async function maybeAutoSendClarify(
     const data = await resp?.json().catch(() => null as any);
     if (!data?.ok || !data?.text) return;
 
-    // Log enqueue (replace with your WABA sender if wired)
     await supa.from("outbound_logs").insert({
       org_id: orgId,
       order_id: orderId,
       kind: "clarify_bundle",
       payload: { text: data.text, phone: order.source_phone },
     });
-
-    // If you have a sender microservice, call it here instead of just logging.
-    // e.g., await wabaSendText({ org_id: orgId, to: order.source_phone, text: data.text });
   } catch (e: any) {
     console.warn("[INGEST][autosend clarify] skipped:", e?.message || e);
   }
@@ -1006,6 +1204,9 @@ export async function ingestCoreFromMessage(
       edited_at: edited_at || undefined,
     });
 
+    // 🔑 Session key = digits-only phone (no "+")
+    const phoneKey = phoneNorm ? String(phoneNorm).replace(/^\+/, "") : null;
+
     // 3) Fast gates
     if (isLikelyPromoOrSpam(textFlat)) {
       return {
@@ -1023,14 +1224,16 @@ export async function ingestCoreFromMessage(
         stored: false,
         kind: "none",
         used: "none",
-        reason: "dropped:greeting_ack",
+        reason: "greeting_ack",
+        // ⬇️ WABA: if result.reply exists, send it back as a text message
+        reply: "Good morning 👋 How can I help you with your order today?",
       };
     }
 
     // ─────────────────────────────────────────
     // LAYER 1: NLU ROUTER (INTENT FIRST)
     // ─────────────────────────────────────────
-    let nlu: NLUResult | null = null;
+    let nlu: CoreNluResult | null = null;
 
     try {
       nlu = await classifyMessage(textRaw);
@@ -1052,6 +1255,7 @@ export async function ingestCoreFromMessage(
         kind: "none",
         used: "none",
         reason: "nlu:greeting",
+        reply: "Hi 👋 How can I help you with your order today?",
       };
     }
 
@@ -1064,7 +1268,7 @@ export async function ingestCoreFromMessage(
         stored: false,
         kind: "none",
         used: "none",
-        reason: "nlu:smalltalk",
+        reason: "small_talk_or_non_order",
       };
     }
 
@@ -1085,6 +1289,17 @@ export async function ingestCoreFromMessage(
     // 4) MENU INQUIRY
     // ─────────────────────────────
     if (nlu.intent === "menu_inquiry") {
+      if (phoneKey) {
+        await markSessionOnInquiry({
+          org_id: orgId,
+          phone_key: phoneKey,
+          kind: "availability",
+          canonical: "menu",
+          text: textRaw,
+          status: "pending",
+        });
+      }
+
       return {
         ok: true,
         stored: false,
@@ -1102,6 +1317,17 @@ export async function ingestCoreFromMessage(
     // 5) PRICE INQUIRY
     // ─────────────────────────────
     if (nlu.intent === "price_inquiry") {
+      if (phoneKey) {
+        await markSessionOnInquiry({
+          org_id: orgId,
+          phone_key: phoneKey,
+          kind: "price",
+          canonical: nlu.canonical || textRaw,
+          text: textRaw,
+          status: "pending",
+        });
+      }
+
       return {
         ok: true,
         stored: false,
@@ -1115,24 +1341,28 @@ export async function ingestCoreFromMessage(
       };
     }
 
-    // ─────────────────────────────
     // 6) AVAILABILITY INQUIRY
-    // ─────────────────────────────
     if (nlu.intent === "availability_inquiry") {
-      return {
-        ok: true,
-        stored: false,
-        kind: "inquiry",
-        used: "inquiry",
-        inquiry: "availability",
-        inquiry_type: "availability",
-        inquiry_canonical: nlu.canonical || "",
-        reply: "Let me check availability…",
-        reason: "nlu:availability_inquiry",
-      };
+      if (phoneKey) {
+        await markSessionOnInquiry({
+          org_id: orgId,
+          phone_key: phoneKey,
+          kind: "availability",
+          canonical: nlu.canonical || textRaw,
+          text: textRaw,
+          status: "pending",
+        });
+      }
+
+      // ⛔ DO NOT return here.
+      // Let the rest of the pipeline run:
+      // - detectInquiry()
+      // - findBestProductForTextV2()
+      // - smart reply:
+      //   "I couldn’t find X... We do have: 1) ... 2) ..."
     }
 
-        // ─────────────────────────────
+    // ─────────────────────────────
     // 6b) ADDRESS UPDATE (handle in WABA, not as order)
     // ─────────────────────────────
     if (nlu.intent === "address_update") {
@@ -1156,13 +1386,24 @@ export async function ingestCoreFromMessage(
       //  - "only boneless"
       //  - "remove coke"
       //
-      // We don't touch DB here. We just tell the caller:
-      //   "this is a modifier-type message"
-      // and WABA will adjust the last order (change qty, notes, remove item, etc.).
+      // We don't touch DB here. Just snapshot the modifier in session
+      // so UI + WABA can see “customer sent a change request”.
+      if (phoneKey) {
+        await markSessionOnModifier({
+          org_id: orgId,
+          phone_key: phoneKey,
+          modifier: {
+            text: textRaw,
+            intent: nlu.intent,
+            ts,
+          },
+        });
+      }
+
       return {
         ok: true,
         stored: false,
-        kind: "modifier",       // 🔴 you'll add this to IngestResult.kind union
+        kind: "modifier",
         used: "none",
         reason: `nlu:${nlu.intent}`,
       };
@@ -1175,17 +1416,7 @@ export async function ingestCoreFromMessage(
       console.log("[NLU] intent=order → continue with parse pipeline");
     }
 
-    // ─────────────────────────────
-    // 7) ORDER INTENT → continue to AI/rule pipeline
-    // ─────────────────────────────
-    if (nlu.intent === "order") {
-      console.log("[NLU] intent=order → continue with parse pipeline");
-    }
-    // ─────────────────────────────────────────
-
-    // ─────────────────────────────────────────
     // [INBOX] Record inbound message for unified view
-    // ─────────────────────────────────────────
     await upsertConversationAndInboundMessage({
       orgId,
       phoneNorm,
@@ -1196,8 +1427,8 @@ export async function ingestCoreFromMessage(
       raw: { source, ts },
     });
 
-    // 4) Parse via hybrid pipeline (AI + rules) on ORIGINAL text
-    let parsed = await parsePipeline(String(textRaw), {
+    // Use AI + rules parser pipeline directly
+    let parsed = await parsePipeline(textRaw, {
       org_id: orgId,
       customer_phone: phoneNorm || undefined,
     });
@@ -1327,16 +1558,19 @@ export async function ingestCoreFromMessage(
       console.log("[INGEST][core][detectInquiry]", detected);
 
       if (detected) {
-        const base: IngestResult = {
+        // allow storing product_id + canonical on the result
+        const base: IngestResult & {
+          inquiry_product_id?: string;
+          canonical?: string;
+        } = {
           ok: true,
           kind: "inquiry",
           used: "inquiry",
           stored: false,
           order_id: undefined,
 
-          // 🔥 These match your IngestInquiry type exactly:
           inquiry: detected.kind, // InquiryKind
-          inquiry_type: detected.kind, // backwards compatibility
+          inquiry_type: detected.kind,
           inquiry_canonical: detected.canonical,
         };
 
@@ -1349,15 +1583,12 @@ export async function ingestCoreFromMessage(
         }
 
         if (matched) {
-          // 🔍 Take the best product name we have
           const candidateName = String(
             matched.display_name || matched.canonical || ""
           ).trim();
 
           const queryName = String(detected.canonical || "").trim();
 
-          // If similarity is weak (e.g. "paneer biryani" vs "chicken biryani"),
-          // treat as NO MATCH → this will trigger inquiry_no_match + auto-pause.
           const strongEnough = hasStrongTokenOverlap(queryName, candidateName);
 
           console.log("[INGEST][core][inquiry-match-overlap]", {
@@ -1367,6 +1598,28 @@ export async function ingestCoreFromMessage(
           });
 
           if (strongEnough) {
+            // 💡 final canonical we want to show/learn
+            const finalCanonical =
+              candidateName || detected.canonical || queryName;
+
+            // update base with canonical + product_id
+            base.inquiry_canonical = finalCanonical;
+            base.canonical = finalCanonical;
+            if (matched.id) {
+              (base as any).inquiry_product_id = matched.id;
+            }
+
+            if (phoneKey) {
+              await markSessionOnInquiry({
+                org_id: orgId,
+                phone_key: phoneKey,
+                kind: detected.kind,
+                canonical: finalCanonical,
+                text: textRaw,
+                status: "answered",
+              });
+            }
+
             return {
               ...base,
               reply: formatInquiryReply(matched, detected.kind),
@@ -1377,12 +1630,56 @@ export async function ingestCoreFromMessage(
           // fall through to no-match below
         }
 
+        // ❌ no safe match → keep original canonical, mark pending
+        if (phoneKey) {
+          await markSessionOnInquiry({
+            org_id: orgId,
+            phone_key: phoneKey,
+            kind: detected.kind,
+            canonical: detected.canonical,
+            text: textRaw,
+            status: "pending",
+          });
+        }
+
         return {
           ...base,
           reply: `I could not find "${detected.canonical}". Please send exact product name.`,
           reason: "inquiry_no_match",
         };
       }
+    }
+
+    // 🔴 NEW: if AI explicitly said "not order / ambiguous" and we still
+    // have no items, treat this as a soft availability inquiry instead of "none".
+    const aiAmbiguousNotOrder =
+      parsed.is_order_like === false &&
+      typeof parsed.reason === "string" &&
+      parsed.reason.toLowerCase().startsWith("ai:not_order:");
+
+    if (
+      (!parsed.items || parsed.items.length === 0) &&
+      !hasListShape &&
+      aiAmbiguousNotOrder
+    ) {
+      const canonical = (nlu.canonical || textFlat).trim();
+
+      console.log(
+        "[INGEST][core] ai:not_order:ambiguous → treating as availability inquiry",
+        { canonical }
+      );
+
+      return {
+        ok: true,
+        stored: false,
+        kind: "inquiry",
+        used: "inquiry",
+        inquiry: "availability",
+        inquiry_type: "availability",
+        inquiry_canonical: canonical,
+        reply: "Let me check availability…",
+        reason: "inquiry_from_ai_not_order",
+      };
     }
 
     // 8) ORDER path starts here
@@ -1404,8 +1701,6 @@ export async function ingestCoreFromMessage(
     }
 
     // ⬇️ LAYER 6: product router (synonyms / aliases → canonical product)
-    // This is where "panner biriyani" can be snapped to the right menu item,
-    // as long as token overlap is strong.
     try {
       const { items: routedItems, applied: prodApplied } =
         await hydrateProductsWithRouter(orgId, parsed.items || []);
@@ -1447,11 +1742,10 @@ export async function ingestCoreFromMessage(
         const matched = check.matched || [];
         const unmatched = check.unmatched || [];
 
-        // 📌 CASE A: ALL items are unmatched → treat as availability inquiry,
-        // do NOT create/append any order.
+        // 📌 CASE A: ALL items are unmatched
         if (!matched.length && unmatched.length) {
           const missingNames = unmatched
-            .map((it) => trim(it.name || it.canonical || ""))
+            .map((it) => normalizeNameForMatch(it.name || it.canonical || ""))
             .filter(Boolean);
 
           const tag = "catalog_unmatched_only:" + missingNames.join("|");
@@ -1461,16 +1755,94 @@ export async function ingestCoreFromMessage(
             missingNames,
           });
 
+          // Try to build a smart clarify reply instead of placing a bad order
+          const firstLabel =
+            normalizeNameForMatch(
+              unmatched[0].canonical || unmatched[0].name || ""
+            ) ||
+            missingNames[0] ||
+            textFlat;
+
+          let replyText = `I couldn’t find "${firstLabel}" exactly in today’s menu.`;
+
+          try {
+            // Use your matcher to find the best product and its siblings (variants)
+            const best = await findBestProductForTextV2(orgId, firstLabel);
+            if (best && (best.canonical || best.display_name)) {
+              const canonical = (best.canonical || "").trim();
+              const { data: siblings, error: siblingsErr } = await supa
+                .from("products")
+                .select("display_name, variant")
+                .eq("org_id", orgId)
+                .eq("canonical", canonical);
+
+              if (!siblingsErr && siblings && siblings.length) {
+                const uniqueNames = Array.from(
+                  new Set(
+                    siblings
+                      .map(
+                        (s: any) =>
+                          String(s.display_name || "").trim() ||
+                          String(s.variant || "").trim()
+                      )
+                      .filter(Boolean)
+                  )
+                );
+
+                if (uniqueNames.length) {
+                  replyText += "\nWe do have:\n";
+                  replyText += uniqueNames
+                    .map((n, idx) => `${idx + 1}) ${n}`)
+                    .join("\n");
+                  replyText +=
+                    "\n\nPlease reply with the option number or exact name.";
+                } else {
+                  replyText +=
+                    "\nPlease send the exact item name as shown in the menu.";
+                }
+              } else {
+                replyText +=
+                  "\nPlease send the exact item name as shown in the menu.";
+              }
+            } else {
+              replyText +=
+                "\nPlease send the exact item name as shown in the menu.";
+            }
+          } catch (e: any) {
+            console.warn(
+              "[INGEST][core][catalog_unmatched_only clarify warn]",
+              e?.message || e
+            );
+            // fallback: simple message
+            replyText +=
+              "\nPlease send the exact item name as shown in the menu.";
+          }
+
+          // ❌ Do NOT create / append an order here.
+          // Treat this as an availability-style inquiry needing clarification.
+          if (phoneKey) {
+            await markSessionOnInquiry({
+              org_id: orgId,
+              phone_key: phoneKey,
+              kind: "availability",
+              canonical: firstLabel,
+              text: textRaw,
+              status: "pending",
+            });
+          }
+
           return {
             ok: true,
             stored: false,
             kind: "inquiry",
             used: "inquiry",
-            order_id: undefined,
-            inquiry: "availability", // InquiryKind
+            inquiry: "availability",
             inquiry_type: "availability",
-            inquiry_canonical: missingNames[0] || "",
-            reason: tag,
+            inquiry_canonical: firstLabel,
+            reply: replyText,
+            reason: (parsed.reason
+              ? `${parsed.reason}; ${tag}`
+              : tag) as string,
           };
         }
 
@@ -1479,10 +1851,10 @@ export async function ingestCoreFromMessage(
           parsed.items = matched;
         }
 
-        // Tag the unmatched ones so WABA can show a ⚠️ line if it wants
+        // Tag the unmatched ones so WABA can still show a warning if needed
         if (unmatched.length) {
           const missingNames = unmatched
-            .map((it) => trim(it.canonical || it.name || ""))
+            .map((it) => normalizeNameForMatch(it.canonical || it.name || ""))
             .filter(Boolean);
 
           if (missingNames.length) {
@@ -1498,6 +1870,66 @@ export async function ingestCoreFromMessage(
       }
     } catch (e: any) {
       console.warn("[INGEST][core][catalog_tag warn]", e?.message || e);
+    }
+
+    // ─────────────────────────────────────────
+    // LAYER 6b: Inline VARIANT CLARIFY (pre-order)
+    // If there are multiple variants in catalog for an item, and
+    // user text does not clearly pick one → ask "Which variant?"
+    // instead of blindly placing an order.
+    // ─────────────────────────────────────────
+    // ─────────────────────────────────────────
+    // LAYER 6b: Inline VARIANT CLARIFY (pre-order)
+    // ─────────────────────────────────────────
+    try {
+      const clarifyTarget = await findFirstVariantClarifyTarget(
+        orgId,
+        parsed.items || []
+      );
+
+      if (
+        clarifyTarget &&
+        parsed.items.length === 1 &&                       // Single item only
+        !hasListShape &&                                  // Not multi-line list
+        !/\band\b/i.test(textFlat) &&                     // No "and" multiple items
+        !/\b(\d+|\d+\s*(kg|g|l|ml|pcs|packs))\b/i.test(textFlat) && // Not explicit ordered qties
+        (looksLikeQuestion || nlu.intent !== "order")     // Only questions, not orders
+      ) {
+        const niceName = clarifyTarget.displayName || clarifyTarget.canonical;
+        const prettyVariants = clarifyTarget.variants
+          .map((v) =>
+            v
+              .split(" ")
+              .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+              .join(" ")
+          )
+          .join(" / ");
+
+        const replyText = `Which ${niceName} – ${prettyVariants}?`;
+
+        console.log("[INGEST][core][variant_clarify]", {
+          canonical: clarifyTarget.canonical,
+          variants: clarifyTarget.variants,
+        });
+
+        // 🔥 FIX: VARIANT CLARIFY IS NOT AN INQUIRY
+        return {
+          ok: true,
+          stored: false,
+          kind: "inquiry", // ✅ allowed by IngestResult
+          used: "inquiry", // ✅ allowed by IngestResult
+          inquiry: "availability",
+          inquiry_type: "availability",
+          inquiry_canonical: clarifyTarget.canonical,
+          reply: replyText,
+          reason: "variant_clarify",
+        };
+      }
+    } catch (e: any) {
+      console.warn(
+        "[INGEST][core][variant_clarify block warn]",
+        e?.message || e
+      );
     }
 
     // Ignore seller-style money messages (heuristic)
@@ -1706,6 +2138,16 @@ export async function ingestCoreFromMessage(
               "[INGEST][core] forced append into active_order_id",
               target.id
             );
+
+            if (phoneKey) {
+              await markSessionOnAppendOrder({
+                org_id: orgId,
+                phone_key: phoneKey,
+                order_id: target.id,
+                status,
+              });
+            }
+
             return {
               ok: true,
               stored: true,
@@ -1726,120 +2168,187 @@ export async function ingestCoreFromMessage(
     }
 
     // ─────────────────────────────────────────────────────────
-    // Decide append vs new using last order snapshot
+    // LAYER B: Session Engine decision (append vs new)
     // ─────────────────────────────────────────────────────────
-    const phonePlain = String(phoneNorm || "").replace(/^\+/, "");
-    const { data: lastRowsAny } = await supa
-      .from("orders")
-      .select("id, status, created_at")
-      .eq("org_id", orgId)
-      .or(`source_phone.eq.${phonePlain},source_phone.eq.+${phonePlain}`)
-      .not("status", "in", ["cancelled_by_customer", "archived_for_new"])
-      .order("created_at", { ascending: false })
-      .limit(1);
 
-    const lastAny = lastRowsAny?.[0] || null;
+    let sessionAction: "start_new_order" | "append_items" = "start_new_order";
+    let sessionTargetOrderId: string | null = null;
+    let sessionReason: string | null = null;
 
-    const { action: linkAction, reason: linkReason } = decideLinking(
-      lastAny
+    if (phoneKey) {
+      // Build minimal NLU + parsed payload for the session engine
+      const sessionNlu: SessionNluResult | null = nlu
         ? {
-            status: lastAny.status as any,
-            last_inbound_at: lastAny.created_at,
-            created_at: lastAny.created_at,
+            intent: mapToSessionIntent(nlu.intent as any),
+            canonical: (nlu.canonical ?? null) as string | null,
+            confidence: typeof nlu.confidence === "number" ? nlu.confidence : 0,
           }
-        : null,
-      textFlat
-    );
+        : null;
 
-    console.log(
-      "[INGEST][link] action=%s last=%s",
-      linkAction,
-      lastAny?.id || "none"
-    );
+      const sessionParsed: SessionParsedMessage = {
+        kind: "order",
+        items: parsed.items || [],
+        inquiryKind: null,
+        canonical: null,
+        reason: parsed.reason ?? null,
+        raw: null,
+      };
+
+      const sessionDecision = await decideSessionNextStep({
+        org_id: orgId,
+        phone_key: phoneKey,
+        text: textFlat,
+        nlu: sessionNlu,
+        parsed: sessionParsed,
+      });
+
+      console.log("[INGEST][sessionDecision]", sessionDecision);
+
+      // If session engine says this is not an order action, do nothing safely
+      if (
+        sessionDecision.action !== "start_new_order" &&
+        sessionDecision.action !== "append_items"
+      ) {
+        return {
+          ok: true,
+          stored: false,
+          kind: "none",
+          used: parsed.used,
+          reason: `session_${sessionDecision.action}`,
+        };
+      }
+
+      sessionAction = sessionDecision.action;
+      sessionTargetOrderId = sessionDecision.targetOrderId || null;
+      sessionReason = sessionDecision.reason || null;
+    } else {
+      // No phone → no session tracking; default to NEW order
+      sessionAction = "start_new_order";
+      sessionTargetOrderId = null;
+      sessionReason = "no_phone_key_session_default_new";
+    }
 
     // ─────────────────────────────────────────────────────────
-    // Apply decision: append to last open order OR create a new one
+    // Apply SessionEngine decision: APPEND or NEW
     // ─────────────────────────────────────────────────────────
-    if (
-      linkAction === "append" &&
-      lastAny &&
-      !["shipped", "paid"].includes(String(lastAny.status))
-    ) {
-      // Append into lastAny
-      const { data: curRow, error: curErr } = await supa
-        .from("orders")
-        .select("items, created_at")
-        .eq("id", lastAny.id)
-        .single();
-      if (curErr) throw curErr;
 
-      const newItems = [...(curRow?.items || []), ...parsed.items];
-
-      const { error: upErr } = await supa
-        .from("orders")
-        .update({
-          items: newItems,
-          parse_reason:
-            (parsed.reason ?? "merged_append") +
-            (msg_id ? `; msgid:${msg_id}` : ""),
-          parse_confidence: parsed.confidence ?? null,
-          ...(msg_id ? { msg_id } : {}),
-          order_link_reason: linkReason || "merged_append",
-        })
-        .eq("id", lastAny.id);
-
-      if (upErr) throw upErr;
-
-      // learning writes (non-fatal)
+    // 1) APPEND path (SessionEngine says append_items to some order)
+    if (sessionAction === "append_items" && sessionTargetOrderId) {
       try {
-        for (const it of parsed.items) {
-          const canon = trim(it.canonical || it.name || "");
-          if (!canon) continue;
-          const brand = (it.brand ?? "") + "";
-          const variant = (it.variant ?? "") + "";
-          const { error: eb } = await supa.rpc("upsert_bvs", {
-            p_org_id: orgId,
-            p_canonical: canon,
-            p_brand: brand,
-            p_variant: variant,
-            p_inc: 1,
-          });
-          if (eb) console.warn("[INGEST][core][bvs err]", eb.message);
-          if (phoneNorm) {
-            const { error: ec } = await supa.rpc("upsert_customer_pref", {
-              p_org_id: orgId,
-              p_phone: phoneNorm, // normalized for consistency
-              p_canonical: canon,
-              p_brand: brand,
-              p_variant: variant,
-              p_inc: 1,
-            });
-            if (ec) console.warn("[INGEST][core][custpref err]", ec.message);
+        const { data: target, error: tgtErr } = await supa
+          .from("orders")
+          .select("id, items, status, source_phone")
+          .eq("org_id", orgId)
+          .eq("id", sessionTargetOrderId)
+          .single();
+
+        if (!tgtErr && target && target.id) {
+          const status = String(target.status || "").toLowerCase();
+
+          const phonePlain = String(phoneNorm || "").replace(/^\+/, "");
+          const srcPhone = String(target.source_phone || "");
+          const matchesPhone =
+            !phonePlain ||
+            srcPhone === phonePlain ||
+            srcPhone === "+" + phonePlain;
+
+          const isOpen = ![
+            "cancelled_by_customer",
+            "archived_for_new",
+            "paid",
+            "shipped",
+          ].includes(status);
+
+          if (matchesPhone && isOpen) {
+            const prevItems = Array.isArray(target.items) ? target.items : [];
+            const newItems = [...prevItems, ...(parsed.items || [])];
+
+            const linkReason = sessionReason || "session_append_items";
+
+            const { error: upErr } = await supa
+              .from("orders")
+              .update({
+                items: newItems,
+                parse_reason:
+                  (parsed.reason ?? "session_append_items") +
+                  (msg_id ? `; msgid:${msg_id}` : ""),
+                parse_confidence: parsed.confidence ?? null,
+                ...(msg_id ? { msg_id } : {}),
+                order_link_reason: linkReason,
+              })
+              .eq("id", target.id);
+
+            if (upErr) throw upErr;
+
+            // learning writes (same as older append path)
+            try {
+              for (const it of parsed.items) {
+                const canon = trim(it.canonical || it.name || "");
+                if (!canon) continue;
+                const brand = (it.brand ?? "") + "";
+                const variant = (it.variant ?? "") + "";
+                const { error: eb } = await supa.rpc("upsert_bvs", {
+                  p_org_id: orgId,
+                  p_canonical: canon,
+                  p_brand: brand,
+                  p_variant: variant,
+                  p_inc: 1,
+                });
+                if (eb) console.warn("[INGEST][core][bvs err]", eb.message);
+                if (phoneNorm) {
+                  const { error: ec } = await supa.rpc("upsert_customer_pref", {
+                    p_org_id: orgId,
+                    p_phone: phoneNorm,
+                    p_canonical: canon,
+                    p_brand: brand,
+                    p_variant: variant,
+                    p_inc: 1,
+                  });
+                  if (ec)
+                    console.warn("[INGEST][core][custpref err]", ec.message);
+                }
+              }
+            } catch (e: any) {
+              console.warn(
+                "[INGEST][core][session_append learn warn]",
+                e?.message || e
+              );
+            }
+
+            // Auto-clarify if needed (WABA-only)
+            await maybeAutoSendClarify(orgId, target.id, source);
+
+            if (phoneKey) {
+              await markSessionOnAppendOrder({
+                org_id: orgId,
+                phone_key: phoneKey,
+                order_id: target.id,
+                status,
+              });
+            }
+
+            console.log("[INGEST][core] session-append into", target.id);
+
+            return {
+              ok: true,
+              stored: true,
+              kind: "order",
+              used: parsed.used,
+              merged_into: target.id,
+              order_id: target.id,
+              items: newItems,
+              org_id: orgId,
+              reason: "session_append_items",
+            };
           }
         }
       } catch (e: any) {
-        console.warn("[INGEST][core][append learn warn]", e?.message || e);
+        console.warn("[INGEST][core][session_append warn]", e?.message || e);
+        // fall through to NEW order path if append failed
       }
-
-      console.log("[INGEST][core] merged into", lastAny.id, "(APPENDED)");
-
-      // ⬇️ NEW: AFTER append, maybe auto-send clarify (WABA only)
-      await maybeAutoSendClarify(orgId, lastAny.id, source);
-
-      return {
-        ok: true,
-        stored: true,
-        kind: "order",
-        used: parsed.used,
-        merged_into: lastAny.id,
-        order_id: lastAny.id,
-        items: newItems,
-        org_id: orgId,
-        reason: "merged_append",
-      };
     }
 
-    // Otherwise → NEW order path (falls through to dedupe + insert)
+    // 2) NEW order path (SessionEngine says start_new_order OR append failed)
 
     // New order dedupe
     const dedupeKey = makeDedupeKey(
@@ -1886,6 +2395,8 @@ export async function ingestCoreFromMessage(
       }
     }
 
+    const linkReasonNew = sessionReason || "session_new_order";
+
     // Insert NEW order
     const reasonTag =
       (parsed.reason ?? "") + (msg_id ? `; msgid:${msg_id}` : "");
@@ -1903,13 +2414,22 @@ export async function ingestCoreFromMessage(
         parse_confidence: parsed.confidence ?? null,
         parse_reason: reasonTag || null,
         msg_id: msg_id || null,
-        order_link_reason: linkReason || "new",
+        order_link_reason: linkReasonNew,
       })
       .select("id")
       .single();
     if (insErr) throw insErr;
 
     console.log("[INGEST][core] stored NEW", { orgId, dedupeKey });
+
+    if (phoneKey && created?.id) {
+      await markSessionOnNewOrder({
+        org_id: orgId,
+        phone_key: phoneKey,
+        order_id: created.id,
+        status: "pending",
+      });
+    }
 
     // learning writes (non-fatal)
     try {
@@ -1942,7 +2462,7 @@ export async function ingestCoreFromMessage(
       console.warn("[INGEST][core][learn non-fatal]", e?.message || e);
     }
 
-    // ⬇️ NEW: AFTER new insert, maybe auto-send clarify (WABA only)
+    // AFTER new insert, maybe auto-send clarify (WABA only)
     await maybeAutoSendClarify(orgId, created!.id, source);
 
     return {
