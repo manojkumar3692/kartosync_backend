@@ -98,14 +98,24 @@ export async function getCustomerSession(
 
   if (error) {
     console.warn("[SESSION][getCustomerSession] err", error.message);
-    return emptySession(orgId, phoneKey);
+    const empty = emptySession(orgId, phoneKey);
+    console.log("[SESSION][getCustomerSession] empty_due_to_error", {
+      orgId,
+      phoneKey,
+    });
+    return empty;
   }
 
   if (!data) {
-    return emptySession(orgId, phoneKey);
+    const empty = emptySession(orgId, phoneKey);
+    console.log("[SESSION][getCustomerSession] empty_no_row", {
+      orgId,
+      phoneKey,
+    });
+    return empty;
   }
 
-  return {
+  const session: CustomerSession = {
     org_id: data.org_id,
     phone_key: phoneKey,
 
@@ -125,6 +135,17 @@ export async function getCustomerSession(
 
     last_seen_at: data.last_seen_at ?? null,
   };
+
+  console.log("[SESSION][getCustomerSession] loaded", {
+    orgId,
+    phoneKey,
+    active_order_id: session.active_order_id,
+    last_order_id: session.last_order_id,
+    last_order_status: session.last_order_status,
+    last_order_at: session.last_order_at,
+  });
+
+  return session;
 }
 
 /**
@@ -496,6 +517,23 @@ export async function decideOrderSessionAction(opts: {
       ? opts.hasActiveOrder
       : !!activeOrderId;
 
+  console.log("[SESSION][engine][input]", {
+    org_id,
+    phone_key,
+    text,
+    lowerText,
+    nlu_intent: nlu?.intent,
+    nlu_confidence: nlu?.confidence,
+    parse_kind: parse?.kind,
+    parse_items_count: Array.isArray(parse?.items) ? parse!.items!.length : 0,
+    parse_reason: parse?.reason,
+    explicitCommand,
+    looksLikeAddToExisting,
+    aiThinksSoftCancel,
+    activeOrderId,
+    hasActiveOrder,
+  });
+
   const baseDecision = (
     kind: SessionDecisionKind,
     reason: string
@@ -516,51 +554,69 @@ export async function decideOrderSessionAction(opts: {
     (nlu.intent === "spam" ||
       (nlu.intent === "smalltalk" && nlu.confidence >= 0.8))
   ) {
-    return baseDecision("noop", "nlu:smalltalk_or_spam");
+    const d = baseDecision("noop", "nlu:smalltalk_or_spam");
+    console.log("[SESSION][engine][decision]", d);
+    return d;
   }
 
   // ─────────────────────────────
   // 1) Explicit commands override NLU
   // ─────────────────────────────
   if (explicitCommand === "agent") {
-    // Session engine doesn't route humans – let WABA handle it.
-    return baseDecision("noop", "command:agent");
+    const d = baseDecision("noop", "command:agent");
+    console.log("[SESSION][engine][decision]", d);
+    return d;
   }
 
   if (explicitCommand === "new") {
-    return baseDecision("start_new_order", "command:new_order");
+    const d = baseDecision("start_new_order", "command:new_order");
+    console.log("[SESSION][engine][decision]", d);
+    return d;
   }
 
   if (explicitCommand === "repeat") {
-    // Frontend / WABA will usually convert last order → synthetic text.
-    // At session level this is just "start a new order from items".
-    return baseDecision("start_new_order", "command:repeat_last_order");
+    const d = baseDecision("start_new_order", "command:repeat_last_order");
+    console.log("[SESSION][engine][decision]", d);
+    return d;
   }
 
   if (explicitCommand === "cancel") {
     if (!hasActiveOrder) {
-      return baseDecision("noop", "command:cancel_but_no_active_order");
+      const d = baseDecision(
+        "noop",
+        "command:cancel_but_no_active_order"
+      );
+      console.log("[SESSION][engine][decision]", d);
+      return d;
     }
-    return {
+    const d: SessionDecision = {
       ...baseDecision("cancel_items", "command:cancel_active_order"),
       targetOrderId: activeOrderId,
     };
+    console.log("[SESSION][engine][decision]", d);
+    return d;
   }
 
   if (explicitCommand === "update") {
-    // For now: we don't auto-edit; treat as "clarify/notify store".
-    return baseDecision("clarify_before_action", "command:update_order");
+    const d = baseDecision(
+      "clarify_before_action",
+      "command:update_order"
+    );
+    console.log("[SESSION][engine][decision]", d);
+    return d;
   }
 
   // ─────────────────────────────
   // 2) Soft cancel (text / AI)
   // ─────────────────────────────
   if (aiThinksSoftCancel && hasActiveOrder) {
-    return {
+    const d: SessionDecision = {
       ...baseDecision("cancel_items", "soft_cancel:ai_signal"),
       targetOrderId: activeOrderId,
       needsClarify: true, // e.g. ask YES/NO before real cancel
     };
+    console.log("[SESSION][engine][decision]", d);
+    return d;
   }
 
   // ─────────────────────────────
@@ -569,25 +625,31 @@ export async function decideOrderSessionAction(opts: {
   if (!parse || parse.kind === "none") {
     if (nlu?.intent === "order" && nlu.confidence >= 0.7) {
       if (!hasActiveOrder) {
-        return baseDecision("start_new_order", "nlu:order_no_active");
+        const d = baseDecision("start_new_order", "nlu:order_no_active");
+        console.log("[SESSION][engine][decision]", d);
+        return d;
       }
 
       if (looksLikeAddToExisting) {
-        return {
+        const d: SessionDecision = {
           ...baseDecision("append_items", "nlu:order_add_to_existing"),
           targetOrderId: activeOrderId,
         };
+        console.log("[SESSION][engine][decision]", d);
+        return d;
       }
 
-      // Unsure whether new or append → ask.
-      return {
+      const d: SessionDecision = {
         ...baseDecision("clarify_before_action", "nlu:order_need_clarify"),
         needsClarify: true,
       };
+      console.log("[SESSION][engine][decision]", d);
+      return d;
     }
 
-    // Inquiry / address_update handled elsewhere; here we noop.
-    return baseDecision("noop", "no_parse_and_not_order");
+    const d = baseDecision("noop", "no_parse_and_not_order");
+    console.log("[SESSION][engine][decision]", d);
+    return d;
   }
 
   // ─────────────────────────────
@@ -595,27 +657,31 @@ export async function decideOrderSessionAction(opts: {
   // ─────────────────────────────
   if (parse.kind === "modifier") {
     if (!hasActiveOrder) {
-      return baseDecision(
+      const d = baseDecision(
         "clarify_before_action",
         "modifier_but_no_active_order"
       );
+      console.log("[SESSION][engine][decision]", d);
+      return d;
     }
 
-    return {
+    const d: SessionDecision = {
       ...baseDecision("modify_existing_order", "modifier_for_active_order"),
       targetOrderId: activeOrderId,
-      // NOTE: Step 4 will fill modifierPatch in a structured way.
       modifierPatch: null,
       needsClarify: false,
     };
+    console.log("[SESSION][engine][decision]", d);
+    return d;
   }
 
   // ─────────────────────────────
   // 5) Inquiry messages (menu / price / availability)
   // ─────────────────────────────
   if (parse.kind === "inquiry") {
-    // Session engine doesn’t decide auto-reply content here.
-    return baseDecision("noop", "inquiry_message");
+    const d = baseDecision("noop", "inquiry_message");
+    console.log("[SESSION][engine][decision]", d);
+    return d;
   }
 
   // ─────────────────────────────
@@ -625,36 +691,53 @@ export async function decideOrderSessionAction(opts: {
     const items = Array.isArray(parse.items) ? parse.items : [];
 
     if (!items.length) {
-      return baseDecision("clarify_before_action", "order_no_items_parsed");
+      const d = baseDecision(
+        "clarify_before_action",
+        "order_no_items_parsed"
+      );
+      console.log("[SESSION][engine][decision]", d);
+      return d;
     }
 
     // 6.1) No active order → clearly a NEW ORDER
     if (!hasActiveOrder) {
-      return baseDecision("start_new_order", "order_no_active_order");
+      const d = baseDecision("start_new_order", "order_no_active_order");
+      console.log("[SESSION][engine][decision]", d);
+      return d;
     }
 
     // 6.2) Looks like “add more” → append_items
     if (looksLikeAddToExisting) {
-      return {
-        ...baseDecision("append_items", "order_add_to_existing_heuristic"),
+      const d: SessionDecision = {
+        ...baseDecision(
+          "append_items",
+          "order_add_to_existing_heuristic"
+        ),
         targetOrderId: activeOrderId,
         itemsToAppend: items,
       };
+      console.log("[SESSION][engine][decision]", d);
+      return d;
     }
 
     // 6.3) Parser already linked to an order_id → respect when it matches active
     if (parse.order_id && parse.order_id === activeOrderId) {
-      return {
-        ...baseDecision("append_items", "order_parser_wants_append_to_active"),
+      const d: SessionDecision = {
+        ...baseDecision(
+          "append_items",
+          "order_parser_wants_append_to_active"
+        ),
         targetOrderId: activeOrderId,
         itemsToAppend: items,
       };
+      console.log("[SESSION][engine][decision]", d);
+      return d;
     }
 
     // 6.4) Parser created a NEW order but we ALSO have an active order.
     // Here we ask user which behaviour they want.
     if (parse.order_id && parse.order_id !== activeOrderId) {
-      return {
+      const d: SessionDecision = {
         ...baseDecision(
           "clarify_before_action",
           "order_ambiguous_existing_vs_new"
@@ -663,10 +746,12 @@ export async function decideOrderSessionAction(opts: {
         itemsToAppend: items,
         needsClarify: true,
       };
+      console.log("[SESSION][engine][decision]", d);
+      return d;
     }
 
     // 6.5) Fallback: we have active order, but no strong “add more” signal
-    return {
+    const d: SessionDecision = {
       ...baseDecision(
         "clarify_before_action",
         "order_with_active_need_clarify"
@@ -675,12 +760,16 @@ export async function decideOrderSessionAction(opts: {
       itemsToAppend: items,
       needsClarify: true,
     };
+    console.log("[SESSION][engine][decision]", d);
+    return d;
   }
 
   // ─────────────────────────────
   // Default: do nothing at session level
   // ─────────────────────────────
-  return baseDecision("noop", "default_fallback");
+  const d = baseDecision("noop", "default_fallback");
+  console.log("[SESSION][engine][decision]", d);
+  return d;
 }
 
 // ─────────────────────────────────────────────
@@ -688,108 +777,121 @@ export async function decideOrderSessionAction(opts: {
 // ─────────────────────────────────────────────
 
 export type ParsedMessage = {
-    kind: "order" | "inquiry" | "modifier" | "none";
-    items: any[];
-    inquiryKind: InquiryKind | null;
-    canonical: string | null;
-    reason: string | null;
-    raw: any | null;
-  };
-  
-  export async function decideSessionNextStep(opts: {
-    org_id: string;
-    phone_key: string;
-    text: string;
-    nlu: NluResult | null;
-    parsed: ParsedMessage;
-  }): Promise<{
-    action: "start_new_order" | "append_items" | "noop";
-    targetOrderId?: string | null;
-    reason?: string;
-  }> {
-    const decision = await decideOrderSessionAction({
-      org_id: opts.org_id,
-      phone_key: opts.phone_key,
-      text: opts.text,
-      nlu: opts.nlu,
-      parse: {
-        kind: opts.parsed.kind,
-        items: opts.parsed.items,
-        reason: opts.parsed.reason,
-      },
-      explicitCommand: null,
-      looksLikeAddToExisting: false,
-      aiThinksSoftCancel: false,
-    });
-  
-    let action: "start_new_order" | "append_items" | "noop";
-    switch (decision.kind) {
-      case "start_new_order":
-        action = "start_new_order";
-        break;
-      case "append_items":
-        action = "append_items";
-        break;
-      default:
-        action = "noop";
-    }
-  
-    return {
-      action,
-      targetOrderId: decision.targetOrderId ?? null,
-      reason: decision.reason,
-    };
+  kind: "order" | "inquiry" | "modifier" | "none";
+  items: any[];
+  inquiryKind: InquiryKind | null;
+  canonical: string | null;
+  reason: string | null;
+  raw: any | null;
+};
+
+export async function decideSessionNextStep(opts: {
+  org_id: string;
+  phone_key: string;
+  text: string;
+  nlu: NluResult | null;
+  parsed: ParsedMessage;
+}): Promise<{
+  action: "start_new_order" | "append_items" | "noop";
+  targetOrderId?: string | null;
+  reason?: string;
+}> {
+  const decision = await decideOrderSessionAction({
+    org_id: opts.org_id,
+    phone_key: opts.phone_key,
+    text: opts.text,
+    nlu: opts.nlu,
+    parse: {
+      kind: opts.parsed.kind,
+      items: opts.parsed.items,
+      reason: opts.parsed.reason,
+    },
+    explicitCommand: null,
+    looksLikeAddToExisting: false,
+    aiThinksSoftCancel: false,
+  });
+
+  let action: "start_new_order" | "append_items" | "noop";
+  switch (decision.kind) {
+    case "start_new_order":
+      action = "start_new_order";
+      break;
+    case "append_items":
+      action = "append_items";
+      break;
+    default:
+      action = "noop";
   }
 
-  export type CustomerInsight = {
-    activeOrderId: string | null;
-  
-    lastOrder: {
-      id: string | null;
-      status: string | null;
-      at: string | null;
-    };
-  
-    lastInquiry: {
-      text: string | null;
-      kind: InquiryKind | null;
-      canonical: string | null;
-      at: string | null;
-      status: string | null;
-    };
-  
-    lastModifier: {
-      json: any | null;
-      at: string | null;
-    };
-  
-    lastSeenAt: string | null;
+  const out = {
+    action,
+    targetOrderId: decision.targetOrderId ?? null,
+    reason: decision.reason,
   };
-  
-  /**
-   * Convert raw CustomerSession → compact insight object for UI.
-   */
-  export function buildCustomerInsight(
-    session: CustomerSession
-  ): CustomerInsight {
-    return {
-      activeOrderId: session.active_order_id || null,
-      lastOrder: {
-        id: session.last_order_id || null,
-        status: session.last_order_status || null,
-        at: session.last_order_at || null,
-      },
-      lastInquiry: {
-        text: session.last_inquiry_text || null,
-        kind: session.last_inquiry_kind,
-        canonical: session.last_inquiry_canonical || null,
-        at: session.last_inquiry_at || null,
-        status: session.last_inquiry_status || null,
-      },
-      lastModifier: {
-        json: session.last_modifier_json ?? null,
-        at: session.last_modifier_at || null,
-      },
-      lastSeenAt: session.last_seen_at || null,
-    };
-  }
+
+  console.log("[SESSION][engine][nextStep]", {
+    org_id: opts.org_id,
+    phone_key: opts.phone_key,
+    text: opts.text,
+    decision_kind: decision.kind,
+    decision_reason: decision.reason,
+    decision_targetOrderId: decision.targetOrderId ?? null,
+    action: out.action,
+    action_targetOrderId: out.targetOrderId,
+  });
+
+  return out;
+}
+
+export type CustomerInsight = {
+  activeOrderId: string | null;
+
+  lastOrder: {
+    id: string | null;
+    status: string | null;
+    at: string | null;
+  };
+
+  lastInquiry: {
+    text: string | null;
+    kind: InquiryKind | null;
+    canonical: string | null;
+    at: string | null;
+    status: string | null;
+  };
+
+  lastModifier: {
+    json: any | null;
+    at: string | null;
+  };
+
+  lastSeenAt: string | null;
+};
+
+/**
+ * Convert raw CustomerSession → compact insight object for UI.
+ */
+export function buildCustomerInsight(
+  session: CustomerSession
+): CustomerInsight {
+  return {
+    activeOrderId: session.active_order_id || null,
+    lastOrder: {
+      id: session.last_order_id || null,
+      status: session.last_order_status || null,
+      at: session.last_order_at || null,
+    },
+    lastInquiry: {
+      text: session.last_inquiry_text || null,
+      kind: session.last_inquiry_kind,
+      canonical: session.last_inquiry_canonical || null,
+      at: session.last_inquiry_at || null,
+      status: session.last_inquiry_status || null,
+    },
+    lastModifier: {
+      json: session.last_modifier_json ?? null,
+      at: session.last_modifier_at || null,
+    },
+    lastSeenAt: session.last_seen_at || null,
+  };
+}

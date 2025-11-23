@@ -52,6 +52,8 @@ import { interpretMessage } from "../ai/interpreter";
 import { saveAiInsight } from "../routes/waba/aiInsights";
 import { resolveActiveOrderIdForCustomer } from "../session/sessionEngine";
 import { resolveAliasForText } from "../routes/waba/aliasEngine";
+// at the top of waba.ts
+import { normalizeLabelForFuzzy, fuzzyCharOverlapScore } from "../util/fuzzy";
 
 export const waba = express.Router();
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || "";
@@ -62,6 +64,10 @@ waba.use((req, _res, next) => {
   wabaDebug("[WABA][ROUTER HIT]", req.method, req.path);
   next();
 });
+
+// Very simple in-memory dedupe for msg IDs (WABA)
+const seenMsgIds = new Set<string>();
+const MAX_SEEN_MSG_IDS = 5000; // avoid unbounded growth
 
 console.log("VERSION 18AAAA --------");
 
@@ -119,30 +125,30 @@ type ProductOptionsResult = {
 // ─────────────────────────────
 
 // Normalize text for fuzzy comparison (lowercase, remove spaces/punctuation)
-function normalizeLabelForFuzzy(raw: string): string {
-  return String(raw || "")
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "") // strip accents
-    .replace(/[^a-z0-9]+/g, "") // keep only a-z0-9
-    .trim();
-}
+// function normalizeLabelForFuzzy(raw: string): string {
+//   return String(raw || "")
+//     .toLowerCase()
+//     .normalize("NFKD")
+//     .replace(/[\u0300-\u036f]/g, "") // strip accents
+//     .replace(/[^a-z0-9]+/g, "") // keep only a-z0-9
+//     .trim();
+// }
 
 // Very simple similarity: how many chars overlap vs max length
-function fuzzyCharOverlapScore(a: string, b: string): number {
-  const s1 = normalizeLabelForFuzzy(a);
-  const s2 = normalizeLabelForFuzzy(b);
-  if (!s1 || !s2) return 0;
+// function fuzzyCharOverlapScore(a: string, b: string): number {
+//   const s1 = normalizeLabelForFuzzy(a);
+//   const s2 = normalizeLabelForFuzzy(b);
+//   if (!s1 || !s2) return 0;
 
-  const set1 = new Set(s1.split(""));
-  let matches = 0;
-  for (const ch of s2) {
-    if (set1.has(ch)) matches++;
-  }
-  const maxLen = Math.max(s1.length, s2.length);
-  if (!maxLen) return 0;
-  return matches / maxLen; // 0 → no overlap, 1 → perfect
-}
+//   const set1 = new Set(s1.split(""));
+//   let matches = 0;
+//   for (const ch of s2) {
+//     if (set1.has(ch)) matches++;
+//   }
+//   const maxLen = Math.max(s1.length, s2.length);
+//   if (!maxLen) return 0;
+//   return matches / maxLen; // 0 → no overlap, 1 → perfect
+// }
 
 // Look up close product names for a misspelled label
 async function findFuzzyProductSuggestions(opts: {
@@ -979,7 +985,25 @@ waba.post("/", async (req, res) => {
           const msgId = msg.id as string;
           const ts = Number(msg.timestamp || Date.now()) * 1000;
 
+          if (seenMsgIds.has(msgId)) {
+            console.log("[WABA][DEDUP] skipping already-seen msg", msgId);
+            continue;
+          }
+          seenMsgIds.add(msgId);
+          if (seenMsgIds.size > MAX_SEEN_MSG_IDS) {
+            // crude GC: clear when too big
+            seenMsgIds.clear();
+          }
+
           if (!text) continue;
+
+          // 👇 SIMPLE INCOMING LOG
+          console.log("[FLOW][INCOMING]", {
+            org_id: org.id,
+            from, // raw WhatsApp number (no +)
+            msgId,
+            text,
+          });
 
           await logInboundMessageToInbox({
             orgId: org.id,
@@ -2876,7 +2900,125 @@ waba.post("/", async (req, res) => {
                 }
               }
             }
+
+            // ─────────────────────────────
+            // Alias confirm: ONLY for clean single-item orders
+            // ─────────────────────────────
+            if (
+              reply &&
+              items.length === 1 &&
+              !clarifyStart &&
+              unmatchedItems.length === 0
+            ) {
+              try {
+                const item = items[0] || {};
+
+                // What the user actually typed for this item (best effort)
+                const requestedLabelRaw =
+                  (typeof item.raw_text === "string" && item.raw_text.trim()) ||
+                  prettyLabelFromText(text);
+                const requestedLabel = requestedLabelRaw
+                  ? requestedLabelRaw.trim()
+                  : "";
+
+                // Canonical / product info from parser
+                const canonicalFromItem =
+                  typeof item.canonical === "string"
+                    ? item.canonical.trim()
+                    : "";
+                const nameFromItem =
+                  typeof item.name === "string" ? item.name.trim() : "";
+                const productIdFromItem =
+                  typeof item.product_id === "string" ? item.product_id : null;
+
+                const canonical =
+                  canonicalFromItem ||
+                  nameFromItem ||
+                  (result as any).canonical ||
+                  "";
+
+                // If we don't have a usable label or canonical, skip alias prompt
+                if (!requestedLabel || !canonical) {
+                  // do nothing
+                } else if (!shouldAskAliasConfirm(requestedLabel, canonical)) {
+                  // spelling is already close enough (biryani vs biriyani etc.)
+                  // don't annoy user with YES/NO
+                } else {
+                  // 🔍 Prefer lookup by product_id from the item, then fall back to canonical search
+                  let prod: any = null;
+                  let prodErr: any = null;
+
+                  if (productIdFromItem) {
+                    const res = await supa
+                      .from("products")
+                      .select("id, display_name, canonical")
+                      .eq("org_id", org.id)
+                      .eq("id", productIdFromItem)
+                      .maybeSingle();
+
+                    prod = res.data;
+                    prodErr = res.error;
+                  } else {
+                    const res = await supa
+                      .from("products")
+                      .select("id, display_name, canonical")
+                      .eq("org_id", org.id)
+                      .ilike("canonical", canonical)
+                      .limit(1)
+                      .maybeSingle();
+
+                    prod = res.data;
+                    prodErr = res.error;
+                  }
+
+                  if (!prodErr && prod && prod.id) {
+                    const canonicalName = (
+                      prod.display_name ||
+                      prod.canonical ||
+                      canonical ||
+                      requestedLabel
+                    ).trim();
+
+                    const phoneKey = normalizePhoneForKey(from);
+                    const wrongText = requestedLabel;
+                    const normalizedWrong = normalizeLabelForFuzzy(wrongText);
+
+                    pendingAliasConfirm.set(from, {
+                      orgId: org.id,
+                      customerPhone: phoneKey,
+                      wrongText,
+                      normalizedWrong,
+                      canonicalProductId: prod.id,
+                      canonicalName,
+                    });
+
+                    const aliasPrompt =
+                      `When you say *${wrongText}*, should I treat it as ` +
+                      `*${canonicalName}* from now on? Reply *YES* or *NO*.`;
+
+                    reply = reply + "\n\n" + aliasPrompt;
+
+                    await logFlowEvent({
+                      orgId: org.id,
+                      from,
+                      event: "alias_confirm_prompted_order",
+                      msgId,
+                      orderId: result.order_id,
+                      text,
+                      result: {
+                        wrongText,
+                        canonicalName,
+                        canonicalId: prod.id,
+                      },
+                    });
+                  }
+                }
+              } catch (e: any) {
+                console.warn("[ALIAS][prompt_order err]", e?.message || e);
+              }
+            }
           }
+
           // 3) Inquiry path → MENU or smart price/availability
           if (!reply && result.kind === "inquiry") {
             const inquiryRaw = result.inquiry || result.inquiry_type || null;
@@ -2956,118 +3098,6 @@ waba.post("/", async (req, res) => {
                 reply =
                   "💬 Got your question. We’ll confirm the details shortly.";
               }
-            }
-          }
-
-          // ─────────────────────────────
-          // After inquiry reply → ask alias confirmation (if applicable)
-          // ─────────────────────────────
-          if (reply && result.kind === "inquiry") {
-            try {
-              // What customer actually typed ("mutton biriyani")
-              const requestedLabelRaw = prettyLabelFromText(text);
-              const requestedLabel = requestedLabelRaw
-                ? requestedLabelRaw.trim()
-                : "";
-
-              // If we don't have a usable label, just skip alias learning
-              if (!requestedLabel) {
-                // do nothing, still send reply below
-              } else {
-                let canonical: string | null = null;
-                let productId: string | null = null;
-
-                if (typeof (result as any).inquiry_canonical === "string") {
-                  canonical = (result as any).inquiry_canonical;
-                } else if (typeof (result as any).canonical === "string") {
-                  canonical = (result as any).canonical;
-                }
-
-                if (typeof (result as any).inquiry_product_id === "string") {
-                  productId = (result as any).inquiry_product_id;
-                }
-
-                // If we know nothing about the product, skip alias question
-                if (!canonical && !productId) {
-                  // skip alias prompt
-                } else if (
-                  canonical &&
-                  !shouldAskAliasConfirm(requestedLabel, canonical)
-                ) {
-                  // user text ≈ canonical, no need to ask
-                } else {
-                  // 🔍 Prefer lookup by productId, fallback to canonical search
-                  let prod: any = null;
-                  let prodErr: any = null;
-
-                  if (productId) {
-                    const res = await supa
-                      .from("products")
-                      .select("id, display_name, canonical")
-                      .eq("org_id", org.id)
-                      .eq("id", productId)
-                      .maybeSingle();
-
-                    prod = res.data;
-                    prodErr = res.error;
-                  } else if (canonical) {
-                    const res = await supa
-                      .from("products")
-                      .select("id, display_name, canonical")
-                      .eq("org_id", org.id)
-                      .ilike("canonical", canonical)
-                      .limit(1)
-                      .maybeSingle();
-
-                    prod = res.data;
-                    prodErr = res.error;
-                  }
-
-                  if (!prodErr && prod && prod.id) {
-                    const canonicalName = (
-                      prod.display_name ||
-                      prod.canonical ||
-                      canonical ||
-                      requestedLabel
-                    ).trim();
-
-                    const phoneKey = normalizePhoneForKey(from);
-                    const wrongText = requestedLabel;
-                    const normalizedWrong = normalizeLabelForFuzzy(wrongText);
-
-                    pendingAliasConfirm.set(from, {
-                      orgId: org.id,
-                      customerPhone: phoneKey,
-                      wrongText,
-                      normalizedWrong,
-                      canonicalProductId: prod.id,
-                      canonicalName,
-                    });
-
-                    const aliasPrompt =
-                      `When you say *${wrongText}*, should I treat it as ` +
-                      `*${canonicalName}* from now on? Reply *YES* or *NO*.`;
-
-                    reply = reply + "\n\n" + aliasPrompt;
-
-                    await logFlowEvent({
-                      orgId: org.id,
-                      from,
-                      event: "alias_confirm_prompted",
-                      msgId,
-                      orderId: null,
-                      text,
-                      result: {
-                        wrongText,
-                        canonicalName,
-                        canonicalId: prod.id,
-                      },
-                    });
-                  }
-                }
-              }
-            } catch (e: any) {
-              console.warn("[ALIAS][prompt err]", e?.message || e);
             }
           }
 
@@ -3153,6 +3183,18 @@ waba.post("/", async (req, res) => {
             }
           }
           if (reply) {
+            // 👇 PAIR: customer text + reply + core result
+            console.log("[FLOW][PAIR]", {
+              org_id: org.id,
+              from,
+              msgId,
+              customer_text: text,
+              bot_reply: reply,
+              ingest_kind: result?.kind,
+              ingest_reason: result?.reason,
+              order_id: result?.order_id || null,
+            });
+
             await sendWabaText({
               phoneNumberId,
               to: from,
@@ -3203,6 +3245,15 @@ async function sendWabaText(opts: {
   }
 
   const toNorm = opts.to.startsWith("+") ? opts.to : `+${opts.to}`;
+
+  // 👇 SIMPLE OUTGOING LOG
+  console.log("[FLOW][OUTGOING]", {
+    org_id: opts.orgId || null,
+    to: toNorm,
+    phoneNumberId: opts.phoneNumberId,
+    text: opts.text || null,
+    image: opts.image || null,
+  });
 
   // -------------------------------------------
   // 🚀 1) SEND IMAGE (NEW)

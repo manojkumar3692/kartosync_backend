@@ -29,6 +29,7 @@ import {
 
 import { formatInquiryReply } from "../util/inquiryReply"; // NEW
 import { classifyMessage, NLUResult as CoreNluResult } from "../ai/nlu";
+import { fuzzyCharOverlapScore } from "../util/fuzzy"; // ⬅️ add at top
 
 // ─────────────────────────────────────────────────────────
 // Optional AI parser hook (safe if missing → rules fallback)
@@ -1122,6 +1123,30 @@ export async function ingestCoreFromMessage(
     const source = input.source || "other";
     const activeOrderId = trim(input.active_order_id || "");
 
+        // 🔒 EARLY msg_id dedupe guard
+    // If this exact WhatsApp message was already attached to an order,
+    // skip re-processing entirely (avoid extra GPT + double append).
+    //
+    // We ONLY skip when it's not an edit (edited_at = 0).
+    if (msg_id && !edited_at) {
+      const existingByMsg = await existsOrderByMsgId(msg_id);
+      if (existingByMsg) {
+        console.log("[INGEST][core][SKIP] duplicate-msgid-early", {
+          msg_id,
+          order_id: existingByMsg.id,
+        });
+
+        return {
+          ok: true,
+          stored: false,
+          kind: "none",
+          used: "none",
+          reason: "duplicate_msgid_early",
+          order_id: existingByMsg.id,
+        };
+      }
+    }
+
     if (!orgId || !textRaw) {
       return {
         ok: false,
@@ -1589,11 +1614,20 @@ export async function ingestCoreFromMessage(
 
           const queryName = String(detected.canonical || "").trim();
 
-          const strongEnough = hasStrongTokenOverlap(queryName, candidateName);
+          const tokenOverlapStrong = hasStrongTokenOverlap(
+            queryName,
+            candidateName
+          );
+          const fuzzyScore = fuzzyCharOverlapScore(queryName, candidateName);
+
+          // allow either good token overlap OR decent fuzzy
+          const strongEnough = tokenOverlapStrong || fuzzyScore >= 0.7; // threshold tweakable
 
           console.log("[INGEST][core][inquiry-match-overlap]", {
             queryName,
             candidateName,
+            tokenOverlapStrong,
+            fuzzyScore,
             strongEnough,
           });
 
@@ -1889,11 +1923,11 @@ export async function ingestCoreFromMessage(
 
       if (
         clarifyTarget &&
-        parsed.items.length === 1 &&                       // Single item only
-        !hasListShape &&                                  // Not multi-line list
-        !/\band\b/i.test(textFlat) &&                     // No "and" multiple items
+        parsed.items.length === 1 && // Single item only
+        !hasListShape && // Not multi-line list
+        !/\band\b/i.test(textFlat) && // No "and" multiple items
         !/\b(\d+|\d+\s*(kg|g|l|ml|pcs|packs))\b/i.test(textFlat) && // Not explicit ordered qties
-        (looksLikeQuestion || nlu.intent !== "order")     // Only questions, not orders
+        (looksLikeQuestion || nlu.intent !== "order") // Only questions, not orders
       ) {
         const niceName = clarifyTarget.displayName || clarifyTarget.canonical;
         const prettyVariants = clarifyTarget.variants
