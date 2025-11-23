@@ -36,15 +36,22 @@ export type IngestSource =
   | "other"
   | "unknown";
 
-export type IngestItem = {
-  qty: number | null;
-  unit?: string | null;
-  canonical?: string | null;
-  name?: string | null;
-  brand?: string | null;
-  variant?: string | null;
-  notes?: string | null;
-};
+  export type IngestItem = {
+    qty: number | null;
+    unit?: string | null;
+    canonical?: string | null;
+    name?: string | null;
+    brand?: string | null;
+    variant?: string | null;
+    notes?: string | null;
+  
+    // 🧠 AI + menu-aware hints (all optional)
+    product_id?: string | null;
+    match_type?: "catalog_exact" | "catalog_fuzzy" | "text_only" | null;
+    needs_clarify?: boolean;
+    clarify_reason?: string | null;
+    text_span?: string | null;
+  };
 
 type IngestCommon = {
   used?: "ai" | "rules" | "inquiry" | "none";

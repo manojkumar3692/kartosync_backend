@@ -10,6 +10,25 @@ import {
 import { supa } from "../db";
 
 // ─────────────────────────────────────────────
+// Rule fallback helper (used when AI JSON is bad)
+// ─────────────────────────────────────────────
+
+function ruleFallbackOnError(text: string, baseReason: string) {
+  const input = String(text || "").trim();
+  const ruleItems = ruleParse(input) || [];
+
+  return {
+    model: process.env.AI_MODEL || "gpt-4o-mini",
+    is_order_like: ruleItems.length > 0,
+    reason:
+      baseReason +
+      (ruleItems.length ? "; rule_fallback" : "; rule_fallback_no_items"),
+    items: ruleItems,
+    used: (ruleItems.length ? "rules" : "ai") as "rules" | "ai",
+  };
+}
+
+// ─────────────────────────────────────────────
 // L0: Model + config
 // ─────────────────────────────────────────────
 
@@ -24,6 +43,17 @@ function getOrderModelName() {
 }
 
 // ─────────────────────────────────────────────
+// Types for menu-aware parsing
+// ─────────────────────────────────────────────
+
+type CandidateProduct = {
+  id: string;
+  canonical: string | null;
+  display_name: string | null;
+  variant: string | null;
+};
+
+// ─────────────────────────────────────────────
 // Shared schemas (items aligned with ingestCore expectation)
 // ─────────────────────────────────────────────
 
@@ -35,6 +65,15 @@ const ItemSchema = z.object({
   brand: z.string().min(1).nullable().optional(),
   variant: z.string().min(1).nullable().optional(),
   notes: z.string().min(1).nullable().optional(),
+
+  // NEW – menu-aware fields
+  product_id: z.string().min(1).nullable().optional(),
+  match_type: z
+    .enum(["catalog_exact", "catalog_fuzzy", "text_only"])
+    .optional(),
+  needs_clarify: z.boolean().optional(),
+  clarify_reason: z.string().min(1).nullable().optional(),
+  text_span: z.string().min(1).nullable().optional(),
 });
 
 const OutputSchema = z.object({
@@ -44,54 +83,131 @@ const OutputSchema = z.object({
   reason: z.string().nullable().optional(),
 });
 
-// This is the “raw” shape coming back from AI before we adapt it for ingestCore
 export type AiOrderOutput = z.infer<typeof OutputSchema>;
 
 // ─────────────────────────────────────────────
-// L0: Prompt template (generic, *not* locked to food)
+// L0.5: Fetch candidate menu
 // ─────────────────────────────────────────────
 
-function buildUserPrompt(input: string): string {
+async function getCandidateMenuForText(
+  org_id: string | undefined,
+  _text: string
+): Promise<CandidateProduct[]> {
+  if (!org_id) return [];
+
+  try {
+    const { data, error } = await supa
+      .from("products")
+      .select("id, canonical, display_name, variant")
+      .eq("org_id", org_id)
+      .limit(80);
+
+    if (error) {
+      console.warn("[AI][order] getCandidateMenuForText err:", error.message);
+      return [];
+    }
+
+    const products = (data || []) as any[];
+
+    const menu: CandidateProduct[] = products.map((p) => ({
+      id: String(p.id),
+      canonical: (p.canonical ?? null) as string | null,
+      display_name: (p.display_name ?? null) as string | null,
+      variant: (p.variant ?? null) as string | null,
+    }));
+
+    return menu;
+  } catch (e: any) {
+    console.warn(
+      "[AI][order] getCandidateMenuForText unexpected err:",
+      e?.message || e
+    );
+    return [];
+  }
+}
+
+// ─────────────────────────────────────────────
+// Prompt template
+// ─────────────────────────────────────────────
+
+function buildUserPrompt(input: string, menu: CandidateProduct[]): string {
+  const menuSnippet = JSON.stringify(menu, null, 2);
+
   return [
+    "You are parsing a customer message for a WhatsApp ordering assistant.",
+    "",
+    "Below is the MENU for this specific shop (only these products are valid for mapping):",
+    "---------------- MENU JSON ----------------",
+    menuSnippet,
+    "-------------------------------------------",
+    "",
     "User message:",
     "----------------",
     input,
     "----------------",
     "",
     "Decide if this is an order. For example:",
-    '- "2kg onion, 1L milk"  → order',
-    '- "do you have product X?" → NOT an order (inquiry only)',
-    '- "hi" / "ok thanks" → not an order',
-    '- "make my order extra spicy" → not a new order (preference/modifier only)',
+    '- \"2kg onion, 1L milk\"  → order',
+    '- \"do you have product X?\" → NOT an order (inquiry only)',
+    '- \"hi\" / \"ok thanks\" → not an order',
+    '- \"make my order extra spicy\" → not a new order (preference/modifier only)',
     "",
     "Now respond ONLY with a JSON object matching this TypeScript type:",
     "",
     "type Item = {",
-    '  name: string;              // e.g. "2kg onion" or "1 face cream"',
-    '  canonical?: string | null; // e.g. "onion", "face cream"',
+    '  // What the user actually wrote for this item (or the key phrase).',
+    "  text_span?: string | null;",
+    '',
+    '  // Normalized/clean item name (e.g. \"Paneer Biryani\").',
+    "  name: string;",
+    "  canonical?: string | null;",
+    "",
     "  qty?: number | null;       // null if unknown",
-    '  unit?: string | null;      // e.g. "kg", "g", "l", "pack", "piece"',
+    '  unit?: string | null;      // e.g. \"kg\", \"g\", \"l\", \"pack\", \"piece\"',
     '  brand?: string | null;     // optional brand or company if user said it',
     '  variant?: string | null;   // optional size/flavour/type if user said it',
-    '  notes?: string | null;     // e.g. "extra spicy", "no onion", "no sugar"',
+    '  notes?: string | null;     // e.g. \"extra spicy\", \"no onion\", \"no sugar\"',
+    "",
+    "  // MENU mapping:",
+    "  product_id?: string | null;  // id from MENU if you are confident",
+    '  match_type?: \"catalog_exact\" | \"catalog_fuzzy\" | \"text_only\";',
+    "  // If you are NOT fully sure about the mapping, mark needs_clarify = true.",
+    "  needs_clarify?: boolean;",
+    "  clarify_reason?: string | null;",
     "};",
     "",
     "type Output = {",
     "  items: Item[];",
     "  is_order_like?: boolean;   // true = order or explicit list of items; false = inquiry/chat/etc.",
     "  confidence?: number;       // 0–1, your confidence that you parsed the order correctly",
-    '  reason?: string | null;    // short tag, e.g. "ai:order", "ai:not_order:greeting", "ai:not_order:inquiry_only"',
+    '  reason?: string | null;    // short tag, e.g. \"ai:order\", \"ai:not_order:greeting\", \"ai:not_order:inquiry_only\"',
     "};",
     "",
-    "Important:",
+    "MENU mapping rules:",
+    "- You MUST only use product_id values that come from the MENU JSON.",
+    "- Never invent new product ids.",
+    '- If user text clearly matches one MENU item (e.g. \"Paneer Biryani\" vs menu \"Paneer Biryani\"), use match_type = \"catalog_exact\", product_id = that id, needs_clarify = false.',
+    '- If user text is a close spelling or fuzzy match (\"panner biryani\" vs menu \"Paneer Biryani\") BUT you are not fully sure → set:',
+    "    product_id = null,",
+    '    match_type = \"catalog_fuzzy\",',
+    "    needs_clarify = true,",
+    '    clarify_reason = \"User text looks like X but I am not fully sure; ask user.\"',
+    "- If the item cannot be safely mapped to any MENU product →",
+    '    product_id = null, match_type = \"text_only\", needs_clarify = true.',
+    "",
+    "Order vs non-order rules:",
     "- If you are not sure or the text is ambiguous → set is_order_like = false, items = [], reason = 'ai:not_order:ambiguous'.",
     "- If the message is only greeting / thanks / acknowledgement → set is_order_like = false, items = [], reason = 'ai:not_order:greeting'.",
-    "- If the message is asking about availability / price (e.g. 'do you have X?', 'price of Y?') but *not* clearly placing an order → is_order_like = false, items = [], reason = 'ai:not_order:inquiry_only'.",
-    "- Do NOT output any text outside JSON. No explanations, no comments, only JSON.",
+    "- If the message is asking about availability / price (e.g. \"do you have X?\", \"price of Y?\") but NOT clearly placing an order →",
+    "    is_order_like = false, items = [], reason = 'ai:not_order:inquiry_only'.",
+    "",
+    "Important:",
+    "- Never hallucinate items that the user did not mention.",
+    "- Stay conservative: if you are not sure that the message is an order, treat it as NOT an order.",
+    "- Output ONLY valid JSON that matches the Output type. No explanations, no comments, no markdown.",
   ].join("\n");
 }
 
-// System prompt stays generic – works for all business types
 const SYSTEM_PROMPT = `
 You are a strict JSON API that interprets customer messages for a WhatsApp-based ordering assistant.
 
@@ -99,30 +215,36 @@ Your job:
 - Detect if the user is placing an ORDER (items + quantities) or something else (greeting, inquiry, complaint, preference, etc.).
 - When it is an order, extract items cleanly.
 - When it's NOT an order, return items = [] and is_order_like = false with a clear reason tag.
+- Use the provided MENU JSON to map items to valid products only when it is safe.
 
 You MUST:
 - Never hallucinate items that the user did not mention.
 - Never assume the business type: the items can be food, grocery, pharmacy, clothing, electronics, salon services, etc.
+- Only propose product_id values that exist in the MENU JSON, never invent ids.
+- If mapping from user text to MENU item is not clearly safe, set needs_clarify = true and do not set product_id.
 - Stay conservative: if you are not sure that the message is an order, treat it as NOT an order.
 - Output ONLY valid JSON that matches the Output type.
 `.trim();
 
 // ─────────────────────────────────────────────
-// L0: Raw model call (string → JSON string)
+// Raw model call
 // ─────────────────────────────────────────────
 
-async function callOrderModelRaw(input: string): Promise<string | null> {
+async function callOrderModelRaw(
+  input: string,
+  menu: CandidateProduct[]
+): Promise<string | null> {
   if (!openai) {
     console.warn("[AI][order] OPENAI_API_KEY missing, skip AI");
     return null;
   }
 
   const model = getOrderModelName();
+  const userPrompt = buildUserPrompt(input, menu);
 
-  // Simple approximate cost guard (depends on your existing cost.ts)
   try {
     const approxCost = estimateCostUSDApprox({
-      prompt_tokens: Math.ceil(input.length / 4),
+      prompt_tokens: Math.ceil(userPrompt.length / 4),
       completion_tokens: 0,
     });
     if (!canSpendMoreUSD(approxCost)) {
@@ -136,13 +258,12 @@ async function callOrderModelRaw(input: string): Promise<string | null> {
     console.warn("[AI][order] cost estimate failed", e?.message || e);
   }
 
-  const userPrompt = buildUserPrompt(input);
-
   const start = Date.now();
   const completion = await openai.chat.completions.create({
     model,
     temperature: 0,
     max_tokens: 256,
+    response_format: { type: "json_object" },
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: userPrompt },
@@ -153,7 +274,6 @@ async function callOrderModelRaw(input: string): Promise<string | null> {
   const content = completion.choices[0]?.message?.content || "";
   console.log("[AI][order] model used:", model, "latency_ms:", ms);
 
-  // track cost (best-effort)
   try {
     const promptTokens = completion.usage?.prompt_tokens ?? 0;
     const completionTokens = completion.usage?.completion_tokens ?? 0;
@@ -170,23 +290,21 @@ async function callOrderModelRaw(input: string): Promise<string | null> {
 }
 
 // ─────────────────────────────────────────────
-// L1: Robust JSON extraction + validation
+// JSON extraction + validation
 // ─────────────────────────────────────────────
 
 function extractJsonObject(raw: string | null): any | null {
   if (!raw) return null;
 
-  // Common case: model already returns pure JSON
   const trimmed = raw.trim();
   if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
     try {
       return JSON.parse(trimmed);
     } catch {
-      // fall through to more robust scan
+      // fall through
     }
   }
 
-  // Fallback: find first '{' and last '}' and parse substring
   const first = raw.indexOf("{");
   const last = raw.lastIndexOf("}");
   if (first === -1 || last === -1 || last <= first) return null;
@@ -215,13 +333,11 @@ function coerceOutputShape(json: any): AiOrderOutput {
 }
 
 // ─────────────────────────────────────────────
-// PUBLIC: aiParseOrder (used by ingestCore)
-// Signature must match ingestCore.ts expectations.
+// PUBLIC: aiParseOrder
 // ─────────────────────────────────────────────
 
 export async function aiParseOrder(
   text: string,
-  // catalog is currently unused but kept for future tuning
   _catalog?: any,
   opts?: { org_id?: string; customer_phone?: string }
 ): Promise<{
@@ -243,7 +359,7 @@ export async function aiParseOrder(
     };
   }
 
-  // If no API key or model is disabled → fallback to rules
+  // No API key → pure rules
   if (!openai) {
     console.log("[AI][order] no client, using rules only");
     const items = ruleParse(input) || [];
@@ -257,16 +373,19 @@ export async function aiParseOrder(
   }
 
   try {
+    const menu = await getCandidateMenuForText(opts?.org_id, input);
+
     console.log("[AI][order] calling model for org/customer", {
       org_id: opts?.org_id || null,
       customer_phone: opts?.customer_phone || null,
       model: getOrderModelName(),
+      menu_count: menu.length,
     });
 
-    const raw = await callOrderModelRaw(input);
+    const raw = await callOrderModelRaw(input, menu);
 
     if (!raw) {
-      // e.g., blocked by budget guard → fallback to rules
+      // budget-guard or other skip → rules fallback
       const items = ruleParse(input) || [];
       return {
         items,
@@ -278,14 +397,47 @@ export async function aiParseOrder(
     }
 
     const json = extractJsonObject(raw);
+
+    // ❗ If we can't parse JSON at all → RULE FALLBACK
+    if (!json) {
+      const fb = ruleFallbackOnError(input, "ai:not_order:invalid_json");
+      console.log("[AI][order] json null → ruleFallbackOnError", {
+        reason: fb.reason,
+        items: fb.items.length,
+      });
+      return {
+        items: fb.items,
+        is_order_like: fb.is_order_like,
+        confidence: undefined,
+        reason: fb.reason,
+        used: fb.used,
+      };
+    }
+
     const coerced = coerceOutputShape(json);
+
+    // ❗ If schema validation says "invalid_json" → RULE FALLBACK
+    if (coerced.reason === "ai:not_order:invalid_json") {
+      const fb = ruleFallbackOnError(input, coerced.reason);
+      console.log("[AI][order] invalid_json schema → ruleFallbackOnError", {
+        reason: fb.reason,
+        items: fb.items.length,
+      });
+      return {
+        items: fb.items,
+        is_order_like: fb.is_order_like,
+        confidence: undefined,
+        reason: fb.reason,
+        used: fb.used,
+      };
+    }
 
     const isOrder =
       typeof coerced.is_order_like === "boolean"
         ? coerced.is_order_like
         : (coerced.items || []).length > 0;
 
-    // Lightweight logging to supabase for debugging (optional, non-fatal)
+    // optional log to DB
     try {
       if (opts?.org_id) {
         await supa.from("ai_order_logs").insert({
@@ -299,6 +451,21 @@ export async function aiParseOrder(
     } catch (e: any) {
       console.warn("[AI][order] log insert failed", e?.message || e);
     }
+
+    console.log("[AI][order][DEBUG_OUTPUT]", {
+      model: getOrderModelName(),
+      is_order_like: isOrder,
+      reason: coerced.reason,
+      items: (coerced.items || []).map((it) => ({
+        name: it.name,
+        canonical: it.canonical,
+        product_id: it.product_id,
+        match_type: it.match_type,
+        needs_clarify: it.needs_clarify,
+        clarify_reason: it.clarify_reason,
+        text_span: it.text_span,
+      })),
+    });
 
     return {
       items: coerced.items || [],

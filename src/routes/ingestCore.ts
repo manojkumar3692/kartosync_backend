@@ -7,7 +7,6 @@ import {
   isPureGreetingOrAck,
   isNotOrderMessage,
 } from "../util/notOrder";
-import { routeProductText } from "../ai/productRouter";
 import {
   IngestInput,
   IngestResult,
@@ -679,73 +678,84 @@ async function enrichWithPrefs(
 //  - resolve synonyms → canonical product
 //  - attach product_id / unit / variant when safe
 //  - but only when overlap with user text is strong
-async function hydrateProductsWithRouter(
+// ───────────────── SMART PRODUCT ROUTER (Layer 6, unified) ─────────────────
+// Uses ONE matcher (findBestProductForTextV2) to:
+//  - resolve synonyms / spelling → canonical product
+//  - attach product_id / variant when safe
+//  - stay generic (no biryani hacks)
+async function productRouter(
   orgId: string,
-  items: any[]
-): Promise<{ items: any[]; applied: number }> {
+  items: any[],
+  textFlat: string
+): Promise<{ items: any[]; unmatched: string[] }> {
   const out: any[] = [];
-  let applied = 0;
+  const unmatched: string[] = [];
 
   for (const it of items || []) {
     const base = { ...it };
 
-    const label = trim(base.canonical || base.name || "");
+    // Prefer canonical, then name
+    const labelRaw =
+      (base.canonical && String(base.canonical)) ||
+      (base.name && String(base.name)) ||
+      "";
+
+    const label = labelRaw.trim();
     if (!label) {
       out.push(base);
       continue;
     }
 
-    let routed: any = null;
+    let best: any = null;
     try {
-      routed = await routeProductText({
-        org_id: orgId,
-        rawName: label,
-      });
+      best = await findBestProductForTextV2(orgId, label);
     } catch (e: any) {
-      console.warn("[INGEST][product_router call warn]", e?.message || e);
+      console.warn("[L6][productRouter] match error", e?.message || e);
       out.push(base);
       continue;
     }
 
-    if (!routed || !routed.canonical) {
+    if (!best) {
+      unmatched.push(label);
       out.push(base);
       continue;
     }
 
     const candidateName = String(
-      routed.display_name || routed.canonical || ""
+      best.display_name || best.canonical || ""
     ).trim();
     if (!candidateName) {
+      unmatched.push(label);
       out.push(base);
       continue;
     }
 
-    // Safety: only trust router if text tokens overlap strongly
+    // Safety: tokens between user text and product name
     const strongOverlap = hasStrongTokenOverlap(label, candidateName);
+    // NEW: fuzzy char overlap (handles paneer/panner, biriyani/biryani, etc.)
+    const fuzzyScore = fuzzyCharOverlapScore(label, candidateName);
+    const strongEnough = strongOverlap || fuzzyScore >= 0.7; // tweak threshold if needed
 
-    if (!strongOverlap) {
-      // Ex: user: "paneer biryani" vs product: "chicken biryani" → reject
+    if (!strongEnough) {
+      // e.g. user: "paneer biriyani" vs product: "chicken sandwich" → reject
+      unmatched.push(label);
       out.push(base);
       continue;
     }
 
-    // ──────────────────────────────────────
-    // NEW: variant ambiguity guard
-    // If multiple variants exist for this canonical and user text
-    // does NOT mention any of them, DO NOT auto-pick variant/product_id.
-    // ──────────────────────────────────────
-    let routedProductId: string | null = routed.product_id ?? null;
-    let routedVariant: string | null = routed.variant
-      ? String(routed.variant)
+    // Variant ambiguity guard (same logic as before)
+    let routedProductId: string | null = best.id ?? null;
+    let routedVariant: string | null = best.variant
+      ? String(best.variant)
       : null;
 
-    if (routed.canonical && routedProductId) {
+    if (best.canonical && routedProductId) {
       try {
         const { data: siblings, error: siblingsErr } = await supa
           .from("products")
           .select("id, variant")
           .eq("org_id", orgId)
-          .eq("canonical", routed.canonical);
+          .eq("canonical", best.canonical);
 
         if (!siblingsErr && siblings && siblings.length) {
           const variants = new Set(
@@ -764,11 +774,7 @@ async function hydrateProductsWithRouter(
               (v) => v && labelLower.includes(v)
             );
 
-            // Example:
-            //  - products: "regular", "boneless"
-            //  - text: "mutton biriyani"
-            // → variants.size = 2, mentionsVariant = false
-            // → keep canonical but drop variant + product_id
+            // multiple variants and user did NOT specify which one
             if (!mentionsVariant) {
               routedProductId = null;
               routedVariant = null;
@@ -777,15 +783,13 @@ async function hydrateProductsWithRouter(
         }
       } catch (e: any) {
         console.warn(
-          "[INGEST][product_router variant_ambiguity warn]",
+          "[L6][productRouter variant_ambiguity warn]",
           e?.message || e
         );
       }
     }
 
-    // Build updated item, but never destroy explicit user inputs
     const updated = { ...base };
-
     let changed = false;
 
     if (routedProductId && !updated.product_id) {
@@ -793,18 +797,18 @@ async function hydrateProductsWithRouter(
       changed = true;
     }
 
-    if (!updated.canonical && routed.canonical) {
-      updated.canonical = routed.canonical;
+    // overwrite canonical/name to catalog’s spelling so downstream checks see the same text
+    if (
+      best.canonical &&
+      normalizeNameForMatch(updated.canonical) !==
+        normalizeNameForMatch(best.canonical)
+    ) {
+      updated.canonical = best.canonical;
       changed = true;
     }
 
-    if (!updated.name && routed.display_name) {
-      updated.name = routed.display_name;
-      changed = true;
-    }
-
-    if (!updated.unit && routed.base_unit) {
-      updated.unit = routed.base_unit;
+    if (best.display_name && !updated.name) {
+      updated.name = best.display_name;
       changed = true;
     }
 
@@ -813,16 +817,15 @@ async function hydrateProductsWithRouter(
       changed = true;
     }
 
-    if (changed) applied++;
     out.push(updated);
   }
 
-  console.log("[L6][product_router] applied=", applied, {
+  console.log("[L6][product_router] applied=", out.length, {
     inCount: (items || []).length,
     outSample: out.slice(0, 3),
   });
 
-  return { items: out, applied };
+  return { items: out, unmatched };
 }
 
 async function orderHasMultiVariantChoices(
@@ -1778,6 +1781,122 @@ export async function ingestCoreFromMessage(
       };
     }
 
+    // 🧠 NEW: AI "needs_clarify" guard
+    // If AI flags an item as needs_clarify, we DO NOT place an order.
+    // Instead, we turn it into an availability-style inquiry and ask the user to choose.
+    try {
+      const aiItems = Array.isArray(parsed.items) ? parsed.items : [];
+
+      const hasClarifyFlag =
+        aiItems.some((it: any) => it && it.needs_clarify === true) ||
+        (typeof parsed.reason === "string" &&
+          /ai:needs_clarify|ambiguous/i.test(parsed.reason));
+
+      if (hasClarifyFlag) {
+        // Pick the first ambiguous item, or fall back to the first item / whole text
+        const firstAmbiguous: any =
+          aiItems.find((it: any) => it && it.needs_clarify) ||
+          aiItems[0] ||
+          null;
+
+        const labelRaw =
+          (firstAmbiguous &&
+            (firstAmbiguous.canonical ||
+              firstAmbiguous.name ||
+              firstAmbiguous.text_span)) ||
+          textFlat;
+
+        const label = normalizeNameForMatch(labelRaw) || labelRaw || textFlat;
+
+        let replyText = `I’m not fully sure which exact item you meant by "${label}".`;
+
+        // Try to offer smart suggestions from the catalog
+        try {
+          const best = await findBestProductForTextV2(orgId, label);
+          if (best && (best.canonical || best.display_name)) {
+            const canonical = (best.canonical || "").trim();
+            const { data: siblings, error: siblingsErr } = await supa
+              .from("products")
+              .select("display_name, variant")
+              .eq("org_id", orgId)
+              .eq("canonical", canonical);
+
+            if (!siblingsErr && siblings && siblings.length) {
+              const uniqueNames = Array.from(
+                new Set(
+                  siblings
+                    .map(
+                      (s: any) =>
+                        String(s.display_name || "").trim() ||
+                        String(s.variant || "").trim()
+                    )
+                    .filter(Boolean)
+                )
+              );
+
+              if (uniqueNames.length) {
+                replyText += "\nI found these similar items:\n";
+                replyText += uniqueNames
+                  .slice(0, 5)
+                  .map((n, idx) => `${idx + 1}) ${n}`)
+                  .join("\n");
+                replyText +=
+                  "\n\nPlease reply with the option number or the exact name.";
+              } else {
+                replyText +=
+                  "\nPlease send the exact item name as shown in the menu.";
+              }
+            } else {
+              replyText +=
+                "\nPlease send the exact item name as shown in the menu.";
+            }
+          } else {
+            replyText +=
+              "\nPlease send the exact item name as shown in the menu.";
+          }
+        } catch (e: any) {
+          console.warn(
+            "[INGEST][core][ai_needs_clarify suggest warn]",
+            e?.message || e
+          );
+          replyText +=
+            "\nPlease send the exact item name as shown in the menu.";
+        }
+
+        // Session: mark as pending inquiry so UI can show it
+        if (phoneKey) {
+          await markSessionOnInquiry({
+            org_id: orgId,
+            phone_key: phoneKey,
+            kind: "availability",
+            canonical: label,
+            text: textRaw,
+            status: "pending",
+          });
+        }
+
+        // ❌ Important: we do NOT create/append any order here.
+        return {
+          ok: true,
+          stored: false,
+          kind: "inquiry",
+          used: "inquiry",
+          inquiry: "availability",
+          inquiry_type: "availability",
+          inquiry_canonical: label,
+          reply: replyText,
+          reason: parsed.reason
+            ? `${parsed.reason}; ai_needs_clarify`
+            : "ai_needs_clarify",
+        };
+      }
+    } catch (e: any) {
+      console.warn(
+        "[INGEST][core][ai_needs_clarify block warn]",
+        e?.message || e
+      );
+    }
+
     // 8) ORDER path starts here
 
     // ⬇️ NEW: BEFORE anything, hydrate brand/variant from prefs (auto-learned)
@@ -1796,13 +1915,22 @@ export async function ingestCoreFromMessage(
       console.warn("[INGEST][prefs_enrich warn]", e?.message || e);
     }
 
-    // ⬇️ LAYER 6: product router (synonyms / aliases → canonical product)
+    // ⬇️ LAYER 6: product router using unified matcher
     try {
-      const { items: routedItems, applied: prodApplied } =
-        await hydrateProductsWithRouter(orgId, parsed.items || []);
-      if (prodApplied > 0) {
-        parsed.items = routedItems;
+      const { items: routedItems, unmatched } = await productRouter(
+        orgId,
+        parsed.items || [],
+        textFlat
+      );
+
+      parsed.items = routedItems;
+
+      if (unmatched.length === 0) {
         parsed.reason = ((parsed.reason || "") + "; product_routed").trim();
+      } else if (unmatched.length && unmatched.length < routedItems.length) {
+        parsed.reason = (
+          (parsed.reason || "") + "; product_routed_partial"
+        ).trim();
       }
     } catch (e: any) {
       console.warn("[INGEST][product_router warn]", e?.message || e);

@@ -329,6 +329,7 @@ async function callInquiryModelRaw(input: string): Promise<string | null> {
     model,
     temperature: 0,
     max_tokens: 160,
+    response_format: { type: "json_object" },
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: userPrompt },
