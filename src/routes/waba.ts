@@ -561,26 +561,85 @@ async function buildSmartInquiryReply(opts: {
     );
 
     const requestedLabel = prettyLabelFromText(text);
-
-    // 🧠 Partial match case:
-    // Example: user -> "panner biriyani"
-    // Catalog -> only "Mutton Biryani", "Chicken Biryani"
-    // → we matched "biryani" but not "panner" → don't lie.
-    if (
-      names.length > 0 &&
-      keywords.length > 0 &&
-      hasOverlap &&
-      missingKeywords.length > 0
-    ) {
+// 🧠 Partial match case:
+// Example: user -> "panner biriyani"
+// Catalog -> only "Mutton Biryani", "Chicken Biryani"
+// → we matched "biryani" but not "panner" → don't lie,
+//   but show ALL related biryani variants from DB.
+if (
+    names.length > 0 &&
+    keywords.length > 0 &&
+    hasOverlap &&
+    missingKeywords.length > 0
+  ) {
+    try {
+      // Look for all "family" items in this org that contain any keyword
+      const { data: allProducts, error: allErr } = await supa
+        .from("products")
+        .select(
+          "id, display_name, canonical, variant, base_unit, price_per_unit"
+        )
+        .eq("org_id", org_id);
+  
+      let familyNames: string[] = [];
+  
+      if (!allErr && allProducts && allProducts.length) {
+        const familyHits = (allProducts as any[]).filter((p) => {
+          const baseName = String(
+            p.display_name || p.canonical || ""
+          ).toLowerCase();
+          const variantName = String(p.variant || "").toLowerCase();
+          const haystack = `${baseName} ${variantName}`.trim();
+          if (!haystack) return false;
+  
+          // match any of the meaningful keywords (e.g. "paneer", "biryani")
+          return keywords.some((kw) => haystack.includes(kw));
+        });
+  
+        familyNames = Array.from(
+          new Set(
+            familyHits
+              .map((p) => {
+                const base = p.display_name || p.canonical || "item";
+                return p.variant
+                  ? `${base} ${String(p.variant).trim()}`
+                  : base;
+              })
+              .filter(Boolean)
+          )
+        );
+      }
+  
+      // If no extra family hits, fall back to the original 'names'
+      const finalNames =
+        familyNames.length > 0
+          ? familyNames
+          : names;
+  
       const header =
         `I couldn’t find *${requestedLabel}* exactly in today’s menu.\n` +
         `We do have:\n`;
-
+  
+      const lines = finalNames.map((n, i) => `${i + 1}) ${n}`);
+      const footer = "\n\nWould you like to choose one of these instead?";
+  
+      return header + lines.join("\n") + footer;
+    } catch (e: any) {
+      console.warn(
+        "[WABA][availability family suggestions err]",
+        e?.message || e
+      );
+  
+      // Safe fallback: keep the old behaviour
+      const header =
+        `I couldn’t find *${requestedLabel}* exactly in today’s menu.\n` +
+        `We do have:\n`;
       const lines = names.map((n, i) => `${i + 1}) ${n}`);
       const footer = "\n\nWould you like to choose one of these instead?";
-
+  
       return header + lines.join("\n") + footer;
     }
+  }
 
     // Normal happy path: full match
     if (names.length >= 1) {
@@ -3378,4 +3437,3 @@ async function sendWabaText(opts: {
 }
 export default waba;
 export { sendWabaText };
-    

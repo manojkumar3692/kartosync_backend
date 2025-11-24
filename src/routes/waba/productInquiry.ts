@@ -505,3 +505,84 @@ export async function buildMenuReply(opts: {
       return null;
     }
   }
+
+  // 🔹 Family-level variants helper for availability / suggestions
+export async function findFamilyVariantsForKeywords(opts: {
+  org_id: string;
+  text: string;
+  limit?: number;
+}): Promise<ProductPriceOption[]> {
+  const { org_id, text, limit = 10 } = opts;
+
+  // Reuse the same keyword extractor as menu logic
+  const keywords = extractMenuKeywords(text || "");
+  if (!keywords.length) return [];
+
+  try {
+    const { data, error } = await supa
+      .from("products")
+      .select(
+        "id, display_name, canonical, variant, base_unit, price_per_unit"
+      )
+      .eq("org_id", org_id);
+
+    if (error || !data || !data.length) {
+      if (error) {
+        console.warn("[WABA][familyVariants products err]", error.message);
+      }
+      return [];
+    }
+
+    const rows = data as any[];
+
+    // Family hits = any product where name/variant contains any of the keywords
+    const hits = rows.filter((row) => {
+      const name = String(
+        row.display_name || row.canonical || ""
+      ).toLowerCase();
+      const variant = String(row.variant || "").toLowerCase();
+
+      return keywords.some(
+        (kw) => name.includes(kw) || (variant && variant.includes(kw))
+      );
+    });
+
+    if (!hits.length) return [];
+
+    const limited = hits.slice(0, limit);
+    const out: ProductPriceOption[] = [];
+
+    for (const row of limited) {
+      const id = row.id;
+      if (!id) continue;
+
+      const latest = await getLatestPrice(org_id, id).catch((e: any) => {
+        console.warn("[WABA][familyVariants latestPrice err]", e?.message || e);
+        return null;
+      });
+
+      const price =
+        latest && typeof latest.price === "number"
+          ? latest.price
+          : typeof row.price_per_unit === "number"
+          ? row.price_per_unit
+          : null;
+
+      const currency = latest ? latest.currency : null;
+
+      out.push({
+        productId: id,
+        name: row.display_name || row.canonical || "item",
+        variant: row.variant ? String(row.variant).trim() || null : null,
+        unit: row.base_unit || "unit",
+        price,
+        currency,
+      });
+    }
+
+    return out;
+  } catch (e: any) {
+    console.warn("[WABA][familyVariants err]", e?.message || e);
+    return [];
+  }
+}
