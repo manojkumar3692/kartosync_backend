@@ -694,6 +694,282 @@ async function findMostRecentOrderForPhone(
 }
 
 // ─────────────────────────────
+// Safe auto-edit for "change/remove/make spicy" messages
+// Used only when ingestCore says: result.kind === "modifier"
+// ─────────────────────────────
+async function applySafeOrderModifier(opts: {
+    orgId: string;
+    phoneNumberId: string;
+    from: string; // raw WhatsApp number (no +)
+    text: string;
+    orderId: string;
+  }): Promise<boolean> {
+    const { orgId, phoneNumberId, from, text, orderId } = opts;
+    const lower = text.toLowerCase();
+  
+    // 1) Load fresh order from DB
+    const { data: ordRow, error: ordErr } = await supa
+      .from("orders")
+      .select("id, items, status")
+      .eq("id", orderId)
+      .maybeSingle();
+  
+    if (ordErr || !ordRow || !ordRow.id) {
+      console.warn("[WABA][modifier order load err]", ordErr?.message);
+      await logFlowEvent({
+        orgId,
+        from,
+        event: "modifier_order_missing",
+        msgId: undefined,
+        orderId,
+        text,
+        result: { error: ordErr?.message || "order not found" },
+      });
+      return false; // let caller fall back to old behaviour
+    }
+  
+    const status = String((ordRow as any).status || "pending").toLowerCase();
+  
+    // Only auto-edit when order is still modifiable
+    const canEdit = status === "pending" || status === "paid";
+    if (!canEdit) {
+      await sendWabaText({
+        phoneNumberId,
+        to: from,
+        orgId,
+        text:
+          "I got your change request, but this order is already being processed.\n" +
+          "The store will try to adjust it if possible.",
+      });
+  
+      await logFlowEvent({
+        orgId,
+        from,
+        event: "modifier_order_not_editable",
+        msgId: undefined,
+        orderId,
+        text,
+        result: { status },
+      });
+  
+      return true; // handled (we replied), but no auto-edit
+    }
+  
+    const items: any[] = Array.isArray((ordRow as any).items)
+      ? ((ordRow as any).items as any[])
+      : [];
+  
+    if (!items.length) {
+      return false;
+    }
+  
+    // 2) Detect type of change (variant / quantity / remove)
+    const wantsRemove =
+      lower.includes("remove ") ||
+      lower.includes("remove the ") ||
+      lower.includes("dont want") ||
+      lower.includes("don't want") ||
+      lower.includes("no need") ||
+      (lower.includes("cancel") && !/cancel my order|cancel order/.test(lower));
+  
+    const hasSpicy = lower.includes("spicy");
+    const hasRegular = lower.includes("regular");
+    const hasLessSpicy =
+      lower.includes("less spicy") || lower.includes("medium spicy");
+  
+    // crude qty detection: look for "to 2", "make it 2", "2 qty", etc.
+    let qtyMatch: number | null = null;
+    {
+      const m = lower.match(/(?:to|make it|make|change).*?(\d{1,2})/) ||
+        lower.match(/(\d{1,2})\s*(?:qty|quantity|pieces?|pcs?|plates?)\b/);
+      if (m && m[1]) {
+        const q = parseInt(m[1], 10);
+        if (!Number.isNaN(q) && q > 0 && q <= 99) {
+          qtyMatch = q;
+        }
+      }
+    }
+  
+    const wantsQtyChange = qtyMatch != null;
+  
+    // If we couldn't recognise *any* supported change type, bail out to old behaviour
+    if (!wantsRemove && !hasSpicy && !hasRegular && !hasLessSpicy && !wantsQtyChange) {
+      await logFlowEvent({
+        orgId,
+        from,
+        event: "modifier_unsupported_change_type",
+        msgId: undefined,
+        orderId,
+        text,
+        result: { note: "no recognised change keywords" },
+      });
+      return false;
+    }
+  
+    // 3) Find best target line-item using fuzzy match on item names vs the message
+    const keywords = lower
+      .split(/\s+/)
+      .map((w) => w.replace(/[^a-z0-9]/gi, ""))
+      .filter((w) => w.length >= 3);
+  
+    type Candidate = { index: number; label: string; score: number };
+    const cands: Candidate[] = [];
+  
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i] || {};
+      const baseName = String(it.canonical || it.name || "").trim();
+      if (!baseName) continue;
+  
+      const label = baseName.toLowerCase();
+      const fuzzyScore = fuzzyCharOverlapScore(baseName, text); // uses normalized forms internally
+  
+      const hasKeywordOverlap = keywords.some((kw) => label.includes(kw));
+      const finalScore = fuzzyScore + (hasKeywordOverlap ? 0.3 : 0);
+  
+      if (finalScore >= 0.4) {
+        cands.push({ index: i, label: baseName, score: finalScore });
+      }
+    }
+  
+    if (!cands.length) {
+      await logFlowEvent({
+        orgId,
+        from,
+        event: "modifier_no_target_match",
+        msgId: undefined,
+        orderId,
+        text,
+        result: { note: "no fuzzy match to any line item" },
+      });
+      return false; // ambiguous → let store handle
+    }
+  
+    // Sort by score desc
+    cands.sort((a, b) => b.score - a.score);
+  
+    const best = cands[0];
+    const second = cands[1];
+  
+    // If two items are almost equally similar → too risky to auto-edit
+    if (second && best.score - second.score < 0.15) {
+      await logFlowEvent({
+        orgId,
+        from,
+        event: "modifier_ambiguous_multiple_targets",
+        msgId: undefined,
+        orderId,
+        text,
+        result: { candidates: cands.slice(0, 3) },
+      });
+      return false;
+    }
+  
+    const targetIndex = best.index;
+    const targetItem = items[targetIndex] || {};
+    const itemName =
+      targetItem.canonical || targetItem.name || "that item";
+  
+    let changed = false;
+    let replyText = "";
+  
+    // 4A) Remove item
+    if (wantsRemove) {
+      items.splice(targetIndex, 1);
+      changed = true;
+      replyText = `✅ Done — removed *${itemName}* from your order.`;
+    }
+  
+    // 4B) Variant change (spicy / regular / less spicy)
+    if (!changed && (hasSpicy || hasRegular || hasLessSpicy)) {
+      let newVariant: string | null = null;
+  
+      if (hasLessSpicy) {
+        newVariant = "Less Spicy";
+      } else if (hasSpicy) {
+        newVariant = "Spicy";
+      } else if (hasRegular) {
+        newVariant = "Regular";
+      }
+  
+      if (newVariant) {
+        items[targetIndex] = {
+          ...targetItem,
+          variant: newVariant,
+        };
+        changed = true;
+        replyText = `✅ Done — updated your *${itemName}* to *${newVariant}*.`;
+      }
+    }
+  
+    // 4C) Quantity change
+    if (!changed && wantsQtyChange && qtyMatch != null) {
+      items[targetIndex] = {
+        ...targetItem,
+        qty: qtyMatch,
+      };
+      changed = true;
+      replyText = `✅ Done — updated *${itemName}* to quantity *${qtyMatch}*.`;
+    }
+  
+    if (!changed) {
+      await logFlowEvent({
+        orgId,
+        from,
+        event: "modifier_no_change_applied",
+        msgId: undefined,
+        orderId,
+        text,
+        result: { note: "change type detected but nothing applied" },
+      });
+      return false;
+    }
+  
+    // 5) Save back to DB
+    const { error: updErr } = await supa
+      .from("orders")
+      .update({ items })
+      .eq("id", ordRow.id);
+  
+    if (updErr) {
+      console.warn("[WABA][modifier save err]", updErr.message);
+      await logFlowEvent({
+        orgId,
+        from,
+        event: "modifier_save_failed",
+        msgId: undefined,
+        orderId,
+        text,
+        result: { error: updErr.message },
+      });
+      return false;
+    }
+  
+    // 6) Confirm to customer
+    await sendWabaText({
+      phoneNumberId,
+      to: from,
+      orgId,
+      text: replyText,
+    });
+  
+    await logFlowEvent({
+      orgId,
+      from,
+      event: "modifier_auto_edit_applied",
+      msgId: undefined,
+      orderId,
+      text,
+      result: {
+        targetIndex,
+        itemName,
+        replyText,
+      },
+    });
+  
+    return true; // ✅ fully handled here
+  }
+
+// ─────────────────────────────
 // Debug flow logger (non-invasive)
 // ─────────────────────────────
 async function logFlowEvent(opts: {
@@ -2160,29 +2436,6 @@ waba.post("/", async (req, res) => {
             continue;
           }
 
-          // 0.8) Edit-like messages while an order is open → safe fallback (no auto edit in V1)
-          const activeOrderForEdit = activeOrder;
-          if (activeOrderForEdit && isLikelyEditRequest(text)) {
-            await logFlowEvent({
-              orgId: org.id,
-              from,
-              event: "edit_like_message",
-              msgId,
-              text,
-              orderId: activeOrderForEdit.id,
-            });
-
-            await sendWabaText({
-              phoneNumberId,
-              to: from,
-              text:
-                "I’m not sure which part of your order to change.\n" +
-                "Please send the updated order clearly, or talk to the store directly.\n" +
-                "If you want, you can cancel this order and create a new one from the beginning.",
-              orgId: org.id,
-            });
-            continue;
-          }
 
           /// ─────────────────────────────
           // LAYER 12: ingestCore (safe)
@@ -2330,47 +2583,63 @@ waba.post("/", async (req, res) => {
             console.warn("[L11][learnAliasFromInquiry err]", e?.message || e);
           }
 
-          // ─────────────────────────────
-          // ORDER MODIFIER / CORRECTION (Option C from ingestCore NLU)
-          // e.g. "make biriyani spicy", "only boneless", "remove coke"
-          // ─────────────────────────────
-          if (result && result.kind === "modifier") {
-            await logFlowEvent({
-              orgId: org.id,
-              from,
-              event: "modifier_message",
-              msgId,
-              orderId: activeOrder?.id || null,
-              text,
-              result,
-            });
-
-            if (!activeOrder) {
-              await sendWabaText({
-                phoneNumberId,
-                to: from,
-                orgId: org.id,
-                text:
-                  "I got that you want to change something in the order, " +
-                  "but I don’t see any recent order for this number.\n" +
-                  "Please send a new order, or talk to the store directly.",
-              });
-
-              // do NOT fall through to generic flow
-              continue;
-            }
-
-            await sendWabaText({
-              phoneNumberId,
-              to: from,
-              orgId: org.id,
-              text: "👍 Got your change request. The store will review it and update your current order if possible.",
-            });
-
-            // In V1 we don’t auto-edit line items; we just pass it to store
-            // and stop here.
-            continue;
-          }
+// ─────────────────────────────
+// ORDER MODIFIER / CORRECTION (Option C from ingestCore NLU)
+// e.g. "make biriyani spicy", "only boneless", "remove coke"
+// ─────────────────────────────
+if (result && result.kind === "modifier") {
+    await logFlowEvent({
+      orgId: org.id,
+      from,
+      event: "modifier_message",
+      msgId,
+      orderId: activeOrder?.id || null,
+      text,
+      result,
+    });
+  
+    const activeOrderForEdit = activeOrder;
+  
+    if (!activeOrderForEdit || !activeOrderForEdit.id) {
+      await sendWabaText({
+        phoneNumberId,
+        to: from,
+        orgId: org.id,
+        text:
+          "I got that you want to change something in the order, " +
+          "but I don’t see any recent order for this number.\n" +
+          "Please send a new order, or talk to the store directly.",
+      });
+  
+      // do NOT fall through to generic flow
+      continue;
+    }
+  
+    // Try safe auto-edit (change variant / qty / remove)
+    const handled = await applySafeOrderModifier({
+      orgId: org.id,
+      phoneNumberId,
+      from,
+      text,
+      orderId: activeOrderForEdit.id,
+    });
+  
+    if (handled) {
+      // auto-edit already replied to customer
+      continue;
+    }
+  
+    // Fallback: keep your old V1 behaviour (no change, just note for store)
+    await sendWabaText({
+      phoneNumberId,
+      to: from,
+      orgId: org.id,
+      text:
+        "👍 Got your change request. The store will review it and update your current order if possible.",
+    });
+  
+    continue;
+  }
 
           // ─────────────────────────────
           // ADDRESS UPDATE FLOW (human-like)
