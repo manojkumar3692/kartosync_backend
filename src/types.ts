@@ -10,6 +10,14 @@ export type Org = {
   created_at: string;
 };
 
+export type OrderStatus =
+  | "pending"
+  | "delivered"
+  | "paid"
+  | "shipped"
+  | "cancelled_by_customer"
+  | "archived_for_new";
+
 export type Order = {
   id: string;
   org_id: string;
@@ -17,11 +25,47 @@ export type Order = {
   source_phone: string | null;
   raw_text: string;
   items: { name: string; qty: number; unit?: string }[];
-  status: "pending" | "delivered" | "paid";
+  status: OrderStatus;
   created_at: string;
 };
 
 export type InquiryKind = "price" | "availability";
+
+// ─────────────────────────────────────────────
+// Modifier payload types (for change requests)
+// ─────────────────────────────────────────────
+
+export type ModifierScope = "one" | "all" | "ambiguous";
+
+export type ModifierChangeType = "variant" | "qty" | "remove" | "note";
+
+export type ModifierTarget = {
+  type: "item";
+  text: string;              // raw phrase from user: "chicken biriyani", "all biryani", "everything"
+  canonical?: string | null; // cleaned name if AI is confident (e.g. "chicken biryani")
+};
+
+export type ModifierChange = {
+  type: ModifierChangeType;
+
+  // For "make biryani spicy", "change to boneless"
+  new_variant?: string | null;
+
+  // For "make coke 2", "change coke to 3"
+  new_qty?: number | null;
+
+  // For "add one more coke", "add 2 more"
+  delta_qty?: number | null;
+
+  // For "no onion", "less oil"
+  note?: string | null;
+};
+
+export type ModifierPayload = {
+  target: ModifierTarget;
+  scope: ModifierScope;
+  change: ModifierChange;
+};
 
 // ─────────────────────────────────────────────
 // Ingest types (backend shared)
@@ -36,25 +80,26 @@ export type IngestSource =
   | "other"
   | "unknown";
 
-  export type IngestItem = {
-    qty: number | null;
-    unit?: string | null;
-    canonical?: string | null;
-    name?: string | null;
-    brand?: string | null;
-    variant?: string | null;
-    notes?: string | null;
-  
-    // 🧠 AI + menu-aware hints (all optional)
-    product_id?: string | null;
-    match_type?: "catalog_exact" | "catalog_fuzzy" | "text_only" | null;
-    needs_clarify?: boolean;
-    clarify_reason?: string | null;
-    text_span?: string | null;
-  };
+export type IngestItem = {
+  qty: number | null;
+  unit?: string | null;
+  canonical?: string | null;
+  name?: string | null;
+  brand?: string | null;
+  variant?: string | null;
+  notes?: string | null;
+
+  // 🧠 AI + menu-aware hints (all optional)
+  product_id?: string | null;
+  match_type?: "catalog_exact" | "catalog_fuzzy" | "text_only" | null;
+  needs_clarify?: boolean;
+  clarify_reason?: string | null;
+  text_span?: string | null;
+};
 
 type IngestCommon = {
-  used?: "ai" | "rules" | "inquiry" | "none";
+  // which engine handled it
+  used?: "ai" | "rules" | "inquiry" | "modifier" | "none";
   reason?: string;
 
   items?: IngestItem[];
@@ -68,6 +113,10 @@ type IngestCommon = {
 
   // Backend can send a reply such as price, availability, etc.
   reply?: string;
+
+  // For order change / correction messages (Option C)
+  modifier?: ModifierPayload | null;
+  modifier_confidence?: number;
 };
 
 type IngestError = IngestCommon & {
@@ -110,12 +159,14 @@ type IngestNone = IngestCommon & {
   stored: false;
 };
 
-// 🔹 NEW: Modifier result for Option C
+// 🔹 Modifier result for Option C
 // "This message is a correction / modifier, let WABA update the order"
 type IngestModifier = IngestCommon & {
   ok: true;
   kind: "modifier";
   stored: false;
+  // you can optionally narrow this:
+  // used?: "none" | "modifier";
 };
 
 export type IngestResult =
@@ -134,6 +185,6 @@ export type IngestInput = {
   msg_id?: string | null;
   edited_at?: number | null;
   source?: IngestSource;
-  // NEW:
+  // NEW: caller can force-append into an active order
   active_order_id?: string | null;
 };

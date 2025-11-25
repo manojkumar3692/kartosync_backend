@@ -3,7 +3,8 @@ import { supa } from "../../db";
 import { getLatestPrice } from "../../util/products";
 import { findBestProductForTextV2 } from "../../util/productMatcher";
 import { BusinessType, normalizeBusinessType } from "./business";
-
+import { normalizeLabelForFuzzy, fuzzyCharOverlapScore } from "../../util/fuzzy";
+import { resolveAliasForText } from "../../routes/waba/aliasEngine";
 // ─────────────────────────────
 // Spelling / synonym normalizer for product text (Layer 7)
 // ─────────────────────────────
@@ -55,18 +56,37 @@ export function normalizeProductText(raw: string): string {
 
 // ─────────────────────────────
 // Helper: extract catalog_unmatched items from parse_reason
+// Supports BOTH:
+//   - catalog_unmatched:...
+//   - catalog_unmatched_only:...
+// and dedupes the final list.
 // ─────────────────────────────
 export function extractCatalogUnmatched(reason?: string | null): string[] {
-    if (!reason) return [];
-    const r = String(reason);
-    // Look for "catalog_unmatched:..." up to the next ';'
-    const m = /catalog_unmatched:([^;]+)/.exec(r);
-    if (!m || !m[1]) return [];
-    return m[1]
+  if (!reason) return [];
+  const r = String(reason);
+
+  const allTokens: string[] = [];
+  const re = /catalog_unmatched(?:_only)?:([^;]+)/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = re.exec(r)) !== null) {
+    if (!m[1]) continue;
+    const parts = m[1]
       .split("|")
       .map((s) => s.trim())
       .filter(Boolean);
+    allTokens.push(...parts);
   }
+
+  // Dedupe + keep order
+  return Array.from(
+    new Set(
+      allTokens
+        .map((s) => s.trim())
+        .filter(Boolean)
+    )
+  );
+}
 
 export function extractCatalogUnmatchedOnly(reason?: string | null): string[] {
     if (!reason) return [];
@@ -583,6 +603,81 @@ export async function findFamilyVariantsForKeywords(opts: {
     return out;
   } catch (e: any) {
     console.warn("[WABA][familyVariants err]", e?.message || e);
+    return [];
+  }
+}
+
+export async function findFuzzyProductSuggestions(opts: {
+  org_id: string;
+  rawLabel: string;
+  customer_phone?: string;
+  limit?: number;
+}): Promise<{ id: string; name: string; score: number }[]> {
+  const { org_id, rawLabel } = opts;
+  const limit = opts.limit ?? 3;
+
+  const labelNorm = normalizeLabelForFuzzy(rawLabel);
+  if (!labelNorm || labelNorm.length < 3) return [];
+
+  // 0️⃣ First try alias memory (customer → org/global)
+  try {
+    const aliasHit = await resolveAliasForText({
+      org_id,
+      customer_phone: opts.customer_phone,
+      wrong_text: rawLabel,
+    });
+
+    if (aliasHit && aliasHit.canonical_product_id) {
+      // Load that exact product and return as a "perfect" suggestion
+      const { data: prod, error: prodErr } = await supa
+        .from("products")
+        .select("id, display_name, canonical")
+        .eq("org_id", org_id)
+        .eq("id", aliasHit.canonical_product_id)
+        .maybeSingle();
+
+      if (!prodErr && prod && prod.id) {
+        const name = String(prod.display_name || prod.canonical || "").trim();
+        if (name) {
+          return [
+            {
+              id: prod.id as string,
+              name,
+              score: 1.0, // treat as perfect match
+            },
+          ];
+        }
+      }
+    }
+  } catch (e: any) {
+    console.warn("[WABA][alias suggestions err]", e?.message || e);
+  }
+
+  // 1️⃣ Fallback to your existing fuzzy catalogue scan
+  try {
+    const { data, error } = await supa
+      .from("products")
+      .select("id, display_name, canonical")
+      .eq("org_id", org_id)
+      .limit(200); // keep it small; we only need top few
+
+    if (error || !data || !data.length) return [];
+
+    const scored = data
+      .map((p: any) => {
+        const name = String(p.display_name || p.canonical || "").trim();
+        if (!name) return null;
+
+        const score = fuzzyCharOverlapScore(rawLabel, name);
+        return { id: p.id as string, name, score };
+      })
+      .filter((x: any) => x && x.score >= 0.4)
+      .sort((a: any, b: any) => b.score - a.score)
+      .slice(0, limit);
+
+    return scored as { id: string; name: string; score: number }[];
+  } catch (e: any) {
+    console.warn("[WABA][fuzzy suggestions err]", e?.message || e);
     return [];
   }
 }

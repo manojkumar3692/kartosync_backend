@@ -46,12 +46,13 @@ import {
   formatPriceLine,
   prettyLabelFromText,
   extractMenuKeywords,
+  findFuzzyProductSuggestions,
   buildMenuReply,
 } from "../routes/waba/productInquiry";
 import { interpretMessage } from "../ai/interpreter";
 import { saveAiInsight } from "../routes/waba/aiInsights";
 import { resolveActiveOrderIdForCustomer } from "../session/sessionEngine";
-import { resolveAliasForText } from "../routes/waba/aliasEngine";
+
 // at the top of waba.ts
 import { normalizeLabelForFuzzy, fuzzyCharOverlapScore } from "../util/fuzzy";
 
@@ -120,111 +121,6 @@ type ProductOptionsResult = {
   options: ProductPriceOption[];
 };
 
-// ─────────────────────────────
-// Fuzzy helpers for spelling / alias suggestions
-// ─────────────────────────────
-
-// Normalize text for fuzzy comparison (lowercase, remove spaces/punctuation)
-// function normalizeLabelForFuzzy(raw: string): string {
-//   return String(raw || "")
-//     .toLowerCase()
-//     .normalize("NFKD")
-//     .replace(/[\u0300-\u036f]/g, "") // strip accents
-//     .replace(/[^a-z0-9]+/g, "") // keep only a-z0-9
-//     .trim();
-// }
-
-// Very simple similarity: how many chars overlap vs max length
-// function fuzzyCharOverlapScore(a: string, b: string): number {
-//   const s1 = normalizeLabelForFuzzy(a);
-//   const s2 = normalizeLabelForFuzzy(b);
-//   if (!s1 || !s2) return 0;
-
-//   const set1 = new Set(s1.split(""));
-//   let matches = 0;
-//   for (const ch of s2) {
-//     if (set1.has(ch)) matches++;
-//   }
-//   const maxLen = Math.max(s1.length, s2.length);
-//   if (!maxLen) return 0;
-//   return matches / maxLen; // 0 → no overlap, 1 → perfect
-// }
-
-// Look up close product names for a misspelled label
-async function findFuzzyProductSuggestions(opts: {
-  org_id: string;
-  rawLabel: string;
-  customer_phone?: string;
-  limit?: number;
-}): Promise<{ id: string; name: string; score: number }[]> {
-  const { org_id, rawLabel } = opts;
-  const limit = opts.limit ?? 3;
-
-  const labelNorm = normalizeLabelForFuzzy(rawLabel);
-  if (!labelNorm || labelNorm.length < 3) return [];
-
-  // 0️⃣ First try alias memory (customer → org/global)
-  try {
-    const aliasHit = await resolveAliasForText({
-      org_id,
-      customer_phone: opts.customer_phone,
-      wrong_text: rawLabel,
-    });
-
-    if (aliasHit && aliasHit.canonical_product_id) {
-      // Load that exact product and return as a "perfect" suggestion
-      const { data: prod, error: prodErr } = await supa
-        .from("products")
-        .select("id, display_name, canonical")
-        .eq("org_id", org_id)
-        .eq("id", aliasHit.canonical_product_id)
-        .maybeSingle();
-
-      if (!prodErr && prod && prod.id) {
-        const name = String(prod.display_name || prod.canonical || "").trim();
-        if (name) {
-          return [
-            {
-              id: prod.id as string,
-              name,
-              score: 1.0, // treat as perfect match
-            },
-          ];
-        }
-      }
-    }
-  } catch (e: any) {
-    console.warn("[WABA][alias suggestions err]", e?.message || e);
-  }
-
-  // 1️⃣ Fallback to your existing fuzzy catalogue scan
-  try {
-    const { data, error } = await supa
-      .from("products")
-      .select("id, display_name, canonical")
-      .eq("org_id", org_id)
-      .limit(200); // keep it small; we only need top few
-
-    if (error || !data || !data.length) return [];
-
-    const scored = data
-      .map((p: any) => {
-        const name = String(p.display_name || p.canonical || "").trim();
-        if (!name) return null;
-
-        const score = fuzzyCharOverlapScore(rawLabel, name);
-        return { id: p.id as string, name, score };
-      })
-      .filter((x: any) => x && x.score >= 0.4)
-      .sort((a: any, b: any) => b.score - a.score)
-      .slice(0, limit);
-
-    return scored as { id: string; name: string; score: number }[];
-  } catch (e: any) {
-    console.warn("[WABA][fuzzy suggestions err]", e?.message || e);
-    return [];
-  }
-}
 
 // ─────────────────────────────
 // Helper: smart reply for price / availability inquiries
@@ -561,85 +457,82 @@ async function buildSmartInquiryReply(opts: {
     );
 
     const requestedLabel = prettyLabelFromText(text);
-// 🧠 Partial match case:
-// Example: user -> "panner biriyani"
-// Catalog -> only "Mutton Biryani", "Chicken Biryani"
-// → we matched "biryani" but not "panner" → don't lie,
-//   but show ALL related biryani variants from DB.
-if (
-    names.length > 0 &&
-    keywords.length > 0 &&
-    hasOverlap &&
-    missingKeywords.length > 0
-  ) {
-    try {
-      // Look for all "family" items in this org that contain any keyword
-      const { data: allProducts, error: allErr } = await supa
-        .from("products")
-        .select(
-          "id, display_name, canonical, variant, base_unit, price_per_unit"
-        )
-        .eq("org_id", org_id);
-  
-      let familyNames: string[] = [];
-  
-      if (!allErr && allProducts && allProducts.length) {
-        const familyHits = (allProducts as any[]).filter((p) => {
-          const baseName = String(
-            p.display_name || p.canonical || ""
-          ).toLowerCase();
-          const variantName = String(p.variant || "").toLowerCase();
-          const haystack = `${baseName} ${variantName}`.trim();
-          if (!haystack) return false;
-  
-          // match any of the meaningful keywords (e.g. "paneer", "biryani")
-          return keywords.some((kw) => haystack.includes(kw));
-        });
-  
-        familyNames = Array.from(
-          new Set(
-            familyHits
-              .map((p) => {
-                const base = p.display_name || p.canonical || "item";
-                return p.variant
-                  ? `${base} ${String(p.variant).trim()}`
-                  : base;
-              })
-              .filter(Boolean)
+    // 🧠 Partial match case:
+    // Example: user -> "panner biriyani"
+    // Catalog -> only "Mutton Biryani", "Chicken Biryani"
+    // → we matched "biryani" but not "panner" → don't lie,
+    //   but show ALL related biryani variants from DB.
+    if (
+      names.length > 0 &&
+      keywords.length > 0 &&
+      hasOverlap &&
+      missingKeywords.length > 0
+    ) {
+      try {
+        // Look for all "family" items in this org that contain any keyword
+        const { data: allProducts, error: allErr } = await supa
+          .from("products")
+          .select(
+            "id, display_name, canonical, variant, base_unit, price_per_unit"
           )
+          .eq("org_id", org_id);
+
+        let familyNames: string[] = [];
+
+        if (!allErr && allProducts && allProducts.length) {
+          const familyHits = (allProducts as any[]).filter((p) => {
+            const baseName = String(
+              p.display_name || p.canonical || ""
+            ).toLowerCase();
+            const variantName = String(p.variant || "").toLowerCase();
+            const haystack = `${baseName} ${variantName}`.trim();
+            if (!haystack) return false;
+
+            // match any of the meaningful keywords (e.g. "paneer", "biryani")
+            return keywords.some((kw) => haystack.includes(kw));
+          });
+
+          familyNames = Array.from(
+            new Set(
+              familyHits
+                .map((p) => {
+                  const base = p.display_name || p.canonical || "item";
+                  return p.variant
+                    ? `${base} ${String(p.variant).trim()}`
+                    : base;
+                })
+                .filter(Boolean)
+            )
+          );
+        }
+
+        // If no extra family hits, fall back to the original 'names'
+        const finalNames = familyNames.length > 0 ? familyNames : names;
+
+        const header =
+          `I couldn’t find *${requestedLabel}* exactly in today’s menu.\n` +
+          `We do have:\n`;
+
+        const lines = finalNames.map((n, i) => `${i + 1}) ${n}`);
+        const footer = "\n\nWould you like to choose one of these instead?";
+
+        return header + lines.join("\n") + footer;
+      } catch (e: any) {
+        console.warn(
+          "[WABA][availability family suggestions err]",
+          e?.message || e
         );
+
+        // Safe fallback: keep the old behaviour
+        const header =
+          `I couldn’t find *${requestedLabel}* exactly in today’s menu.\n` +
+          `We do have:\n`;
+        const lines = names.map((n, i) => `${i + 1}) ${n}`);
+        const footer = "\n\nWould you like to choose one of these instead?";
+
+        return header + lines.join("\n") + footer;
       }
-  
-      // If no extra family hits, fall back to the original 'names'
-      const finalNames =
-        familyNames.length > 0
-          ? familyNames
-          : names;
-  
-      const header =
-        `I couldn’t find *${requestedLabel}* exactly in today’s menu.\n` +
-        `We do have:\n`;
-  
-      const lines = finalNames.map((n, i) => `${i + 1}) ${n}`);
-      const footer = "\n\nWould you like to choose one of these instead?";
-  
-      return header + lines.join("\n") + footer;
-    } catch (e: any) {
-      console.warn(
-        "[WABA][availability family suggestions err]",
-        e?.message || e
-      );
-  
-      // Safe fallback: keep the old behaviour
-      const header =
-        `I couldn’t find *${requestedLabel}* exactly in today’s menu.\n` +
-        `We do have:\n`;
-      const lines = names.map((n, i) => `${i + 1}) ${n}`);
-      const footer = "\n\nWould you like to choose one of these instead?";
-  
-      return header + lines.join("\n") + footer;
     }
-  }
 
     // Normal happy path: full match
     if (names.length >= 1) {
@@ -698,276 +591,282 @@ async function findMostRecentOrderForPhone(
 // Used only when ingestCore says: result.kind === "modifier"
 // ─────────────────────────────
 async function applySafeOrderModifier(opts: {
-    orgId: string;
-    phoneNumberId: string;
-    from: string; // raw WhatsApp number (no +)
-    text: string;
-    orderId: string;
-  }): Promise<boolean> {
-    const { orgId, phoneNumberId, from, text, orderId } = opts;
-    const lower = text.toLowerCase();
-  
-    // 1) Load fresh order from DB
-    const { data: ordRow, error: ordErr } = await supa
-      .from("orders")
-      .select("id, items, status")
-      .eq("id", orderId)
-      .maybeSingle();
-  
-    if (ordErr || !ordRow || !ordRow.id) {
-      console.warn("[WABA][modifier order load err]", ordErr?.message);
-      await logFlowEvent({
-        orgId,
-        from,
-        event: "modifier_order_missing",
-        msgId: undefined,
-        orderId,
-        text,
-        result: { error: ordErr?.message || "order not found" },
-      });
-      return false; // let caller fall back to old behaviour
-    }
-  
-    const status = String((ordRow as any).status || "pending").toLowerCase();
-  
-    // Only auto-edit when order is still modifiable
-    const canEdit = status === "pending" || status === "paid";
-    if (!canEdit) {
-      await sendWabaText({
-        phoneNumberId,
-        to: from,
-        orgId,
-        text:
-          "I got your change request, but this order is already being processed.\n" +
-          "The store will try to adjust it if possible.",
-      });
-  
-      await logFlowEvent({
-        orgId,
-        from,
-        event: "modifier_order_not_editable",
-        msgId: undefined,
-        orderId,
-        text,
-        result: { status },
-      });
-  
-      return true; // handled (we replied), but no auto-edit
-    }
-  
-    const items: any[] = Array.isArray((ordRow as any).items)
-      ? ((ordRow as any).items as any[])
-      : [];
-  
-    if (!items.length) {
-      return false;
-    }
-  
-    // 2) Detect type of change (variant / quantity / remove)
-    const wantsRemove =
-      lower.includes("remove ") ||
-      lower.includes("remove the ") ||
-      lower.includes("dont want") ||
-      lower.includes("don't want") ||
-      lower.includes("no need") ||
-      (lower.includes("cancel") && !/cancel my order|cancel order/.test(lower));
-  
-    const hasSpicy = lower.includes("spicy");
-    const hasRegular = lower.includes("regular");
-    const hasLessSpicy =
-      lower.includes("less spicy") || lower.includes("medium spicy");
-  
-    // crude qty detection: look for "to 2", "make it 2", "2 qty", etc.
-    let qtyMatch: number | null = null;
-    {
-      const m = lower.match(/(?:to|make it|make|change).*?(\d{1,2})/) ||
-        lower.match(/(\d{1,2})\s*(?:qty|quantity|pieces?|pcs?|plates?)\b/);
-      if (m && m[1]) {
-        const q = parseInt(m[1], 10);
-        if (!Number.isNaN(q) && q > 0 && q <= 99) {
-          qtyMatch = q;
-        }
-      }
-    }
-  
-    const wantsQtyChange = qtyMatch != null;
-  
-    // If we couldn't recognise *any* supported change type, bail out to old behaviour
-    if (!wantsRemove && !hasSpicy && !hasRegular && !hasLessSpicy && !wantsQtyChange) {
-      await logFlowEvent({
-        orgId,
-        from,
-        event: "modifier_unsupported_change_type",
-        msgId: undefined,
-        orderId,
-        text,
-        result: { note: "no recognised change keywords" },
-      });
-      return false;
-    }
-  
-    // 3) Find best target line-item using fuzzy match on item names vs the message
-    const keywords = lower
-      .split(/\s+/)
-      .map((w) => w.replace(/[^a-z0-9]/gi, ""))
-      .filter((w) => w.length >= 3);
-  
-    type Candidate = { index: number; label: string; score: number };
-    const cands: Candidate[] = [];
-  
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i] || {};
-      const baseName = String(it.canonical || it.name || "").trim();
-      if (!baseName) continue;
-  
-      const label = baseName.toLowerCase();
-      const fuzzyScore = fuzzyCharOverlapScore(baseName, text); // uses normalized forms internally
-  
-      const hasKeywordOverlap = keywords.some((kw) => label.includes(kw));
-      const finalScore = fuzzyScore + (hasKeywordOverlap ? 0.3 : 0);
-  
-      if (finalScore >= 0.4) {
-        cands.push({ index: i, label: baseName, score: finalScore });
-      }
-    }
-  
-    if (!cands.length) {
-      await logFlowEvent({
-        orgId,
-        from,
-        event: "modifier_no_target_match",
-        msgId: undefined,
-        orderId,
-        text,
-        result: { note: "no fuzzy match to any line item" },
-      });
-      return false; // ambiguous → let store handle
-    }
-  
-    // Sort by score desc
-    cands.sort((a, b) => b.score - a.score);
-  
-    const best = cands[0];
-    const second = cands[1];
-  
-    // If two items are almost equally similar → too risky to auto-edit
-    if (second && best.score - second.score < 0.15) {
-      await logFlowEvent({
-        orgId,
-        from,
-        event: "modifier_ambiguous_multiple_targets",
-        msgId: undefined,
-        orderId,
-        text,
-        result: { candidates: cands.slice(0, 3) },
-      });
-      return false;
-    }
-  
-    const targetIndex = best.index;
-    const targetItem = items[targetIndex] || {};
-    const itemName =
-      targetItem.canonical || targetItem.name || "that item";
-  
-    let changed = false;
-    let replyText = "";
-  
-    // 4A) Remove item
-    if (wantsRemove) {
-      items.splice(targetIndex, 1);
-      changed = true;
-      replyText = `✅ Done — removed *${itemName}* from your order.`;
-    }
-  
-    // 4B) Variant change (spicy / regular / less spicy)
-    if (!changed && (hasSpicy || hasRegular || hasLessSpicy)) {
-      let newVariant: string | null = null;
-  
-      if (hasLessSpicy) {
-        newVariant = "Less Spicy";
-      } else if (hasSpicy) {
-        newVariant = "Spicy";
-      } else if (hasRegular) {
-        newVariant = "Regular";
-      }
-  
-      if (newVariant) {
-        items[targetIndex] = {
-          ...targetItem,
-          variant: newVariant,
-        };
-        changed = true;
-        replyText = `✅ Done — updated your *${itemName}* to *${newVariant}*.`;
-      }
-    }
-  
-    // 4C) Quantity change
-    if (!changed && wantsQtyChange && qtyMatch != null) {
-      items[targetIndex] = {
-        ...targetItem,
-        qty: qtyMatch,
-      };
-      changed = true;
-      replyText = `✅ Done — updated *${itemName}* to quantity *${qtyMatch}*.`;
-    }
-  
-    if (!changed) {
-      await logFlowEvent({
-        orgId,
-        from,
-        event: "modifier_no_change_applied",
-        msgId: undefined,
-        orderId,
-        text,
-        result: { note: "change type detected but nothing applied" },
-      });
-      return false;
-    }
-  
-    // 5) Save back to DB
-    const { error: updErr } = await supa
-      .from("orders")
-      .update({ items })
-      .eq("id", ordRow.id);
-  
-    if (updErr) {
-      console.warn("[WABA][modifier save err]", updErr.message);
-      await logFlowEvent({
-        orgId,
-        from,
-        event: "modifier_save_failed",
-        msgId: undefined,
-        orderId,
-        text,
-        result: { error: updErr.message },
-      });
-      return false;
-    }
-  
-    // 6) Confirm to customer
+  orgId: string;
+  phoneNumberId: string;
+  from: string; // raw WhatsApp number (no +)
+  text: string;
+  orderId: string;
+}): Promise<boolean> {
+  const { orgId, phoneNumberId, from, text, orderId } = opts;
+  const lower = text.toLowerCase();
+
+  // 1) Load fresh order from DB
+  const { data: ordRow, error: ordErr } = await supa
+    .from("orders")
+    .select("id, items, status")
+    .eq("id", orderId)
+    .maybeSingle();
+
+  if (ordErr || !ordRow || !ordRow.id) {
+    console.warn("[WABA][modifier order load err]", ordErr?.message);
+    await logFlowEvent({
+      orgId,
+      from,
+      event: "modifier_order_missing",
+      msgId: undefined,
+      orderId,
+      text,
+      result: { error: ordErr?.message || "order not found" },
+    });
+    return false; // let caller fall back to old behaviour
+  }
+
+  const status = String((ordRow as any).status || "pending").toLowerCase();
+
+  // Only auto-edit when order is still modifiable
+  const canEdit = status === "pending" || status === "paid";
+  if (!canEdit) {
     await sendWabaText({
       phoneNumberId,
       to: from,
       orgId,
-      text: replyText,
+      text:
+        "I got your change request, but this order is already being processed.\n" +
+        "The store will try to adjust it if possible.",
     });
-  
+
     await logFlowEvent({
       orgId,
       from,
-      event: "modifier_auto_edit_applied",
+      event: "modifier_order_not_editable",
       msgId: undefined,
       orderId,
       text,
-      result: {
-        targetIndex,
-        itemName,
-        replyText,
-      },
+      result: { status },
     });
-  
-    return true; // ✅ fully handled here
+
+    return true; // handled (we replied), but no auto-edit
   }
+
+  const items: any[] = Array.isArray((ordRow as any).items)
+    ? ((ordRow as any).items as any[])
+    : [];
+
+  if (!items.length) {
+    return false;
+  }
+
+  // 2) Detect type of change (variant / quantity / remove)
+  const wantsRemove =
+    lower.includes("remove ") ||
+    lower.includes("remove the ") ||
+    lower.includes("dont want") ||
+    lower.includes("don't want") ||
+    lower.includes("no need") ||
+    (lower.includes("cancel") && !/cancel my order|cancel order/.test(lower));
+
+  const hasSpicy = lower.includes("spicy");
+  const hasRegular = lower.includes("regular");
+  const hasLessSpicy =
+    lower.includes("less spicy") || lower.includes("medium spicy");
+
+  // crude qty detection: look for "to 2", "make it 2", "2 qty", etc.
+  let qtyMatch: number | null = null;
+  {
+    const m =
+      lower.match(/(?:to|make it|make|change).*?(\d{1,2})/) ||
+      lower.match(/(\d{1,2})\s*(?:qty|quantity|pieces?|pcs?|plates?)\b/);
+    if (m && m[1]) {
+      const q = parseInt(m[1], 10);
+      if (!Number.isNaN(q) && q > 0 && q <= 99) {
+        qtyMatch = q;
+      }
+    }
+  }
+
+  const wantsQtyChange = qtyMatch != null;
+
+  // If we couldn't recognise *any* supported change type, bail out to old behaviour
+  if (
+    !wantsRemove &&
+    !hasSpicy &&
+    !hasRegular &&
+    !hasLessSpicy &&
+    !wantsQtyChange
+  ) {
+    await logFlowEvent({
+      orgId,
+      from,
+      event: "modifier_unsupported_change_type",
+      msgId: undefined,
+      orderId,
+      text,
+      result: { note: "no recognised change keywords" },
+    });
+    return false;
+  }
+
+  // 3) Find best target line-item using fuzzy match on item names vs the message
+  const keywords = lower
+    .split(/\s+/)
+    .map((w) => w.replace(/[^a-z0-9]/gi, ""))
+    .filter((w) => w.length >= 3);
+
+  type Candidate = { index: number; label: string; score: number };
+  const cands: Candidate[] = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i] || {};
+    const baseName = String(it.canonical || it.name || "").trim();
+    if (!baseName) continue;
+
+    const label = baseName.toLowerCase();
+    const fuzzyScore = fuzzyCharOverlapScore(baseName, text); // uses normalized forms internally
+
+    const hasKeywordOverlap = keywords.some((kw) => label.includes(kw));
+    const finalScore = fuzzyScore + (hasKeywordOverlap ? 0.3 : 0);
+
+    if (finalScore >= 0.4) {
+      cands.push({ index: i, label: baseName, score: finalScore });
+    }
+  }
+
+  if (!cands.length) {
+    await logFlowEvent({
+      orgId,
+      from,
+      event: "modifier_no_target_match",
+      msgId: undefined,
+      orderId,
+      text,
+      result: { note: "no fuzzy match to any line item" },
+    });
+    return false; // ambiguous → let store handle
+  }
+
+  // Sort by score desc
+  cands.sort((a, b) => b.score - a.score);
+
+  const best = cands[0];
+  const second = cands[1];
+
+  // If two items are almost equally similar → too risky to auto-edit
+  if (second && best.score - second.score < 0.15) {
+    await logFlowEvent({
+      orgId,
+      from,
+      event: "modifier_ambiguous_multiple_targets",
+      msgId: undefined,
+      orderId,
+      text,
+      result: { candidates: cands.slice(0, 3) },
+    });
+    return false;
+  }
+
+  const targetIndex = best.index;
+  const targetItem = items[targetIndex] || {};
+  const itemName = targetItem.canonical || targetItem.name || "that item";
+
+  let changed = false;
+  let replyText = "";
+
+  // 4A) Remove item
+  if (wantsRemove) {
+    items.splice(targetIndex, 1);
+    changed = true;
+    replyText = `✅ Done — removed *${itemName}* from your order.`;
+  }
+
+  // 4B) Variant change (spicy / regular / less spicy)
+  if (!changed && (hasSpicy || hasRegular || hasLessSpicy)) {
+    let newVariant: string | null = null;
+
+    if (hasLessSpicy) {
+      newVariant = "Less Spicy";
+    } else if (hasSpicy) {
+      newVariant = "Spicy";
+    } else if (hasRegular) {
+      newVariant = "Regular";
+    }
+
+    if (newVariant) {
+      items[targetIndex] = {
+        ...targetItem,
+        variant: newVariant,
+      };
+      changed = true;
+      replyText = `✅ Done — updated your *${itemName}* to *${newVariant}*.`;
+    }
+  }
+
+  // 4C) Quantity change
+  if (!changed && wantsQtyChange && qtyMatch != null) {
+    items[targetIndex] = {
+      ...targetItem,
+      qty: qtyMatch,
+    };
+    changed = true;
+    replyText = `✅ Done — updated *${itemName}* to quantity *${qtyMatch}*.`;
+  }
+
+  if (!changed) {
+    await logFlowEvent({
+      orgId,
+      from,
+      event: "modifier_no_change_applied",
+      msgId: undefined,
+      orderId,
+      text,
+      result: { note: "change type detected but nothing applied" },
+    });
+    return false;
+  }
+
+  // 5) Save back to DB
+  const { error: updErr } = await supa
+    .from("orders")
+    .update({ items })
+    .eq("id", ordRow.id);
+
+  if (updErr) {
+    console.warn("[WABA][modifier save err]", updErr.message);
+    await logFlowEvent({
+      orgId,
+      from,
+      event: "modifier_save_failed",
+      msgId: undefined,
+      orderId,
+      text,
+      result: { error: updErr.message },
+    });
+    return false;
+  }
+
+  // 6) Confirm to customer
+  await sendWabaText({
+    phoneNumberId,
+    to: from,
+    orgId,
+    text: replyText,
+  });
+
+  await logFlowEvent({
+    orgId,
+    from,
+    event: "modifier_auto_edit_applied",
+    msgId: undefined,
+    orderId,
+    text,
+    result: {
+      targetIndex,
+      itemName,
+      replyText,
+    },
+  });
+
+  return true; // ✅ fully handled here
+}
 
 // ─────────────────────────────
 // Debug flow logger (non-invasive)
@@ -2436,7 +2335,6 @@ waba.post("/", async (req, res) => {
             continue;
           }
 
-
           /// ─────────────────────────────
           // LAYER 12: ingestCore (safe)
           // ─────────────────────────────
@@ -2583,63 +2481,62 @@ waba.post("/", async (req, res) => {
             console.warn("[L11][learnAliasFromInquiry err]", e?.message || e);
           }
 
-// ─────────────────────────────
-// ORDER MODIFIER / CORRECTION (Option C from ingestCore NLU)
-// e.g. "make biriyani spicy", "only boneless", "remove coke"
-// ─────────────────────────────
-if (result && result.kind === "modifier") {
-    await logFlowEvent({
-      orgId: org.id,
-      from,
-      event: "modifier_message",
-      msgId,
-      orderId: activeOrder?.id || null,
-      text,
-      result,
-    });
-  
-    const activeOrderForEdit = activeOrder;
-  
-    if (!activeOrderForEdit || !activeOrderForEdit.id) {
-      await sendWabaText({
-        phoneNumberId,
-        to: from,
-        orgId: org.id,
-        text:
-          "I got that you want to change something in the order, " +
-          "but I don’t see any recent order for this number.\n" +
-          "Please send a new order, or talk to the store directly.",
-      });
-  
-      // do NOT fall through to generic flow
-      continue;
-    }
-  
-    // Try safe auto-edit (change variant / qty / remove)
-    const handled = await applySafeOrderModifier({
-      orgId: org.id,
-      phoneNumberId,
-      from,
-      text,
-      orderId: activeOrderForEdit.id,
-    });
-  
-    if (handled) {
-      // auto-edit already replied to customer
-      continue;
-    }
-  
-    // Fallback: keep your old V1 behaviour (no change, just note for store)
-    await sendWabaText({
-      phoneNumberId,
-      to: from,
-      orgId: org.id,
-      text:
-        "👍 Got your change request. The store will review it and update your current order if possible.",
-    });
-  
-    continue;
-  }
+          // ─────────────────────────────
+          // ORDER MODIFIER / CORRECTION (Option C from ingestCore NLU)
+          // e.g. "make biriyani spicy", "only boneless", "remove coke"
+          // ─────────────────────────────
+          if (result && result.kind === "modifier") {
+            await logFlowEvent({
+              orgId: org.id,
+              from,
+              event: "modifier_message",
+              msgId,
+              orderId: activeOrder?.id || null,
+              text,
+              result,
+            });
+
+            const activeOrderForEdit = activeOrder;
+
+            if (!activeOrderForEdit || !activeOrderForEdit.id) {
+              await sendWabaText({
+                phoneNumberId,
+                to: from,
+                orgId: org.id,
+                text:
+                  "I got that you want to change something in the order, " +
+                  "but I don’t see any recent order for this number.\n" +
+                  "Please send a new order, or talk to the store directly.",
+              });
+
+              // do NOT fall through to generic flow
+              continue;
+            }
+
+            // Try safe auto-edit (change variant / qty / remove)
+            const handled = await applySafeOrderModifier({
+              orgId: org.id,
+              phoneNumberId,
+              from,
+              text,
+              orderId: activeOrderForEdit.id,
+            });
+
+            if (handled) {
+              // auto-edit already replied to customer
+              continue;
+            }
+
+            // Fallback: keep your old V1 behaviour (no change, just note for store)
+            await sendWabaText({
+              phoneNumberId,
+              to: from,
+              orgId: org.id,
+              text: "👍 Got your change request. The store will review it and update your current order if possible.",
+            });
+
+            continue;
+          }
 
           // ─────────────────────────────
           // ADDRESS UPDATE FLOW (human-like)

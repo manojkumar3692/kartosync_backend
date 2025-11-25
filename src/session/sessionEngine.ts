@@ -2,6 +2,15 @@
 import { supa } from "../db";
 import { InquiryKind } from "../types";
 
+// 🔹 NEW: typed snapshot for last modifier
+export type SessionModifierSnapshot = {
+  text: string;
+  intent: "order_correction" | "modifier";
+  ts: number;
+  payload?: any;
+  confidence?: number;
+};
+
 // Keep this in ONE place so ingestCore / WABA / dashboards
 // all see the SAME idea of "active order" + last inquiry.
 export type CustomerSession = {
@@ -22,7 +31,7 @@ export type CustomerSession = {
   last_inquiry_status: string | null;
 
   // For future use (modifiers, address updates, etc.)
-  last_modifier_json: any | null;
+  last_modifier_json: SessionModifierSnapshot | null;
   last_modifier_at: string | null;
 
   // Generic activity
@@ -130,7 +139,8 @@ export async function getCustomerSession(
     last_inquiry_at: data.last_inquiry_at ?? null,
     last_inquiry_status: data.last_inquiry_status ?? null,
 
-    last_modifier_json: data.last_modifier_json ?? null,
+    last_modifier_json: (data.last_modifier_json ??
+      null) as SessionModifierSnapshot | null,
     last_modifier_at: data.last_modifier_at ?? null,
 
     last_seen_at: data.last_seen_at ?? null,
@@ -352,13 +362,16 @@ export async function markSessionOnInquiry(opts: {
 export async function markSessionOnModifier(opts: {
   org_id: string;
   phone_key: string;
-  modifier: any; // you can define a strict type later
+  modifier: SessionModifierSnapshot;
 }) {
   const orgId = String(opts.org_id || "").trim();
   const phoneKey = String(opts.phone_key || "").trim();
   if (!orgId || !phoneKey) return;
 
-  const now = new Date().toISOString();
+  const ts =
+    typeof opts.modifier.ts === "number" && opts.modifier.ts > 0
+      ? new Date(opts.modifier.ts).toISOString()
+      : new Date().toISOString();
 
   await ensureSessionRow(orgId, phoneKey);
 
@@ -366,8 +379,8 @@ export async function markSessionOnModifier(opts: {
     .from("org_customer_settings")
     .update({
       last_modifier_json: opts.modifier,
-      last_modifier_at: now,
-      last_seen_at: now,
+      last_modifier_at: ts,
+      last_seen_at: ts,
     })
     .eq("org_id", orgId)
     .eq("customer_phone", phoneKey);

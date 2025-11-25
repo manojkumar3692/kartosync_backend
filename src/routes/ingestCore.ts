@@ -2,6 +2,7 @@
 import { supa } from "../db";
 import { parseOrder } from "../parser";
 import { detectInquiry } from "../util/inquiry";
+import { cleanForOrderPipeline } from "../ai/cleanText";
 import {
   isObviousPromoOrSpam,
   isPureGreetingOrAck,
@@ -30,6 +31,7 @@ import { formatInquiryReply } from "../util/inquiryReply"; // NEW
 import { classifyMessage, NLUResult as CoreNluResult } from "../ai/nlu";
 import { fuzzyCharOverlapScore } from "../util/fuzzy"; // ⬅️ add at top
 import { getOrgMenuIndex, matchMenuItem } from "../menu/menuIndex";
+import { parseModifier } from "../ai/modifierParser";
 
 // ─────────────────────────────────────────────────────────
 // Optional AI parser hook (safe if missing → rules fallback)
@@ -157,6 +159,9 @@ function stripNonItemPreamble(line: string): string {
     /^(and|also|sorry|one more thing|that's it|thats it)[:,]?\s*/i,
     ""
   );
+
+  // 👇 NEW: treat casual address as noise
+  s = s.replace(/^(bro|boss|sir|madam|anna|bhai)\s+/i, "");
 
   return s.trim();
 }
@@ -1222,9 +1227,25 @@ export async function ingestCoreFromMessage(
       };
     }
 
-    // 1) Line normalization and shape detection
-    const rawLines0 = splitAndCleanLines(textRaw);
-    console.log("[INGEST][core][dbg] rawLines0=", rawLines0);
+// 🔹 Layer 0: Semantic cleaner (for ORDER pipe)
+// NLU will still use textRaw. Parser uses cleanedText.
+const { cleanedText, removedTokens, strategy: cleanStrategy } =
+  await cleanForOrderPipeline({ text: textRaw, orgId });
+
+const textForOrder = cleanedText || textRaw;
+
+if (cleanStrategy !== "none") {
+  console.log("[INGEST][core][cleaner]", {
+    textRaw,
+    textForOrder,
+    removedTokens,
+    cleanStrategy,
+  });
+}
+
+// 1) Line normalization and shape detection (on cleaned text)
+const rawLines0 = splitAndCleanLines(textForOrder);
+console.log("[INGEST][core][dbg] rawLines0=", rawLines0);
 
     const listLines = rawLines0.filter((s) => {
       if (!s) return false;
@@ -1251,7 +1272,7 @@ export async function ingestCoreFromMessage(
     );
     console.log("[INGEST][core][dbg] hasListShape=%s", hasListShape);
 
-    const textFlat = rawLines0.join(" ") || textRaw;
+    const textFlat = rawLines0.join(" ") || textForOrder;
 
     // 2) Normalize phone + customer name
     let phoneNorm = normPhone(from_phone_raw);
@@ -1467,17 +1488,30 @@ export async function ingestCoreFromMessage(
       };
     }
 
-    // ─────────────────────────────
     // 6c) ORDER CORRECTION / MODIFIER (Option C)
-    // ─────────────────────────────
     if (nlu.intent === "order_correction" || nlu.intent === "modifier") {
       // Example texts:
       //  - "make biriyani spicy"
       //  - "only boneless"
       //  - "remove coke"
+      //  - "make all biryanis spicy"
       //
-      // We don't touch DB here. Just snapshot the modifier in session
-      // so UI + WABA can see “customer sent a change request”.
+      // We parse this as a structured modifier payload, but we DO NOT
+      // touch the DB order items here. WABA / dashboard will decide
+      // which order + which line(s) to apply it on.
+
+      let payload: any = null;
+      let modConfidence = 0;
+
+      try {
+        const parsed = await parseModifier(textRaw);
+        payload = parsed.modifier ?? null;
+        modConfidence = parsed.confidence ?? 0;
+      } catch (e: any) {
+        console.warn("[INGEST][modifier] parseModifier error", e?.message || e);
+      }
+
+      // Snapshot in session so UI can show “customer requested a change”
       if (phoneKey) {
         await markSessionOnModifier({
           org_id: orgId,
@@ -1486,6 +1520,8 @@ export async function ingestCoreFromMessage(
             text: textRaw,
             intent: nlu.intent,
             ts,
+            payload,
+            confidence: modConfidence,
           },
         });
       }
@@ -1496,6 +1532,8 @@ export async function ingestCoreFromMessage(
         kind: "modifier",
         used: "none",
         reason: `nlu:${nlu.intent}`,
+        modifier: payload,
+        modifier_confidence: modConfidence,
       };
     }
 
@@ -1518,10 +1556,10 @@ export async function ingestCoreFromMessage(
     });
 
     // Use AI + rules parser pipeline directly
-    let parsed = await parsePipeline(textRaw, {
-      org_id: orgId,
-      customer_phone: phoneNorm || undefined,
-    });
+let parsed = await parsePipeline(textForOrder, {
+  org_id: orgId,
+  customer_phone: phoneNorm || undefined,
+});
 
     // 5) Multi-line list preference: if it looks like a list, prefer deterministic parsing
     if (hasListShape) {
@@ -1790,7 +1828,7 @@ export async function ingestCoreFromMessage(
       const hasClarifyFlag =
         aiItems.some((it: any) => it && it.needs_clarify === true) ||
         (typeof parsed.reason === "string" &&
-          /ai:needs_clarify|ambiguous/i.test(parsed.reason));
+          /ai:needs_clarify/i.test(parsed.reason));
 
       if (hasClarifyFlag) {
         // Pick the first ambiguous item, or fall back to the first item / whole text

@@ -32,8 +32,6 @@ export type NLUResult = {
 
 // Extract a simple noun-phrase for "chicken biryani", "milk", "rice 1kg"
 function extractCanonical(text: string): string | null {
-  const t = text.toLowerCase();
-
   // common patterns for extracting product names from inquiries
   const patterns = [
     /(?:do you have|do u have|have|available|availability of|price of|rate of)\s+([\w\s\-]+)/i,
@@ -51,9 +49,9 @@ function extractCanonical(text: string): string | null {
     }
   }
 
-  // fallback: single most meaningful noun-like term
+  // fallback: keep short phrases only
   const fallback = text.replace(/[^a-zA-Z0-9\s]/g, "").trim();
-  if (fallback.split(" ").length <= 4) return fallback;
+  if (fallback && fallback.split(" ").length <= 4) return fallback;
 
   return null;
 }
@@ -62,23 +60,47 @@ function extractCanonical(text: string): string | null {
 // CLASSIFIER
 // ─────────────────────────────
 export async function classifyMessage(text: string): Promise<NLUResult> {
-  const prompt = `
-You are an NLU classifier. Classify the user's message into ONE intent.
+  const trimmed = String(text || "").trim();
 
-INTENTS:
-- order → user wants to place an order / mentions qty or items
-- price_inquiry → asking price ("rate?", "how much?", "price?")
-- availability_inquiry → "do you have X", "is biryani available"
-- menu_inquiry → "send menu", "what items do you have"
-- greeting → hi, hello, vanakkam
-- complaint → delay, missing item, cold food, bad service
-- smalltalk → unrelated chit chat
-- other → anything else
+  const prompt = `
+You are an NLU classifier for WhatsApp order chats. 
+Choose EXACTLY ONE intent from this list:
+
+- order
+  → user is placing an order, adding items, or clearly listing items/qty.
+- order_correction
+  → user is changing an EXISTING order: "make biryani spicy", "remove coke",
+    "change coke to sprite", "make quantity 2 instead of 1".
+- modifier
+  → same as order_correction; you may use either, but PREFER "order_correction"
+    for clear change messages.
+- address_update
+  → user is giving or changing address, location, flat number, landmark,
+    Google map link, pin location, etc.
+- cancel_request
+  → user wants to cancel an existing order: "cancel my order", "no need",
+    "don't send", "stop the order".
+- price_inquiry
+  → asking about price or rate: "rate?", "how much?", "price of chicken biryani".
+- availability_inquiry
+  → asking if something is available / in stock: "do you have biryani?",
+    "is mutton available today", "any biriyani today".
+- menu_inquiry
+  → asking for menu / list of items: "send menu", "what do you have",
+    "share today specials".
+- greeting
+  → "hi", "hello", "vanakkam", "good morning" without any clear order or inquiry.
+- complaint
+  → complaining about delay, missing item, cold food, wrong item, bad service, etc.
+- smalltalk
+  → random chit-chat, jokes, personal talk, not about order/business.
+- other
+  → anything that does not clearly fit above categories.
 
 Return ONLY strict JSON:
-{ "intent": "...", "confidence": 0.0 }
+{ "intent": "<one_of_the_above>", "confidence": 0.0 }
 
-User message: "${text}"
+User message: "${trimmed}"
 `;
 
   try {
@@ -86,7 +108,8 @@ User message: "${text}"
       model: "gpt-4o-mini",
       temperature: 0,
       messages: [{ role: "user", content: prompt }],
-      max_tokens: 50
+      max_tokens: 80,
+      response_format: { type: "json_object" },
     });
 
     const raw = resp.choices[0].message?.content || "{}";
@@ -100,17 +123,18 @@ User message: "${text}"
 
     // Canonical extraction (only for relevant intents)
     let canonical: string | null = null;
+    const intent = parsed.intent as NLUIntent;
 
     if (
-      parsed.intent === "price_inquiry" ||
-      parsed.intent === "availability_inquiry" ||
-      parsed.intent === "order"
+      intent === "price_inquiry" ||
+      intent === "availability_inquiry" ||
+      intent === "order"
     ) {
       canonical = extractCanonical(text);
     }
 
     return {
-      intent: parsed.intent as NLUIntent,
+      intent,
       confidence: Number(parsed.confidence) || 0,
       canonical: canonical || null,
     };
