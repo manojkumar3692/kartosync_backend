@@ -4,6 +4,7 @@ import jwt from "jsonwebtoken";
 import { supa } from "../db";
 import { parseOrder as ruleParse } from "../parser";
 import resolvePhoneForOrder, { normalizePhone } from "../util/normalizePhone";
+import { markSessionOnOrderStatusChange } from "../session/sessionEngine";
 
 export const orders = express.Router();
 
@@ -45,6 +46,7 @@ try {
   aiParseOrder = undefined;
 }
 const ENABLE_AI = !!process.env.OPENAI_API_KEY && !!aiParseOrder;
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth middleware: extracts org_id from JWT
@@ -470,6 +472,31 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
       .json({ error: "invalid_status", allowed: Array.from(STATUS_LIST) });
   }
 
+  async function syncSession(nextStatus: OrderStatus) {
+    try {
+      const { data: ord, error: ordErr } = await supa
+        .from("orders")
+        .select("source_phone")
+        .eq("id", id)
+        .eq("org_id", req.org_id)
+        .single();
+
+      if (!ordErr && ord?.source_phone) {
+        await markSessionOnOrderStatusChange({
+          org_id: req.org_id,
+          phone_key: ord.source_phone, // already normalized in create
+          order_id: id,
+          status: nextStatus,
+        });
+      }
+    } catch (e: any) {
+      console.warn(
+        "[orders][:id/status] session sync non-fatal",
+        e?.message || e
+      );
+    }
+  }
+
   try {
     // When closing the order, snapshot prices so catalog changes don't affect it
     if (next === "shipped" || next === "paid") {
@@ -490,6 +517,8 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
           .eq("org_id", req.org_id);
 
         if (error) throw error;
+
+        await syncSession(next);
         return res.json({ ok: true, status: next });
       }
 
@@ -519,6 +548,8 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
         .eq("org_id", req.org_id);
 
       if (error) throw error;
+
+      await syncSession(next);
       return res.json({ ok: true, status: next });
     }
 
@@ -530,6 +561,7 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
       .eq("org_id", req.org_id);
     if (error) throw error;
 
+    await syncSession(next);
     res.json({ ok: true, status: next });
   } catch (err: any) {
     console.error("Order update error:", err);
@@ -713,8 +745,123 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
     res.status(500).json({ error: err.message || "ai_fix_failed" });
   }
 });
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/orders/:id/edit  → dashboard manual edit of items
+// (Phase 2 – safe item edits, reuse same normalization as ai-fix)
+// ─────────────────────────────────────────────────────────────────────────────
+orders.post("/:id/edit", ensureAuth, async (req: any, res) => {
+  const { id } = req.params;
+
+  try {
+    // 1) Load current order to check org + status + pricing_locked
+    const { data: cur, error: loadErr } = await supa
+      .from("orders")
+      .select("id, org_id, status, pricing_locked, items")
+      .eq("id", id)
+      .eq("org_id", req.org_id)
+      .single();
+
+    if (loadErr || !cur) {
+      return res.status(404).json({ error: "order_not_found" });
+    }
+
+    const status = String(cur.status || "").toLowerCase();
+    const closedStatuses = new Set([
+      "shipped",
+      "paid",
+      "cancelled",
+      "delivered",
+    ]);
+
+    // ❌ Do NOT allow editing closed / locked orders via this endpoint
+    if (closedStatuses.has(status) || cur.pricing_locked) {
+      return res
+        .status(400)
+        .json({ error: "order_not_editable", status, pricing_locked: cur.pricing_locked });
+    }
+
+    const incoming = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!incoming.length) {
+      return res.status(400).json({ error: "items_required" });
+    }
+
+    // 2) Normalize items (same shape as /ai-fix)
+    const normalizedItems = incoming
+      .map((it: any) => ({
+        qty:
+          it?.qty === null ||
+          it?.qty === undefined ||
+          Number.isNaN(Number(it?.qty))
+            ? null
+            : Number(it.qty),
+        unit: trim(it?.unit) || null,
+        name: trim(it?.name || it?.canonical || ""),
+        canonical: trim(it?.canonical) || null,
+        brand: trim(it?.brand) || null,
+        variant: trim(it?.variant) || null,
+        notes: trim(it?.notes) || null,
+        category: trim(it?.category) || null,
+
+        // keep pricing fields
+        price_per_unit:
+          it?.price_per_unit === null ||
+          it?.price_per_unit === undefined ||
+          Number.isNaN(Number(it?.price_per_unit))
+            ? null
+            : Number(it.price_per_unit),
+        line_total:
+          it?.line_total === null ||
+          it?.line_total === undefined ||
+          Number.isNaN(Number(it?.line_total))
+            ? null
+            : Number(it.line_total),
+      }))
+      .filter((it: any) => it.name && it.name.length > 0);
+
+    if (!normalizedItems.length) {
+      return res.status(400).json({ error: "no_valid_items_after_normalize" });
+    }
+
+    // 3) Recompute order_total from items
+    const new_order_total = computeOrderTotalFromItems(normalizedItems);
+
+    const parse_reason =
+      trim(req.body?.reason) || "dashboard_edit"; // mark as operator edit
+
+    // 4) Save
+    const { data: upd, error: updErr } = await supa
+      .from("orders")
+      .update({
+        items: normalizedItems,
+        order_total: new_order_total,
+        parse_confidence: null,
+        parse_reason,
+        // ⚠️ Do NOT touch pricing_locked here. If it was false, it stays false.
+      })
+      .eq("id", id)
+      .eq("org_id", req.org_id)
+      .select("*")
+      .single();
+
+    if (updErr) throw updErr;
+
+    return res.json({ ok: true, order: upd });
+  } catch (e: any) {
+    console.error("[ORDERS][edit] ERR", e?.message || e);
+    return res
+      .status(500)
+      .json({ error: e?.message || "order_edit_failed" });
+  }
+});
+
+
 const OPEN_STATUSES = new Set(["pending", "confirmed", "packing"]);
 const CLOSED_STATUSES = new Set(["shipped", "paid", "cancelled", "delivered"]);
+
+
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers for UI overrides

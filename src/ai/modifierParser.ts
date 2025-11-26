@@ -6,20 +6,22 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
 });
 
+export type ParsedModifier = ModifierPayload;
+
 export type ModifierParseResult = {
   modifier: ModifierPayload | null;
-  confidence: number;
+  confidence: number; // 0–1
 };
 
-export async function parseModifier(
-  text: string
-): Promise<ModifierParseResult> {
+
+export async function parseModifier(text: string): Promise<ModifierParseResult> {
   const trimmed = String(text || "").trim();
+
   if (!trimmed || !process.env.OPENAI_API_KEY) {
     return { modifier: null, confidence: 0 };
   }
 
-  const model = process.env.AI_MODEL || "gpt-4.1-mini";
+  const model = process.env.AI_MODEL || "gpt-4o-mini";
 
   const res = await client.chat.completions.create({
     model,
@@ -55,21 +57,14 @@ export async function parseModifier(
           "",
           "Rules:",
           "- If the message is NOT a clear change to an existing order, return:",
-          '  { "modifier": null, "confidence": 0 }',
-          "- If user says 'change all biryanis to spicy', scope = 'all'.",
-          "- If user says 'make the chicken biryani spicy', and it is unclear which one when there are multiple, scope = 'one'.",
-          "- If they say 'make both biryanis spicy' or 'all biryani' or 'everything spicy', scope = 'all'.",
-          "- If they say 'one biriyani spicy and one normal', this is ambiguous → scope = 'ambiguous', modifier = null.",
+          '  { \"modifier\": null, \"confidence\": 0 }',
+          "- 'make biryani spicy' → change.type='variant', new_variant='spicy'",
+          "- 'make coke 2' → change.type='qty', new_qty=2",
+          "- 'add one more coke' → change.type='qty', delta_qty=1",
+          "- 'remove coke' → change.type='remove'",
+          "- 'no onion in biryani' → change.type='note', note='no onion'",
           "",
-          "Change.type mapping examples:",
-          "- 'make biryani spicy' → { type:'variant', new_variant:'spicy' }",
-          "- 'change to boneless' → { type:'variant', new_variant:'boneless' }",
-          "- 'make coke 2' → { type:'qty', new_qty:2 }",
-          "- 'add one more coke' → { type:'qty', delta_qty:1 }",
-          "- 'remove coke' → { type:'remove' }",
-          "- 'no onion in biryani' → { type:'note', note:'no onion' }",
-          "",
-          "For target.text, always echo the item phrase the user used ('biryani', 'chicken biriyani', 'all biryani', 'everything', etc).",
+          "For target.text, always echo the item phrase the user used ('biryani', 'chicken biriyani', 'everything', etc).",
           "canonical can be a cleaned name like 'chicken biryani' BUT if unsure, set canonical = null.",
         ].join("\n"),
       },
@@ -89,9 +84,21 @@ export async function parseModifier(
     return { modifier: null, confidence: 0 };
   }
 
-  const modifier = (parsed?.modifier ?? null) as ModifierPayload | null;
-  const confidence =
-    typeof parsed?.confidence === "number" ? parsed.confidence : 0;
+  const modifier = parsed?.modifier ?? null;
+  let confidence = Number(parsed?.confidence ?? 0);
+  if (!Number.isFinite(confidence)) confidence = 0;
+  if (confidence < 0) confidence = 0;
+  if (confidence > 1) confidence = 1;
+
+  // Basic sanity: must have target + change.type
+  if (
+    !modifier ||
+    !modifier.target ||
+    !modifier.change ||
+    !modifier.change.type
+  ) {
+    return { modifier: null, confidence: 0 };
+  }
 
   return { modifier, confidence };
 }

@@ -32,6 +32,13 @@ import { classifyMessage, NLUResult as CoreNluResult } from "../ai/nlu";
 import { fuzzyCharOverlapScore } from "../util/fuzzy"; // ⬅️ add at top
 import { getOrgMenuIndex, matchMenuItem } from "../menu/menuIndex";
 import { parseModifier } from "../ai/modifierParser";
+import { rewriteForParser } from "../ai/rewriter";
+import { applyModifierToLatestOrder } from "../ai/modifierEngine";
+import { repeatLastOrderForCustomer } from "../order/repeatOrder"; // NEW
+import {
+  startModifierQALoopForLatestOpenOrder,
+  type StartModifierResult,
+} from "../ai/modifierQA";
 
 // ─────────────────────────────────────────────────────────
 // Optional AI parser hook (safe if missing → rules fallback)
@@ -88,6 +95,21 @@ function normPhone(raw?: string | null): string | null {
   const plus = s.startsWith("+") ? "+" : "";
   const digits = s.replace(/[^\d]/g, "");
   return digits.length >= 7 ? plus + digits : null;
+}
+
+function looksLikeRepeatOrderMessage(text: string): boolean {
+  const t = (text || "").toLowerCase().trim();
+  if (!t) return false;
+
+  // Strict phrases to avoid false positives
+  if (/\brepeat (my )?(last )?order\b/.test(t)) return true;        // "repeat last order"
+  if (/\bsame as (last time|yesterday|before)\b/.test(t)) return true; // "same as last time"
+  if (/\bsame order\b/.test(t)) return true;
+  if (/\bmy usual\b/.test(t)) return true;                           // "my usual"
+  if (/\busual order\b/.test(t)) return true;
+  if (/\breorder\b/.test(t)) return true;                            // "reorder"
+
+  return false;
 }
 
 function mapToSessionIntent(
@@ -1192,6 +1214,11 @@ export async function ingestCoreFromMessage(
     const from_phone_raw = trim(input.from_phone || "");
     const source = input.source || "other";
     const activeOrderId = trim(input.active_order_id || "");
+    // 🔹 phoneKey for rewriter (digits only, or fallback)
+    const phoneNormForRewrite = normPhone(from_phone_raw);
+    const phoneKeyForRewrite = phoneNormForRewrite
+      ? phoneNormForRewrite.replace(/^\+/, "")
+      : "_no_phone_";
 
     // 🔒 EARLY msg_id dedupe guard
     // If this exact WhatsApp message was already attached to an order,
@@ -1227,25 +1254,53 @@ export async function ingestCoreFromMessage(
       };
     }
 
-// 🔹 Layer 0: Semantic cleaner (for ORDER pipe)
-// NLU will still use textRaw. Parser uses cleanedText.
-const { cleanedText, removedTokens, strategy: cleanStrategy } =
-  await cleanForOrderPipeline({ text: textRaw, orgId });
+     // 🔹 Layer 0a: Static semantic cleaner (edge slang/politeness)
+     const {
+      cleanedText,
+      removedTokens,
+      strategy: cleanStrategy,
+    } = await cleanForOrderPipeline({ text: textRaw, orgId });
 
-const textForOrder = cleanedText || textRaw;
+    const baseClean = cleanedText || textRaw;
 
-if (cleanStrategy !== "none") {
-  console.log("[INGEST][core][cleaner]", {
-    textRaw,
-    textForOrder,
-    removedTokens,
-    cleanStrategy,
-  });
-}
+    // 🔹 Layer 0b: AI Rewriter – this is what the parser sees
+    let textForOrder = baseClean;
+    try {
+      const rew = await rewriteForParser({
+        orgId,
+        phoneKey: phoneKeyForRewrite,
+        text: baseClean,
+      });
 
-// 1) Line normalization and shape detection (on cleaned text)
-const rawLines0 = splitAndCleanLines(textForOrder);
-console.log("[INGEST][core][dbg] rawLines0=", rawLines0);
+      if (rew && rew.text) {
+        textForOrder = rew.text;
+      }
+
+      if (cleanStrategy !== "none") {
+        console.log("[INGEST][core][L0_PIPELINE]", {
+          textRaw,
+          cleanedText: baseClean,
+          parserText: textForOrder,
+          removedTokens,
+          cleanStrategy,
+        });
+      }
+    } catch (e: any) {
+      console.warn("[INGEST][core][rewriter warn]", e?.message || e);
+      textForOrder = baseClean;
+      if (cleanStrategy !== "none") {
+        console.log("[INGEST][core][cleaner-only]", {
+          textRaw,
+          cleanedText: baseClean,
+          removedTokens,
+          cleanStrategy,
+        });
+      }
+    }
+
+    // 1) Line normalization and shape detection (on parser text)
+    const rawLines0 = splitAndCleanLines(textForOrder);
+    console.log("[INGEST][core][dbg] rawLines0=", rawLines0);
 
     const listLines = rawLines0.filter((s) => {
       if (!s) return false;
@@ -1275,8 +1330,8 @@ console.log("[INGEST][core][dbg] rawLines0=", rawLines0);
     const textFlat = rawLines0.join(" ") || textForOrder;
 
     // 2) Normalize phone + customer name
-    let phoneNorm = normPhone(from_phone_raw);
-
+    let phoneNorm = phoneNormForRewrite;
+    
     let customerName: string | null = phoneNorm
       ? from_name || null
       : from_name || null;
@@ -1488,60 +1543,153 @@ console.log("[INGEST][core][dbg] rawLines0=", rawLines0);
       };
     }
 
-    // 6c) ORDER CORRECTION / MODIFIER (Option C)
-    if (nlu.intent === "order_correction" || nlu.intent === "modifier") {
-      // Example texts:
-      //  - "make biriyani spicy"
-      //  - "only boneless"
-      //  - "remove coke"
-      //  - "make all biryanis spicy"
-      //
-      // We parse this as a structured modifier payload, but we DO NOT
-      // touch the DB order items here. WABA / dashboard will decide
-      // which order + which line(s) to apply it on.
+// 6c) ORDER CORRECTION / MODIFIER  (Phase 3 with QA loop)
+if (nlu.intent === "order_correction" || nlu.intent === "modifier") {
+  let payload: any = null;
+  let modConfidence = 0;
 
-      let payload: any = null;
-      let modConfidence = 0;
+  try {
+    const parsed = await parseModifier(textRaw);
+    payload = parsed.modifier ?? null;
+    modConfidence = parsed.confidence ?? 0;
+  } catch (e: any) {
+    console.warn("[INGEST][modifier] parseModifier error", e?.message || e);
+  }
 
-      try {
-        const parsed = await parseModifier(textRaw);
-        payload = parsed.modifier ?? null;
-        modConfidence = parsed.confidence ?? 0;
-      } catch (e: any) {
-        console.warn("[INGEST][modifier] parseModifier error", e?.message || e);
-      }
+  // Snapshot in session so UI can show “customer requested a change”
+  if (phoneKey) {
+    await markSessionOnModifier({
+      org_id: orgId,
+      phone_key: phoneKey,
+      modifier: {
+        text: textRaw,
+        intent: nlu.intent,
+        ts,
+        payload,
+        confidence: modConfidence,
+      },
+    });
+  }
 
-      // Snapshot in session so UI can show “customer requested a change”
-      if (phoneKey) {
-        await markSessionOnModifier({
-          org_id: orgId,
-          phone_key: phoneKey,
-          modifier: {
-            text: textRaw,
-            intent: nlu.intent,
-            ts,
-            payload,
-            confidence: modConfidence,
-          },
-        });
-      }
+  let qaResult: StartModifierResult | null = null;
 
-      return {
-        ok: true,
-        stored: false,
-        kind: "modifier",
-        used: "none",
-        reason: `nlu:${nlu.intent}`,
-        modifier: payload,
-        modifier_confidence: modConfidence,
-      };
-    }
+  // Phase-3 core: try to apply against latest OPEN order,
+  // but fall back to disambiguation question if ambiguous.
+  if (payload && phoneNorm && modConfidence >= 0.6) {
+    qaResult = await startModifierQALoopForLatestOpenOrder({
+      orgId,
+      phoneNorm,
+      modifier: payload,
+    });
+    console.log("[INGEST][modifier][qa-result]", qaResult);
+  }
+
+  // Base response (no text if we didn’t need to ask anything)
+  const base = {
+    ok: true as const,
+    stored: false as const,
+    kind: "modifier" as const,
+    used: "none" as const,
+    reason: `nlu:${nlu.intent}`,
+    modifier: payload,
+    modifier_confidence: modConfidence,
+  };
+
+  // If engine found no open order / couldn’t apply, we keep behaviour simple:
+  if (!qaResult || !qaResult.foundOpenOrder) {
+    return base;
+  }
+
+  // If engine says "ambiguous" and we have a question, we ASK the user.
+  if (qaResult.status === "ambiguous" && qaResult.question) {
+    return {
+      ...base,
+      reason: `modifier_ambiguous:${qaResult.summary || ""}`,
+      // send the disambiguation text back to WABA
+      reply: qaResult.question.text,
+      // OPTIONAL: if you extend IngestResult, you can also pass this through
+      // modifier_question: qaResult.question,
+    };
+  }
+
+  // For now, on "applied" / "noop" / "no_match" we don’t auto-reply.
+  // You could later use qaResult.summary to send a confirmation like
+  // "Updated your order ✅" if you want.
+  return base;
+}
 
     // ─────────────────────────────
     // 7) ORDER INTENT → continue to AI/rule pipeline
     // ─────────────────────────────
     if (nlu.intent === "order") {
       console.log("[NLU] intent=order → continue with parse pipeline");
+    }
+
+    // ─────────────────────────────
+    // 7a) SPECIAL CASE: "repeat last order" / "my usual"
+    // ─────────────────────────────
+    if (looksLikeRepeatOrderMessage(textRaw)) {
+      console.log("[INGEST][core][repeat-check] textRaw=", textRaw);
+
+      if (!phoneNorm) {
+        // No stable phone key → we can't safely find last order
+        return {
+          ok: true,
+          stored: false,
+          kind: "none",
+          used: "none",
+          reason: "repeat_but_no_phone",
+          reply:
+            "I couldn’t find your last order for this number. Please send your order items again.",
+        };
+      }
+
+      const repeatRes = await repeatLastOrderForCustomer({
+        orgId,
+        phoneNorm,
+      });
+
+      console.log("[INGEST][core][repeat-result]", repeatRes);
+
+      if (repeatRes.status !== "ok" || !repeatRes.newOrderId) {
+        return {
+          ok: true,
+          stored: false,
+          kind: "none",
+          used: "none",
+          reason: `repeat_failed:${repeatRes.reason}`,
+          reply:
+            "I couldn’t repeat your last order. Please send your order items again.",
+        };
+      }
+
+      const newOrderId = repeatRes.newOrderId;
+      const repeatedItems = repeatRes.items || [];
+
+      // Session tracking: mark new order
+      if (phoneKey && newOrderId) {
+        await markSessionOnNewOrder({
+          org_id: orgId,
+          phone_key: phoneKey,
+          order_id: newOrderId,
+          status: "pending",
+        });
+      }
+
+      // Auto-clarify if needed (WABA only)
+      await maybeAutoSendClarify(orgId, newOrderId, source);
+
+      return {
+        ok: true,
+        stored: true,
+        kind: "order",
+        used: "rules",
+        order_id: newOrderId,
+        items: repeatedItems,
+        org_id: orgId,
+        reason: "repeat_last_order",
+        reply: "I’ve repeated your last order ✅",
+      };
     }
 
     // [INBOX] Record inbound message for unified view
@@ -1556,10 +1704,10 @@ console.log("[INGEST][core][dbg] rawLines0=", rawLines0);
     });
 
     // Use AI + rules parser pipeline directly
-let parsed = await parsePipeline(textForOrder, {
-  org_id: orgId,
-  customer_phone: phoneNorm || undefined,
-});
+    let parsed = await parsePipeline(textForOrder, {
+      org_id: orgId,
+      customer_phone: phoneNorm || undefined,
+    });
 
     // 5) Multi-line list preference: if it looks like a list, prefer deterministic parsing
     if (hasListShape) {
