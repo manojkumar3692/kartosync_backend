@@ -5,6 +5,26 @@ import { findBestProductForTextV2 } from "../../util/productMatcher";
 import { BusinessType, normalizeBusinessType } from "./business";
 import { normalizeLabelForFuzzy, fuzzyCharOverlapScore } from "../../util/fuzzy";
 import { resolveAliasForText } from "../../routes/waba/aliasEngine";
+
+
+export type MenuEntry = {
+  label: string;
+  price?: number | null;
+  currency?: string | null;
+};
+
+export function formatMenuLine(index: number, entry: MenuEntry): string {
+  const price = entry.price;
+  const currencyCode = (entry.currency || "INR").toUpperCase();
+
+  const priceText =
+    typeof price === "number" && price > 0
+      ? ` – ${currencyCode} ${price}`
+      : "";
+
+  return `${index + 1}) ${entry.label}${priceText}`;
+}
+
 // ─────────────────────────────
 // Spelling / synonym normalizer for product text (Layer 7)
 // ─────────────────────────────
@@ -314,14 +334,13 @@ export async function findProductOptionsForText(
     };
   }
 
-export function formatPriceLine(opt: ProductPriceOption): string {
+  export function formatPriceLine(opt: ProductPriceOption): string {
     const label = opt.variant ? `${opt.name} ${opt.variant}`.trim() : opt.name;
   
-    // ✅ allow price even if currency is null
     if (opt.price != null) {
-      const cur = opt.currency || "";
-      const curPart = cur ? ` ${cur}` : "";
-      return `${label} – ${opt.price}${curPart} / ${opt.unit}`;
+      // Use DB currency if present, otherwise default to INR
+      const currencyCode = (opt.currency || "INR").toUpperCase();
+      return `${label} – ${currencyCode} ${opt.price} / ${opt.unit}`;
     }
   
     // price missing → softer wording

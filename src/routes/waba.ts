@@ -47,6 +47,8 @@ import {
   extractMenuKeywords,
   findFuzzyProductSuggestions,
   buildMenuReply,
+  MenuEntry,
+  formatMenuLine,
 } from "../routes/waba/productInquiry";
 import { interpretMessage } from "../ai/interpreter";
 import { saveAiInsight } from "../routes/waba/aiInsights";
@@ -117,6 +119,38 @@ function wabaDebug(...args: any[]) {
   if (!WABA_DEBUG) return;
   console.log("[WABA-DEBUG]", ...args);
 }
+
+
+
+
+function cleanRequestedLabel(text: string, keywords: string[]): string {
+    const STOPWORDS = new Set([
+      "add",
+      "have",
+      "want",
+      "need",
+      "give",
+      "please",
+      "hi",
+      "hello",
+      "can",
+      "u",
+      "you",
+    ]);
+  
+    const labelKeywords = keywords.filter(
+      (kw) => !STOPWORDS.has(kw.toLowerCase())
+    );
+  
+    return (
+      (labelKeywords.length
+        ? labelKeywords.join(" ")
+        : keywords.length
+        ? keywords.join(" ")
+        : ""
+      ).trim() || prettyLabelFromText(text)
+    );
+  }
 
 // Helper: smart reply for price / availability inquiries
 
@@ -430,26 +464,55 @@ async function buildSmartInquiryReply(opts: {
 
   // 3) AVAILABILITY inquiry
   if (inquiryType === "availability") {
-    const names = Array.from(
-      new Set(
-        options.map((o) =>
-          o.variant ? `${o.name} ${o.variant}`.trim() : o.name
-        )
-      )
-    ).filter(Boolean);
+    // Build menu entries with label + price (if known)
+    const entriesMap = new Map<string, MenuEntry>();
+  
+    for (const o of options) {
+      // ProductPriceOption → only .name, .variant, .price, .unit, .currency
+      const base = (o.name || "").trim();
+      if (!base) continue;
+  
+      const variant = o.variant ? String(o.variant).trim() : "";
+      const label = variant ? `${base} ${variant}` : base;
+      const key = label.toLowerCase();
+  
+      const price =
+        typeof o.price === "number"
+          ? o.price
+          : null;
 
+      const currency = o.currency || null;
+      const existing = entriesMap.get(key);
+      if (!existing) {
+        entriesMap.set(key, { label, price, currency });
+      } else {
+        // Upgrade price/currency if we get a better one
+        if (existing.price == null && price != null) {
+          existing.price = price;
+        }
+        if (!existing.currency && currency) {
+          existing.currency = currency;
+        }
+      }
+    }
+  
+    // previously this was a string[], now MenuEntry[]
+    const names: MenuEntry[] = Array.from(entriesMap.values());
+  
     // Use same keyword extractor as menu logic
     const keywords = extractMenuKeywords(text);
-    const lowerNames = names.map((n) => n.toLowerCase());
-
+    const lowerNames = names.map((e) => e.label.toLowerCase());
+  
     const hasOverlap = keywords.some((kw) =>
       lowerNames.some((name) => name.includes(kw))
     );
     const missingKeywords = keywords.filter(
       (kw) => !lowerNames.some((name) => name.includes(kw))
     );
-
-    const requestedLabel = prettyLabelFromText(text);
+  
+    const requestedLabel = cleanRequestedLabel(text, keywords);
+    // const requestedLabel = parsed.requested_label || cleanRequestedLabel(text, keywords);
+  
     // 🧠 Partial match case:
     // Example: user -> "panner biriyani"
     // Catalog -> only "Mutton Biryani", "Chicken Biryani"
@@ -466,12 +529,12 @@ async function buildSmartInquiryReply(opts: {
         const { data: allProducts, error: allErr } = await supa
           .from("products")
           .select(
-            "id, display_name, canonical, variant, base_unit, price_per_unit"
+            "id, display_name, canonical, variant, base_unit, price_per_unit, unit_price, price"
           )
           .eq("org_id", org_id);
-
-        let familyNames: string[] = [];
-
+  
+        let familyEntries: MenuEntry[] = [];
+  
         if (!allErr && allProducts && allProducts.length) {
           const familyHits = (allProducts as any[]).filter((p) => {
             const baseName = String(
@@ -480,65 +543,88 @@ async function buildSmartInquiryReply(opts: {
             const variantName = String(p.variant || "").toLowerCase();
             const haystack = `${baseName} ${variantName}`.trim();
             if (!haystack) return false;
-
+  
             // match any of the meaningful keywords (e.g. "paneer", "biryani")
             return keywords.some((kw) => haystack.includes(kw));
           });
-
-          familyNames = Array.from(
-            new Set(
-              familyHits
-                .map((p) => {
-                  const base = p.display_name || p.canonical || "item";
-                  return p.variant
-                    ? `${base} ${String(p.variant).trim()}`
-                    : base;
-                })
-                .filter(Boolean)
-            )
-          );
+  
+          const tmpMap = new Map<string, MenuEntry>();
+  
+          for (const p of familyHits) {
+            const base = p.display_name || p.canonical || "item";
+            const label = p.variant
+              ? `${base} ${String(p.variant).trim()}`
+              : base;
+            const key = label.toLowerCase();
+  
+            const price =
+              typeof p.price_per_unit === "number"
+                ? p.price_per_unit
+                : typeof p.unit_price === "number"
+                ? p.unit_price
+                : typeof p.price === "number"
+                ? p.price
+                : null;
+  
+            const existing = tmpMap.get(key);
+            if (!existing) {
+                tmpMap.set(key, { label, price, currency: null });
+              } else if (existing.price == null && price != null) {
+                existing.price = price;
+              }
+          }
+  
+          familyEntries = Array.from(tmpMap.values());
         }
-        // If no extra family hits, fall back to the original 'names'
-        const finalNames = familyNames.length > 0 ? familyNames : names;
-
+  
+        // If no extra family hits, fall back to the original entries
+        const finalEntries = familyEntries.length > 0 ? familyEntries : names;
+  
         const header =
           `I couldn’t find *${requestedLabel}* exactly in today’s menu.\n` +
           `We do have:\n`;
-
-        const lines = finalNames.map((n, i) => `${i + 1}) ${n}`);
+  
+        const lines = finalEntries.map((entry, i) =>
+          formatMenuLine(i, entry)
+        );
         const footer = "\n\nWould you like to choose one of these instead?";
-
+  
         return header + lines.join("\n") + footer;
       } catch (e: any) {
         console.warn(
           "[WABA][availability family suggestions err]",
           e?.message || e
         );
-
-        // Safe fallback: keep the old behaviour
+  
+        // Safe fallback: keep the simpler behaviour but with prices
         const header =
           `I couldn’t find *${requestedLabel}* exactly in today’s menu.\n` +
           `We do have:\n`;
-        const lines = names.map((n, i) => `${i + 1}) ${n}`);
+        const lines = names.map((entry, i) => formatMenuLine(i, entry));
         const footer = "\n\nWould you like to choose one of these instead?";
-
+  
         return header + lines.join("\n") + footer;
       }
     }
-
+  
     // Normal happy path: full match
     if (names.length >= 1) {
       if (names.length >= 2) {
         return (
           "✅ Yes, we have this available. Some options:\n" +
-          names.map((n, i) => `${i + 1}) ${n}`).join("\n")
+          names.map((entry, i) => formatMenuLine(i, entry)).join("\n")
         );
       }
-
+  
       // Single option but still matched cleanly
-      return `✅ Yes, we have ${names[0]} available.`;
+      const only = names[0];
+      const priceText =
+        typeof only.price === "number" && only.price > 0
+          ? ` (₹${only.price})`
+          : "";
+      return `✅ Yes, we have ${only.label}${priceText} available.`;
     }
-
+  
     // Fallback when no variants
     return `✅ Yes, we have ${best.display_name} available.`;
   }

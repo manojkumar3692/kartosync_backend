@@ -77,6 +77,34 @@ const asStr = (v: any) =>
   typeof v === "string" ? v : v == null ? "" : String(v);
 const trim = (v: any) => asStr(v).trim();
 
+
+// in ingestCore.ts (already added by you)
+export function computeOrderTotals(items: any[]) {
+  let subtotal = 0;
+  const lines: string[] = [];
+
+  for (const it of items || []) {
+    const qty = it.qty ?? 1;
+    const unitPrice =
+      it.unit_price ?? it.price_per_unit ?? 0; // adjust field name if needed
+
+    const lineTotal = unitPrice * qty;
+    subtotal += lineTotal;
+
+    const name = it.name || it.canonical || "Item";
+    const variant = it.variant ? ` · ${String(it.variant).trim()}` : "";
+
+    let pricePart = "";
+    if (unitPrice) {
+      pricePart = ` – ₹${unitPrice} x ${qty} = ₹${lineTotal}`;
+    }
+
+    lines.push(`• ${qty} ${name}${variant}${pricePart}`);
+  }
+
+  return { subtotal, lines };
+}
+
 /** Normalize a product name for catalog matching */
 function normalizeNameForMatch(raw?: string | null): string {
   return (
@@ -102,12 +130,12 @@ function looksLikeRepeatOrderMessage(text: string): boolean {
   if (!t) return false;
 
   // Strict phrases to avoid false positives
-  if (/\brepeat (my )?(last )?order\b/.test(t)) return true;        // "repeat last order"
+  if (/\brepeat (my )?(last )?order\b/.test(t)) return true; // "repeat last order"
   if (/\bsame as (last time|yesterday|before)\b/.test(t)) return true; // "same as last time"
   if (/\bsame order\b/.test(t)) return true;
-  if (/\bmy usual\b/.test(t)) return true;                           // "my usual"
+  if (/\bmy usual\b/.test(t)) return true; // "my usual"
   if (/\busual order\b/.test(t)) return true;
-  if (/\breorder\b/.test(t)) return true;                            // "reorder"
+  if (/\breorder\b/.test(t)) return true; // "reorder"
 
   return false;
 }
@@ -626,7 +654,6 @@ function blank(v?: string | null) {
 function itemNeedsClarify(it: any) {
   return blank(it?.brand) || blank(it?.variant);
 }
-
 async function enrichWithPrefs(
   orgId: string,
   phone: string | null,
@@ -698,6 +725,61 @@ async function enrichWithPrefs(
   }
 
   return { items: out, applied };
+}
+
+/**
+ * Reuse the same variant for the same canonical item within a single order.
+ * Example: if order already has "Chicken Biryani · Chennai Bhai Marriage – 1/2 kg"
+ * and user later says "add chicken biriyani", we auto-fill that same variant
+ * as long as there is EXACTLY one variant for that canonical in the existing items.
+ */
+function applySameOrderVariantSmartAppend(
+  prevItems: any[],
+  newItems: any[]
+): { name: string; variant: string }[] {
+  const picked: { name: string; variant: string }[] = [];
+
+  if (!Array.isArray(prevItems) || !Array.isArray(newItems)) return picked;
+
+  for (const item of newItems) {
+    const canon = trim(item.canonical || item.name || "");
+    if (!canon) continue;
+
+    // Skip if this new item already has a variant
+    const hasVariant = !!trim(item.variant || "");
+    if (hasVariant) continue;
+
+    // Look for a previous item with same product_id OR same canonical + variant
+    const match = prevItems.find((p: any) => {
+      const pCanon = trim(p.canonical || p.name || "");
+      const pVariant = trim(p.variant || "");
+      if (!pCanon || !pVariant) return false;
+
+      if (item.product_id && p.product_id && item.product_id === p.product_id) {
+        return true;
+      }
+
+      return pCanon.toLowerCase() === canon.toLowerCase();
+    });
+
+    if (!match) continue;
+
+    const variant = trim(match.variant || "");
+    if (!variant) continue;
+
+    // Copy variant (and brand if missing) into the new item
+    item.variant = variant;
+    if (!trim(item.brand || "") && match.brand) {
+      item.brand = match.brand;
+    }
+
+    picked.push({
+      name: trim(item.name || item.canonical || canon),
+      variant,
+    });
+  }
+
+  return picked;
 }
 
 // ───────────────── SMART PRODUCT ROUTER (Layer 6) ─────────────────
@@ -1254,8 +1336,8 @@ export async function ingestCoreFromMessage(
       };
     }
 
-     // 🔹 Layer 0a: Static semantic cleaner (edge slang/politeness)
-     const {
+    // 🔹 Layer 0a: Static semantic cleaner (edge slang/politeness)
+    const {
       cleanedText,
       removedTokens,
       strategy: cleanStrategy,
@@ -1331,7 +1413,7 @@ export async function ingestCoreFromMessage(
 
     // 2) Normalize phone + customer name
     let phoneNorm = phoneNormForRewrite;
-    
+
     let customerName: string | null = phoneNorm
       ? from_name || null
       : from_name || null;
@@ -1543,80 +1625,80 @@ export async function ingestCoreFromMessage(
       };
     }
 
-// 6c) ORDER CORRECTION / MODIFIER  (Phase 3 with QA loop)
-if (nlu.intent === "order_correction" || nlu.intent === "modifier") {
-  let payload: any = null;
-  let modConfidence = 0;
+    // 6c) ORDER CORRECTION / MODIFIER  (Phase 3 with QA loop)
+    if (nlu.intent === "order_correction" || nlu.intent === "modifier") {
+      let payload: any = null;
+      let modConfidence = 0;
 
-  try {
-    const parsed = await parseModifier(textRaw);
-    payload = parsed.modifier ?? null;
-    modConfidence = parsed.confidence ?? 0;
-  } catch (e: any) {
-    console.warn("[INGEST][modifier] parseModifier error", e?.message || e);
-  }
+      try {
+        const parsed = await parseModifier(textRaw);
+        payload = parsed.modifier ?? null;
+        modConfidence = parsed.confidence ?? 0;
+      } catch (e: any) {
+        console.warn("[INGEST][modifier] parseModifier error", e?.message || e);
+      }
 
-  // Snapshot in session so UI can show “customer requested a change”
-  if (phoneKey) {
-    await markSessionOnModifier({
-      org_id: orgId,
-      phone_key: phoneKey,
-      modifier: {
-        text: textRaw,
-        intent: nlu.intent,
-        ts,
-        payload,
-        confidence: modConfidence,
-      },
-    });
-  }
+      // Snapshot in session so UI can show “customer requested a change”
+      if (phoneKey) {
+        await markSessionOnModifier({
+          org_id: orgId,
+          phone_key: phoneKey,
+          modifier: {
+            text: textRaw,
+            intent: nlu.intent,
+            ts,
+            payload,
+            confidence: modConfidence,
+          },
+        });
+      }
 
-  let qaResult: StartModifierResult | null = null;
+      let qaResult: StartModifierResult | null = null;
 
-  // Phase-3 core: try to apply against latest OPEN order,
-  // but fall back to disambiguation question if ambiguous.
-  if (payload && phoneNorm && modConfidence >= 0.6) {
-    qaResult = await startModifierQALoopForLatestOpenOrder({
-      orgId,
-      phoneNorm,
-      modifier: payload,
-    });
-    console.log("[INGEST][modifier][qa-result]", qaResult);
-  }
+      // Phase-3 core: try to apply against latest OPEN order,
+      // but fall back to disambiguation question if ambiguous.
+      if (payload && phoneNorm && modConfidence >= 0.6) {
+        qaResult = await startModifierQALoopForLatestOpenOrder({
+          orgId,
+          phoneNorm,
+          modifier: payload,
+        });
+        console.log("[INGEST][modifier][qa-result]", qaResult);
+      }
 
-  // Base response (no text if we didn’t need to ask anything)
-  const base = {
-    ok: true as const,
-    stored: false as const,
-    kind: "modifier" as const,
-    used: "none" as const,
-    reason: `nlu:${nlu.intent}`,
-    modifier: payload,
-    modifier_confidence: modConfidence,
-  };
+      // Base response (no text if we didn’t need to ask anything)
+      const base = {
+        ok: true as const,
+        stored: false as const,
+        kind: "modifier" as const,
+        used: "none" as const,
+        reason: `nlu:${nlu.intent}`,
+        modifier: payload,
+        modifier_confidence: modConfidence,
+      };
 
-  // If engine found no open order / couldn’t apply, we keep behaviour simple:
-  if (!qaResult || !qaResult.foundOpenOrder) {
-    return base;
-  }
+      // If engine found no open order / couldn’t apply, we keep behaviour simple:
+      if (!qaResult || !qaResult.foundOpenOrder) {
+        return base;
+      }
 
-  // If engine says "ambiguous" and we have a question, we ASK the user.
-  if (qaResult.status === "ambiguous" && qaResult.question) {
-    return {
-      ...base,
-      reason: `modifier_ambiguous:${qaResult.summary || ""}`,
-      // send the disambiguation text back to WABA
-      reply: qaResult.question.text,
-      // OPTIONAL: if you extend IngestResult, you can also pass this through
-      // modifier_question: qaResult.question,
-    };
-  }
+      // If engine says "ambiguous" and we have a question, we ASK the user.
+      if (qaResult.status === "ambiguous" && qaResult.question) {
+        return {
+          ...base,
+          reason: `modifier_ambiguous:${qaResult.summary || ""}`,
+          // send the disambiguation text back to WABA
+          reply: qaResult.question.text,
+          // OPTIONAL: if you extend IngestResult, you can also pass this through
+          // modifier_question: qaResult.question,
+        };
+      }
 
-  // For now, on "applied" / "noop" / "no_match" we don’t auto-reply.
-  // You could later use qaResult.summary to send a confirmation like
-  // "Updated your order ✅" if you want.
-  return base;
-}
+      // For now, on "applied" / "noop" / "no_match" we don’t auto-reply.
+      // You could later use qaResult.summary to send a confirmation like
+      // "Updated your order ✅" if you want.
+      return base;
+    }
 
     // ─────────────────────────────
     // 7) ORDER INTENT → continue to AI/rule pipeline
@@ -2456,126 +2538,153 @@ if (nlu.intent === "order_correction" || nlu.intent === "modifier") {
       }
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Forced append when caller passes active_order_id
-    // (e.g., WABA knows there is an active pending order)
-    // ─────────────────────────────────────────────────────────
-    if (activeOrderId) {
-      try {
-        const { data: target, error: tgtErr } = await supa
-          .from("orders")
-          .select("id, items, status, source_phone")
-          .eq("org_id", orgId)
-          .eq("id", activeOrderId)
-          .single();
+// ─────────────────────────────────────────────────────────
+// Forced append when caller passes active_order_id
+// (e.g., WABA knows there is an active pending order)
+// ─────────────────────────────────────────────────────────
+if (activeOrderId) {
+  try {
+    const { data: target, error: tgtErr } = await supa
+      .from("orders")
+      .select("id, items, status, source_phone")
+      .eq("org_id", orgId)
+      .eq("id", activeOrderId)
+      .single();
 
-        if (!tgtErr && target && target.id) {
-          const status = String(target.status || "").toLowerCase();
+    if (!tgtErr && target && target.id) {
+      const status = String(target.status || "").toLowerCase();
 
-          // Only append if it is still "open" and belongs to same phone
-          const phonePlain = String(phoneNorm || "").replace(/^\+/, "");
-          const srcPhone = String(target.source_phone || "");
-          const matchesPhone =
-            !phonePlain ||
-            srcPhone === phonePlain ||
-            srcPhone === "+" + phonePlain;
+      // Only append if it is still "open" and belongs to same phone
+      const phonePlain = String(phoneNorm || "").replace(/^\+/, "");
+      const srcPhone = String(target.source_phone || "");
+      const matchesPhone =
+        !phonePlain ||
+        srcPhone === phonePlain ||
+        srcPhone === "+" + phonePlain;
 
-          const isOpen = ![
-            "cancelled_by_customer",
-            "archived_for_new",
-            "paid",
-            "shipped",
-          ].includes(status);
+      const isOpen = ![
+        "cancelled_by_customer",
+        "archived_for_new",
+        "paid",
+        "shipped",
+      ].includes(status);
 
-          if (matchesPhone && isOpen) {
-            const prevItems = Array.isArray(target.items) ? target.items : [];
-            const newItems = [...prevItems, ...(parsed.items || [])];
+      if (matchesPhone && isOpen) {
+        const prevItems = Array.isArray(target.items) ? target.items : [];
+        const itemsToAppend = [...(parsed.items || [])];
 
-            const { error: upErr } = await supa
-              .from("orders")
-              .update({
-                items: newItems,
-                parse_reason:
-                  (parsed.reason ?? "forced_append_active_order") +
-                  (msg_id ? `; msgid:${msg_id}` : ""),
-                parse_confidence: parsed.confidence ?? null,
-                ...(msg_id ? { msg_id } : {}),
-                order_link_reason: "forced_append_active_order",
-              })
-              .eq("id", target.id);
-
-            if (upErr) throw upErr;
-
-            // learning writes (same as append path)
-            try {
-              for (const it of parsed.items) {
-                const canon = trim(it.canonical || it.name || "");
-                if (!canon) continue;
-                const brand = (it.brand ?? "") + "";
-                const variant = (it.variant ?? "") + "";
-                const { error: eb } = await supa.rpc("upsert_bvs", {
-                  p_org_id: orgId,
-                  p_canonical: canon,
-                  p_brand: brand,
-                  p_variant: variant,
-                  p_inc: 1,
-                });
-                if (eb) console.warn("[INGEST][core][bvs err]", eb.message);
-                if (phoneNorm) {
-                  const { error: ec } = await supa.rpc("upsert_customer_pref", {
-                    p_org_id: orgId,
-                    p_phone: phoneNorm,
-                    p_canonical: canon,
-                    p_brand: brand,
-                    p_variant: variant,
-                    p_inc: 1,
-                  });
-                  if (ec)
-                    console.warn("[INGEST][core][custpref err]", ec.message);
-                }
-              }
-            } catch (e: any) {
-              console.warn(
-                "[INGEST][core][forced_append learn warn]",
-                e?.message || e
-              );
-            }
-
-            // Auto-clarify if needed (WABA-only)
-            await maybeAutoSendClarify(orgId, target.id, source);
-
-            console.log(
-              "[INGEST][core] forced append into active_order_id",
-              target.id
-            );
-
-            if (phoneKey) {
-              await markSessionOnAppendOrder({
-                org_id: orgId,
-                phone_key: phoneKey,
-                order_id: target.id,
-                status,
-              });
-            }
-
-            return {
-              ok: true,
-              stored: true,
-              kind: "order",
-              used: parsed.used,
-              merged_into: target.id,
-              order_id: target.id,
-              items: newItems,
-              org_id: orgId,
-              reason: "forced_append_active_order",
-            };
-          }
+        // 🔹 NEW: reuse same variant as earlier in this order when safe
+        const autoPicked = applySameOrderVariantSmartAppend(
+          prevItems,
+          itemsToAppend
+        );
+        if (autoPicked.length) {
+          parsed.reason = (
+            (parsed.reason || "") + "; same_variant_reused"
+          ).trim();
         }
-      } catch (e: any) {
-        console.warn("[INGEST][core][forced_append warn]", e?.message || e);
-        // if anything fails, we simply fall through to normal append/new logic
+
+        // keep parsed.items in sync so learning writes see the enriched variants
+        parsed.items = itemsToAppend;
+
+        const newItems = [...prevItems, ...itemsToAppend];
+
+        const { error: upErr } = await supa
+          .from("orders")
+          .update({
+            items: newItems,
+            parse_reason:
+              (parsed.reason ?? "forced_append_active_order") +
+              (msg_id ? `; msgid:${msg_id}` : ""),
+            parse_confidence: parsed.confidence ?? null,
+            ...(msg_id ? { msg_id } : {}),
+            order_link_reason: "forced_append_active_order",
+          })
+          .eq("id", target.id);
+
+        if (upErr) throw upErr;
+
+        // learning writes (same as append path)
+        try {
+          for (const it of parsed.items) {
+            const canon = trim(it.canonical || it.name || "");
+            if (!canon) continue;
+            const brand = (it.brand ?? "") + "";
+            const variant = (it.variant ?? "") + "";
+            const { error: eb } = await supa.rpc("upsert_bvs", {
+              p_org_id: orgId,
+              p_canonical: canon,
+              p_brand: brand,
+              p_variant: variant,
+              p_inc: 1,
+            });
+            if (eb) console.warn("[INGEST][core][bvs err]", eb.message);
+            if (phoneNorm) {
+              const { error: ec } = await supa.rpc("upsert_customer_pref", {
+                p_org_id: orgId,
+                p_phone: phoneNorm,
+                p_canonical: canon,
+                p_brand: brand,
+                p_variant: variant,
+                p_inc: 1,
+              });
+              if (ec)
+                console.warn("[INGEST][core][custpref err]", ec.message);
+            }
+          }
+        } catch (e: any) {
+          console.warn(
+            "[INGEST][core][forced_append learn warn]",
+            e?.message || e
+          );
+        }
+
+        // Auto-clarify if needed (WABA-only)
+        await maybeAutoSendClarify(orgId, target.id, source);
+
+        console.log(
+          "[INGEST][core] forced append into active_order_id",
+          target.id
+        );
+
+        if (phoneKey) {
+          await markSessionOnAppendOrder({
+            org_id: orgId,
+            phone_key: phoneKey,
+            order_id: target.id,
+            status,
+          });
+        }
+
+        // 🗣️ NEW optional reply when we reused a variant
+        let reply: string | undefined;
+        if (autoPicked.length) {
+          const first = autoPicked[0];
+          const variantPart = first.variant ? ` · ${first.variant}` : "";
+          reply =
+            `I’ve added ${first.name}${variantPart} again.\n` +
+            `If you wanted a different style, please send the exact name.`;
+        }
+
+        return {
+          ok: true,
+          stored: true,
+          kind: "order",
+          used: parsed.used,
+          merged_into: target.id,
+          order_id: target.id,
+          items: newItems,
+          org_id: orgId,
+          reason: "forced_append_active_order",
+          ...(reply ? { reply } : {}),
+        };
       }
     }
+  } catch (e: any) {
+    console.warn("[INGEST][core][forced_append warn]", e?.message || e);
+    // if anything fails, we simply fall through to normal append/new logic
+  }
+}
 
     // ─────────────────────────────────────────────────────────
     // LAYER B: Session Engine decision (append vs new)
@@ -2641,7 +2750,6 @@ if (nlu.intent === "order_correction" || nlu.intent === "modifier") {
     // ─────────────────────────────────────────────────────────
     // Apply SessionEngine decision: APPEND or NEW
     // ─────────────────────────────────────────────────────────
-
     // 1) APPEND path (SessionEngine says append_items to some order)
     if (sessionAction === "append_items" && sessionTargetOrderId) {
       try {
@@ -2671,7 +2779,23 @@ if (nlu.intent === "order_correction" || nlu.intent === "modifier") {
 
           if (matchesPhone && isOpen) {
             const prevItems = Array.isArray(target.items) ? target.items : [];
-            const newItems = [...prevItems, ...(parsed.items || [])];
+            const itemsToAppend = [...(parsed.items || [])];
+
+            // 🔹 NEW: reuse same variant as earlier in this order when safe
+            const autoPicked = applySameOrderVariantSmartAppend(
+              prevItems,
+              itemsToAppend
+            );
+            if (autoPicked.length) {
+              parsed.reason = (
+                (parsed.reason || "") + "; same_variant_reused"
+              ).trim();
+            }
+
+            // keep parsed.items in sync so learning writes see the enriched variants
+            parsed.items = itemsToAppend;
+
+            const newItems = [...prevItems, ...itemsToAppend];
 
             const linkReason = sessionReason || "session_append_items";
 
@@ -2739,6 +2863,22 @@ if (nlu.intent === "order_correction" || nlu.intent === "modifier") {
 
             console.log("[INGEST][core] session-append into", target.id);
 
+            // 🗣️ NEW optional reply when we reused a previous variant
+            let reply: string | undefined;
+            if (autoPicked.length) {
+              const first = autoPicked[0];
+              if (first.name && first.variant) {
+                reply =
+                  `I’ve added ${first.name} · ${first.variant} again.\n` +
+                  `If you wanted a different style, please send the exact name.`;
+              } else if (first.name) {
+                // fallback if variant missing for some reason
+                reply =
+                  `I’ve added ${first.name} again.\n` +
+                  `If you wanted a different style, please send the exact name.`;
+              }
+            }
+
             return {
               ok: true,
               stored: true,
@@ -2749,6 +2889,7 @@ if (nlu.intent === "order_correction" || nlu.intent === "modifier") {
               items: newItems,
               org_id: orgId,
               reason: "session_append_items",
+              ...(reply ? { reply } : {}),
             };
           }
         }

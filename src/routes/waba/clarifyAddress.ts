@@ -4,6 +4,7 @@ import { setConversationStage } from "../../util/conversationState";
 import { prettyLabelFromText } from "../../routes/waba/productInquiry";
 import { detectAddress } from "../../ai/address"; // ⬅️ NEW
 import { recordAliasConfirmation } from "./aliasEngine";
+import { computeOrderTotals } from "../ingestCore"; // ⬅️ adjust path if needed
 
 export type VariantChoice = {
   index: number; // item index in order.items
@@ -670,6 +671,7 @@ export async function maybeHandleClarifyReply(opts: {
     }
 
     // 5) Mark session as address_done
+    // 5) Mark session as address_done
     await supa
       .from("order_clarify_sessions")
       .update({
@@ -685,6 +687,45 @@ export async function maybeHandleClarifyReply(opts: {
       last_action: "address_captured_ai",
     });
 
+    // 6) Build smart confirmation: order summary + ETA + total
+    let summaryText = "";
+    try {
+      const { data: orderRow, error: orderErr } = await supa
+        .from("orders")
+        .select("id, items")
+        .eq("id", session.order_id)
+        .single();
+
+      if (!orderErr && orderRow && Array.isArray(orderRow.items)) {
+        const { subtotal, lines } = computeOrderTotals(orderRow.items);
+
+        // TODO: later read from org settings; for now hard-code 60 mins
+        const etaMinutes = 60;
+        const etaText = etaMinutes
+          ? `⏰ Estimated delivery: ~${etaMinutes} minutes.\n`
+          : "";
+
+        const summaryBlock =
+          lines.length > 0
+            ? `\n\n🧾 *Order summary:*\n` + lines.join("\n")
+            : "";
+
+        const totalBlock =
+          subtotal > 0
+            ? `\n\n💰 *Estimated total*: ₹${Math.round(subtotal)}`
+            : "";
+
+        summaryText =
+          "\n\n✅ Your order is now confirmed.\n" +
+          etaText +
+          summaryBlock +
+          totalBlock;
+      }
+    } catch (e: any) {
+      console.warn("[WABA][address summary err]", e?.message || e);
+      // If anything fails, we just fallback to simple "got address" text below
+    }
+
     await sendWabaText({
       phoneNumberId,
       to: from,
@@ -692,7 +733,8 @@ export async function maybeHandleClarifyReply(opts: {
       text:
         "📍 Got your address:\n" +
         normalized +
-        "\n\nIf anything is wrong, please send the correct address.",
+        summaryText +
+        "\n\nIf anything is wrong, please send the correct address or changes.",
     });
 
     return true;
