@@ -139,190 +139,228 @@ export type ProductOptionsResult = {
 };
 
 export async function findProductOptionsForText(
-    org_id: string,
-    text: string
-  ): Promise<ProductOptionsResult | null> {
-    // 1) Try your existing fuzzy matcher first
-    let best: any = await findBestProductForTextV2(org_id, text);
-    // ─────────────────────────────────────────────
-    // 1b) GENERIC FALLBACK: token-based search
-    //     (for spelling differences like biriyani vs biryani,
-    //      works for any vertical: grocery, salon, pharmacy, etc.)
-    // ─────────────────────────────────────────────
-    if (!best || !best.id) {
-      try {
-        // 🔹 Layer 7: normalised version for product matching
-        const raw = normalizeProductText(text || "");
-        const words = raw.split(/\s+/).filter(Boolean);
-        const stopwords = new Set([
-          "hi",
-          "hello",
-          "hey",
-          "what",
-          "whats",
-          "is",
-          "the",
-          "a",
-          "an",
-          "of",
-          "for",
-          "to",
-          "do",
-          "you",
-          "have",
-          "any",
-          "today",
-          "please",
-          "pls",
-          "kindly",
-          "how",
-          "much",
-          "price",
-          "rate",
-          "cost",
-          "available",
-          "availability",
-          "stock",
-          "there",
-        ]);
-        const keywords = words.filter((w) => !stopwords.has(w) && w.length >= 3);
-        if (!keywords.length) {
-          // nothing meaningful left → give up, keep old behaviour
-          return null;
+  org_id: string,
+  text: string
+): Promise<ProductOptionsResult | null> {
+  // 0) Try alias-based resolution first (org-level + optional global)
+  try {
+    const aliasHit = await resolveAliasForText({
+      org_id,
+      customer_phone: null, // we can extend later to pass phone
+      wrong_text: text,
+    });
+
+    if (aliasHit && aliasHit.canonical_product_id) {
+      const { data: prod, error: prodErr } = await supa
+        .from("products")
+        .select("id, display_name, canonical, base_unit")
+        .eq("org_id", org_id)
+        .eq("id", aliasHit.canonical_product_id)
+        .maybeSingle();
+
+      if (!prodErr && prod && prod.id) {
+        // Direct alias hit → use this as best and skip fuzzy
+        const best = {
+          id: prod.id as string,
+          display_name:
+            (prod.display_name as string) ||
+            (prod.canonical as string) ||
+            "item",
+          canonical: (prod.canonical as string) || null,
+          base_unit: (prod.base_unit as string) || null,
+        };
+
+        // Still build options list from canonical as usual
+        const canon = (best.canonical || best.display_name || "")
+          .toString()
+          .trim();
+
+        if (!canon) {
+          return {
+            best: {
+              id: best.id,
+              display_name: best.display_name || "item",
+              canonical: best.canonical || null,
+              base_unit: best.base_unit || null,
+            },
+            options: [],
+          };
         }
-        // Fetch candidate products for this org (generic, all business types)
+
         const { data, error } = await supa
           .from("products")
-          .select("id, canonical, display_name, base_unit")
-          .eq("org_id", org_id);
-  
-        if (error || !data || !data.length) {
-          return null;
+          .select(
+            "id, canonical, variant, base_unit, display_name, price_per_unit"
+          )
+          .eq("org_id", org_id)
+          .ilike("canonical", canon);
+
+        if (error) {
+          console.warn("[WABA][productOptions alias err]", error.message);
+          return {
+            best: {
+              id: best.id,
+              display_name: best.display_name || canon || "item",
+              canonical: best.canonical || null,
+              base_unit: best.base_unit || null,
+            },
+            options: [],
+          };
         }
-        // Very simple token-overlap scoring (generic across domains)
-        let bestRow: any | null = null;
-        let bestScore = 0;
-        for (const row of data) {
-          const name = String(
-            row.display_name || row.canonical || ""
-          ).toLowerCase();
-          const nameTokens = name.split(/\s+/).filter(Boolean);
-          if (!nameTokens.length) continue;
-          const overlap = nameTokens.filter((t) => keywords.includes(t));
-          let score = overlap.length;
-          // Slight bonus if the product name contains the raw keyword string
-          const joined = keywords.join(" ");
-          if (joined && name.includes(joined)) {
-            score += 0.5;
-          }
-          if (score > bestScore) {
-            bestScore = score;
-            bestRow = row;
-          }
+
+        const rows = (data || []) as any[];
+        const options: ProductPriceOption[] = [];
+
+        for (const row of rows) {
+          const id = row.id;
+          if (!id) continue;
+
+          const latest = await getLatestPrice(org_id, id).catch((e: any) => {
+            console.warn("[WABA][latestPrice err]", e?.message || e);
+            return null;
+          });
+
+          const price =
+            latest && typeof latest.price === "number"
+              ? latest.price
+              : typeof row.price_per_unit === "number"
+              ? row.price_per_unit
+              : null;
+
+          const currency = latest ? latest.currency : null;
+
+          options.push({
+            productId: id,
+            name:
+              row.display_name ||
+              row.canonical ||
+              best.display_name ||
+              canon ||
+              "item",
+            variant: row.variant ? String(row.variant).trim() || null : null,
+            unit: row.base_unit || best.base_unit || "unit",
+            price,
+            currency,
+          });
         }
-        // Require at least some overlap to avoid random matches
-        if (!bestRow || bestScore <= 0) {
-          return null; // fall back to your existing generic text
-        }
-  
-        // Map fallback row to the "best" shape your code expects
-        best = {
-          id: bestRow.id,
-          display_name: bestRow.display_name || bestRow.canonical || "item",
-          canonical: bestRow.canonical || null,
-          base_unit: bestRow.base_unit || null,
+
+        return {
+          best: {
+            id: best.id,
+            display_name: best.display_name || canon || "item",
+            canonical: best.canonical || null,
+            base_unit: best.base_unit || null,
+          },
+          options,
         };
-      } catch (e: any) {
-        console.warn("[WABA][fallback product search err]", e?.message || e);
-        return null;
       }
     }
-    const canon = (best.canonical || best.display_name || "").toString().trim();
-    if (!canon) {
-      // we still return best, but no extra options
-      return {
-        best: {
-          id: best.id,
-          display_name: best.display_name || canon || "item",
-          canonical: best.canonical || null,
-          base_unit: best.base_unit || null,
-        },
-        options: [],
-      };
-    }
-  
-    // 2) Fetch all products with same canonical in this org
-    const { data, error } = await supa
-      .from("products")
-      .select("id, canonical, variant, base_unit, display_name, price_per_unit")
-      .eq("org_id", org_id)
-      .ilike("canonical", canon);
-  
-    if (error) {
-      console.warn("[WABA][productOptions err]", error.message);
-      // fall back to just 'best' product
-      return {
-        best: {
-          id: best.id,
-          display_name: best.display_name || canon || "item",
-          canonical: best.canonical || null,
-          base_unit: best.base_unit || null,
-        },
-        options: [],
-      };
-    }
-  
-    const rows = (data || []) as any[];
-  
-    // If nothing else is configured, still return best as an option
-    if (!rows.length) {
-      return {
-        best: {
-          id: best.id,
-          display_name: best.display_name || canon || "item",
-          canonical: best.canonical || null,
-          base_unit: best.base_unit || null,
-        },
-        options: [],
-      };
-    }
-  
-    const options: ProductPriceOption[] = [];
-  
-    for (const row of rows) {
-      const id = row.id;
-      if (!id) continue;
-  
-      const latest = await getLatestPrice(org_id, id).catch((e: any) => {
-        console.warn("[WABA][latestPrice err]", e?.message || e);
+  } catch (e: any) {
+    console.warn("[WABA][alias productOptions err]", e?.message || e);
+  }
+
+  // 1) Try your existing fuzzy matcher first
+  let best: any = await findBestProductForTextV2(org_id, text);
+
+  // ─────────────────────────────────────────────
+  // 1b) GENERIC FALLBACK: token-based search
+  //     (for spelling differences like biriyani vs biryani,
+  //      works for any vertical: grocery, salon, pharmacy, etc.)
+  // ─────────────────────────────────────────────
+  if (!best || !best.id) {
+    try {
+      // 🔹 Layer 7: normalised version for product matching
+      const raw = normalizeProductText(text || "");
+      const words = raw.split(/\s+/).filter(Boolean);
+      const stopwords = new Set([
+        "hi",
+        "hello",
+        "hey",
+        "what",
+        "whats",
+        "is",
+        "the",
+        "a",
+        "an",
+        "of",
+        "for",
+        "to",
+        "do",
+        "you",
+        "have",
+        "any",
+        "today",
+        "please",
+        "pls",
+        "kindly",
+        "how",
+        "much",
+        "price",
+        "rate",
+        "cost",
+        "available",
+        "availability",
+        "stock",
+        "there",
+      ]);
+      const keywords = words.filter(
+        (w) => !stopwords.has(w) && w.length >= 3
+      );
+      if (!keywords.length) {
+        // nothing meaningful left → give up, keep old behaviour
         return null;
-      });
-  
-      // ✅ NEW: fall back to price_per_unit when there is no latest price
-      const price =
-        latest && typeof latest.price === "number"
-          ? latest.price
-          : typeof row.price_per_unit === "number"
-          ? row.price_per_unit
-          : null;
-  
-      const currency = latest ? latest.currency : null;
-  
-      options.push({
-        productId: id,
-        name:
-          row.display_name ||
-          row.canonical ||
-          best.display_name ||
-          canon ||
-          "item",
-        variant: row.variant ? String(row.variant).trim() || null : null,
-        unit: row.base_unit || best.base_unit || "unit",
-        price, // ✅ now includes static price_per_unit fallback
-        currency, // may be null
-      });
+      }
+      // Fetch candidate products for this org (generic, all business types)
+      const { data, error } = await supa
+        .from("products")
+        .select("id, canonical, display_name, base_unit")
+        .eq("org_id", org_id);
+
+      if (error || !data || !data.length) {
+        return null;
+      }
+      // Very simple token-overlap scoring (generic across domains)
+      let bestRow: any | null = null;
+      let bestScore = 0;
+      for (const row of data) {
+        const name = String(
+          row.display_name || row.canonical || ""
+        ).toLowerCase();
+        const nameTokens = name.split(/\s+/).filter(Boolean);
+        if (!nameTokens.length) continue;
+        const overlap = nameTokens.filter((t) => keywords.includes(t));
+        let score = overlap.length;
+        // Slight bonus if the product name contains the raw keyword string
+        const joined = keywords.join(" ");
+        if (joined && name.includes(joined)) {
+          score += 0.5;
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          bestRow = row;
+        }
+      }
+      // Require at least some overlap to avoid random matches
+      if (!bestRow || bestScore <= 0) {
+        return null; // fall back to your existing generic text
+      }
+
+      // Map fallback row to the "best" shape your code expects
+      best = {
+        id: bestRow.id,
+        display_name: bestRow.display_name || bestRow.canonical || "item",
+        canonical: bestRow.canonical || null,
+        base_unit: bestRow.base_unit || null,
+      };
+    } catch (e: any) {
+      console.warn("[WABA][fallback product search err]", e?.message || e);
+      return null;
     }
-  
+  }
+
+  const canon = (best.canonical || best.display_name || "").toString().trim();
+  if (!canon) {
+    // we still return best, but no extra options
     return {
       best: {
         id: best.id,
@@ -330,9 +368,94 @@ export async function findProductOptionsForText(
         canonical: best.canonical || null,
         base_unit: best.base_unit || null,
       },
-      options,
+      options: [],
     };
   }
+
+  // 2) Fetch all products with same canonical in this org
+  const { data, error } = await supa
+    .from("products")
+    .select(
+      "id, canonical, variant, base_unit, display_name, price_per_unit"
+    )
+    .eq("org_id", org_id)
+    .ilike("canonical", canon);
+
+  if (error) {
+    console.warn("[WABA][productOptions err]", error.message);
+    // fall back to just 'best' product
+    return {
+      best: {
+        id: best.id,
+        display_name: best.display_name || canon || "item",
+        canonical: best.canonical || null,
+        base_unit: best.base_unit || null,
+      },
+      options: [],
+    };
+  }
+
+  const rows = (data || []) as any[];
+
+  // If nothing else is configured, still return best as an option
+  if (!rows.length) {
+    return {
+      best: {
+        id: best.id,
+        display_name: best.display_name || canon || "item",
+        canonical: best.canonical || null,
+        base_unit: best.base_unit || null,
+      },
+      options: [],
+    };
+  }
+
+  const options: ProductPriceOption[] = [];
+
+  for (const row of rows) {
+    const id = row.id;
+    if (!id) continue;
+
+    const latest = await getLatestPrice(org_id, id).catch((e: any) => {
+      console.warn("[WABA][latestPrice err]", e?.message || e);
+      return null;
+    });
+
+    // ✅ NEW: fall back to price_per_unit when there is no latest price
+    const price =
+      latest && typeof latest.price === "number"
+        ? latest.price
+        : typeof row.price_per_unit === "number"
+        ? row.price_per_unit
+        : null;
+
+    const currency = latest ? latest.currency : null;
+
+    options.push({
+      productId: id,
+      name:
+        row.display_name ||
+        row.canonical ||
+        best.display_name ||
+        canon ||
+        "item",
+      variant: row.variant ? String(row.variant).trim() || null : null,
+      unit: row.base_unit || best.base_unit || "unit",
+      price, // ✅ now includes static price_per_unit fallback
+      currency, // may be null
+    });
+  }
+
+  return {
+    best: {
+      id: best.id,
+      display_name: best.display_name || canon || "item",
+      canonical: best.canonical || null,
+      base_unit: best.base_unit || null,
+    },
+    options,
+  };
+}
 
   export function formatPriceLine(opt: ProductPriceOption): string {
     const label = opt.variant ? `${opt.name} ${opt.variant}`.trim() : opt.name;

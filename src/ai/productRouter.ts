@@ -12,6 +12,7 @@
 
 import { supa } from "../db";
 import { findBestProductForTextV2 } from "../util/productMatcher";
+import { resolveAliasForText } from "../routes/waba/aliasEngine";
 
 export type RoutedProduct = {
   product_id: string | null;
@@ -20,7 +21,7 @@ export type RoutedProduct = {
   variant: string | null;
   base_unit: string | null;
   confidence: number; // 0–1
-  source: "matcher" | "fallback";
+  source: "alias" | "matcher" | "fallback";
 };
 
 // Simple helpers (same flavour as in productMatcher)
@@ -66,6 +67,61 @@ export async function routeProductText(opts: {
   const clean = normalize(rawName);
   if (!clean) return null;
 
+  // 0) Try alias memory FIRST (org/global)
+  try {
+    const aliasHit = await resolveAliasForText({
+      org_id,
+      // we can later pass customer_phone when we have it in this layer
+      customer_phone: undefined,
+      wrong_text: rawName,
+    });
+
+    if (aliasHit && aliasHit.canonical_product_id) {
+      const { data: prod, error: prodErr } = await supa
+        .from("products")
+        .select("id, canonical, display_name, base_unit, variant")
+        .eq("org_id", org_id)
+        .eq("id", aliasHit.canonical_product_id)
+        .maybeSingle();
+
+      if (!prodErr && prod && prod.id) {
+        const canonical =
+          (prod.canonical && String(prod.canonical)) ||
+          (prod.display_name && String(prod.display_name)) ||
+          null;
+
+        const display_name = prod.display_name
+          ? String(prod.display_name)
+          : canonical;
+
+        const base_unit =
+          (prod.base_unit && String(prod.base_unit)) || null;
+
+        // For now, variant comes from product row only
+        const variant = prod.variant ? String(prod.variant) : null;
+
+        const nameForSim = [canonical, display_name]
+          .filter(Boolean)
+          .join(" ");
+
+        const sim = computeNameSimilarity(clean, nameForSim);
+        const confidence = Math.max(0, Math.min(1, sim || 1));
+
+        return {
+          product_id: prod.id as string,
+          canonical,
+          display_name,
+          variant,
+          base_unit,
+          confidence,
+          source: "alias",
+        };
+      }
+    }
+  } catch (e: any) {
+    console.warn("[productRouter][alias lookup err]", e?.message || e);
+  }
+
   // 1) Use our upgraded matcher (Layer 6 depends on Layer 5)
   const best: any = await findBestProductForTextV2(org_id, clean);
   if (!best) return null;
@@ -90,7 +146,6 @@ export async function routeProductText(opts: {
     .join(" ");
 
   const sim = computeNameSimilarity(clean, nameForSim);
-  // Clamp and bias a bit so we usually stay in 0.4–0.95
   const confidence = Math.max(0, Math.min(1, sim || 0));
 
   const routed: RoutedProduct = {

@@ -1,7 +1,7 @@
 import { supa } from "../../db";
 
 // Reuse the same style of normalization you use for fuzzy labels
-function normalizeAliasKey(raw: string): string {
+export function normalizeAliasKey(raw: string): string {
   return String(raw || "")
     .toLowerCase()
     .normalize("NFKD")

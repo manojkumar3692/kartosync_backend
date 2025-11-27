@@ -5,6 +5,8 @@ import { prettyLabelFromText } from "../../routes/waba/productInquiry";
 import { detectAddress } from "../../ai/address"; // ⬅️ NEW
 import { recordAliasConfirmation } from "./aliasEngine";
 import { computeOrderTotals } from "../ingestCore"; // ⬅️ adjust path if needed
+import { fuzzyCharOverlapScore, normalizeLabelForFuzzy } from "../../util/fuzzy";
+import { recordVariantAlias } from "./aiInsights";
 
 export type VariantChoice = {
   index: number; // item index in order.items
@@ -829,12 +831,29 @@ export async function maybeHandleClarifyReply(opts: {
   }
 
   // Try to match answer to one of the variants
-  const answer = lower;
+  // Try to match answer to one of the variants (be forgiving, but still safe)
+  const answerRaw = text;
+  const answerLower = lower;
+  const answerNorm = normalizeLabelForFuzzy(answerRaw);
   let chosen: string | null = null;
 
   for (const v of variants) {
     const vLower = v.toLowerCase();
-    if (answer === vLower || answer.includes(vLower)) {
+    const vNorm = normalizeLabelForFuzzy(vLower);
+
+    // 1) Normalised exact or containment match
+    if (
+      answerNorm === vNorm ||
+      answerNorm.includes(vNorm) ||
+      vNorm.includes(answerNorm)
+    ) {
+      chosen = v;
+      break;
+    }
+
+    // 2) Fuzzy overlap as backup
+    const score = fuzzyCharOverlapScore(answerRaw, vLower);
+    if (score >= 0.7) {
       chosen = v;
       break;
     }
@@ -845,7 +864,10 @@ export async function maybeHandleClarifyReply(opts: {
     await sendWabaText({
       phoneNumberId,
       to: from,
-      text: `Sorry, I didn’t catch that. Please reply with one of: ${optionsStr}`,
+      text:
+        "Sorry, I didn’t catch that.\n" +
+        "Please reply by copying one option exactly, for example:\n" +
+        optionsStr,
       orgId: org_id,
     });
     return true;
@@ -856,6 +878,14 @@ export async function maybeHandleClarifyReply(opts: {
     ...currentItem,
     variant: chosen,
   };
+
+  await recordVariantAlias({
+    org_id,
+    customer_phone: from,
+    wrong_text: text,
+    canonical_product_id: currentItem.product_id,
+    variant: chosen,
+  });
 
   const { error: updErr } = await supa
     .from("orders")
