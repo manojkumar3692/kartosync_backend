@@ -2,6 +2,7 @@ import { supa } from "../../db";
 import { META_WA_BASE } from "../waba";
 import { UserCommand } from "./clarifyAddress"
 import axios from "axios";
+import { prettyLabelFromText } from "./productInquiry";
 
 export async function logFlowEvent(opts: {
     orgId: string;
@@ -320,3 +321,62 @@ export function detectSoftCancelIntent(text: string): boolean {
   
     return false;
   }
+
+
+  // Edit-like messages we *don’t* support in V1 (we answer safely)
+export function isLikelyEditRequest(text: string): boolean {
+  const lower = text.toLowerCase();
+  if (lower.includes("change ")) return true;
+  if (lower.includes("instead of")) return true;
+  if (lower.includes("make it ")) return true;
+  if (lower.includes("make my ")) return true;
+  if (lower.includes("remove ")) return true;
+  if (lower.startsWith("no ")) return true;
+  if (lower.includes("reduce ")) return true;
+  if (lower.includes("increase ")) return true;
+
+  // NEW patterns for "only X", "stop adding", etc.
+  if (lower.includes("only biryani") || lower.includes("only biriyani"))
+    return true;
+  if (lower.includes("only this")) return true;
+  if (lower.includes("dont add") || lower.includes("don't add")) return true;
+  if (lower.includes("no need") && lower.includes("item")) return true;
+  if (lower.includes("wrong") && lower.includes("order")) return true;
+  if (
+    lower.includes("why are u adding") ||
+    lower.includes("why are you adding")
+  )
+    return true;
+
+  return false;
+}
+
+
+export function cleanRequestedLabel(text: string, keywords: string[]): string {
+  const STOPWORDS = new Set([
+    "add",
+    "have",
+    "want",
+    "need",
+    "give",
+    "please",
+    "hi",
+    "hello",
+    "can",
+    "u",
+    "you",
+  ]);
+
+  const labelKeywords = keywords.filter(
+    (kw) => !STOPWORDS.has(kw.toLowerCase())
+  );
+
+  return (
+    (labelKeywords.length
+      ? labelKeywords.join(" ")
+      : keywords.length
+      ? keywords.join(" ")
+      : ""
+    ).trim() || prettyLabelFromText(text)
+  );
+}

@@ -172,16 +172,14 @@ async function ensureSessionRow(
 
   const now = new Date().toISOString();
 
-  const { error } = await supa
-    .from("org_customer_settings")
-    .upsert(
-      {
-        org_id: orgId,
-        customer_phone: phoneKey,
-        last_seen_at: now,
-      },
-      { onConflict: "org_id,customer_phone" }
-    );
+  const { error } = await supa.from("org_customer_settings").upsert(
+    {
+      org_id: orgId,
+      customer_phone: phoneKey,
+      last_seen_at: now,
+    },
+    { onConflict: "org_id,customer_phone" }
+  );
 
   if (error) {
     console.warn("[SESSION][ensureSessionRow] err", error.message);
@@ -517,8 +515,7 @@ export async function decideOrderSessionAction(opts: {
 
   const lowerText = text.toLowerCase().trim();
 
-  const session =
-    opts.session || (await getCustomerSession(org_id, phone_key));
+  const session = opts.session || (await getCustomerSession(org_id, phone_key));
 
   const activeOrderId =
     (typeof opts.activeOrderId === "string"
@@ -595,10 +592,7 @@ export async function decideOrderSessionAction(opts: {
 
   if (explicitCommand === "cancel") {
     if (!hasActiveOrder) {
-      const d = baseDecision(
-        "noop",
-        "command:cancel_but_no_active_order"
-      );
+      const d = baseDecision("noop", "command:cancel_but_no_active_order");
       console.log("[SESSION][engine][decision]", d);
       return d;
     }
@@ -611,10 +605,7 @@ export async function decideOrderSessionAction(opts: {
   }
 
   if (explicitCommand === "update") {
-    const d = baseDecision(
-      "clarify_before_action",
-      "command:update_order"
-    );
+    const d = baseDecision("clarify_before_action", "command:update_order");
     console.log("[SESSION][engine][decision]", d);
     return d;
   }
@@ -704,10 +695,7 @@ export async function decideOrderSessionAction(opts: {
     const items = Array.isArray(parse.items) ? parse.items : [];
 
     if (!items.length) {
-      const d = baseDecision(
-        "clarify_before_action",
-        "order_no_items_parsed"
-      );
+      const d = baseDecision("clarify_before_action", "order_no_items_parsed");
       console.log("[SESSION][engine][decision]", d);
       return d;
     }
@@ -722,10 +710,7 @@ export async function decideOrderSessionAction(opts: {
     // 6.2) Looks like “add more” → append_items
     if (looksLikeAddToExisting) {
       const d: SessionDecision = {
-        ...baseDecision(
-          "append_items",
-          "order_add_to_existing_heuristic"
-        ),
+        ...baseDecision("append_items", "order_add_to_existing_heuristic"),
         targetOrderId: activeOrderId,
         itemsToAppend: items,
       };
@@ -736,10 +721,7 @@ export async function decideOrderSessionAction(opts: {
     // 6.3) Parser already linked to an order_id → respect when it matches active
     if (parse.order_id && parse.order_id === activeOrderId) {
       const d: SessionDecision = {
-        ...baseDecision(
-          "append_items",
-          "order_parser_wants_append_to_active"
-        ),
+        ...baseDecision("append_items", "order_parser_wants_append_to_active"),
         targetOrderId: activeOrderId,
         itemsToAppend: items,
       };

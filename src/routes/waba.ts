@@ -2,7 +2,7 @@
 import express from "express";
 
 import { supa } from "../db";
-import { ingestCoreFromMessage } from "./ingestCore";
+import { ingestCoreFromMessage, recordMenuAliasHit } from "./ingestCore";
 import { getLatestPrice } from "../util/products";
 import {
   startAddressSessionForOrder,
@@ -63,6 +63,8 @@ import {
   pendingSoftCancel,
   shouldAskAliasConfirm,
   sendWabaText,
+  isLikelyEditRequest,
+  cleanRequestedLabel,
 } from "../routes/waba/wabaimports";
 import { rewriteForParser } from "../ai/rewriter";
 // at the top of waba.ts
@@ -120,39 +122,18 @@ function wabaDebug(...args: any[]) {
   console.log("[WABA-DEBUG]", ...args);
 }
 
-
-
-
-function cleanRequestedLabel(text: string, keywords: string[]): string {
-    const STOPWORDS = new Set([
-      "add",
-      "have",
-      "want",
-      "need",
-      "give",
-      "please",
-      "hi",
-      "hello",
-      "can",
-      "u",
-      "you",
-    ]);
-  
-    const labelKeywords = keywords.filter(
-      (kw) => !STOPWORDS.has(kw.toLowerCase())
-    );
-  
-    return (
-      (labelKeywords.length
-        ? labelKeywords.join(" ")
-        : keywords.length
-        ? keywords.join(" ")
-        : ""
-      ).trim() || prettyLabelFromText(text)
-    );
-  }
+console.log("WABA VERSION V18");
 
 // Helper: smart reply for price / availability inquiries
+
+// Which menu we last showed for this customer (for numeric reply 1/2/3)
+const pendingMenuSuggestions = new Map<
+  string,
+  {
+    queryText: string; // e.g. "donne biriyani"
+    options: { productId: string; label: string }[];
+  }
+>();
 
 async function buildSmartInquiryReply(opts: {
   org_id: string;
@@ -466,20 +447,17 @@ async function buildSmartInquiryReply(opts: {
   if (inquiryType === "availability") {
     // Build menu entries with label + price (if known)
     const entriesMap = new Map<string, MenuEntry>();
-  
+
     for (const o of options) {
       // ProductPriceOption → only .name, .variant, .price, .unit, .currency
       const base = (o.name || "").trim();
       if (!base) continue;
-  
+
       const variant = o.variant ? String(o.variant).trim() : "";
       const label = variant ? `${base} ${variant}` : base;
       const key = label.toLowerCase();
-  
-      const price =
-        typeof o.price === "number"
-          ? o.price
-          : null;
+
+      const price = typeof o.price === "number" ? o.price : null;
 
       const currency = o.currency || null;
       const existing = entriesMap.get(key);
@@ -495,24 +473,24 @@ async function buildSmartInquiryReply(opts: {
         }
       }
     }
-  
+
     // previously this was a string[], now MenuEntry[]
     const names: MenuEntry[] = Array.from(entriesMap.values());
-  
+
     // Use same keyword extractor as menu logic
     const keywords = extractMenuKeywords(text);
     const lowerNames = names.map((e) => e.label.toLowerCase());
-  
+
     const hasOverlap = keywords.some((kw) =>
       lowerNames.some((name) => name.includes(kw))
     );
     const missingKeywords = keywords.filter(
       (kw) => !lowerNames.some((name) => name.includes(kw))
     );
-  
+
     const requestedLabel = cleanRequestedLabel(text, keywords);
     // const requestedLabel = parsed.requested_label || cleanRequestedLabel(text, keywords);
-  
+
     // 🧠 Partial match case:
     // Example: user -> "panner biriyani"
     // Catalog -> only "Mutton Biryani", "Chicken Biryani"
@@ -532,9 +510,9 @@ async function buildSmartInquiryReply(opts: {
             "id, display_name, canonical, variant, base_unit, price_per_unit, unit_price, price"
           )
           .eq("org_id", org_id);
-  
+
         let familyEntries: MenuEntry[] = [];
-  
+
         if (!allErr && allProducts && allProducts.length) {
           const familyHits = (allProducts as any[]).filter((p) => {
             const baseName = String(
@@ -543,20 +521,20 @@ async function buildSmartInquiryReply(opts: {
             const variantName = String(p.variant || "").toLowerCase();
             const haystack = `${baseName} ${variantName}`.trim();
             if (!haystack) return false;
-  
+
             // match any of the meaningful keywords (e.g. "paneer", "biryani")
             return keywords.some((kw) => haystack.includes(kw));
           });
-  
+
           const tmpMap = new Map<string, MenuEntry>();
-  
+
           for (const p of familyHits) {
             const base = p.display_name || p.canonical || "item";
             const label = p.variant
               ? `${base} ${String(p.variant).trim()}`
               : base;
             const key = label.toLowerCase();
-  
+
             const price =
               typeof p.price_per_unit === "number"
                 ? p.price_per_unit
@@ -565,48 +543,46 @@ async function buildSmartInquiryReply(opts: {
                 : typeof p.price === "number"
                 ? p.price
                 : null;
-  
+
             const existing = tmpMap.get(key);
             if (!existing) {
-                tmpMap.set(key, { label, price, currency: null });
-              } else if (existing.price == null && price != null) {
-                existing.price = price;
-              }
+              tmpMap.set(key, { label, price, currency: null });
+            } else if (existing.price == null && price != null) {
+              existing.price = price;
+            }
           }
-  
+
           familyEntries = Array.from(tmpMap.values());
         }
-  
+
         // If no extra family hits, fall back to the original entries
         const finalEntries = familyEntries.length > 0 ? familyEntries : names;
-  
+
         const header =
           `I couldn’t find *${requestedLabel}* exactly in today’s menu.\n` +
           `We do have:\n`;
-  
-        const lines = finalEntries.map((entry, i) =>
-          formatMenuLine(i, entry)
-        );
+
+        const lines = finalEntries.map((entry, i) => formatMenuLine(i, entry));
         const footer = "\n\nWould you like to choose one of these instead?";
-  
+
         return header + lines.join("\n") + footer;
       } catch (e: any) {
         console.warn(
           "[WABA][availability family suggestions err]",
           e?.message || e
         );
-  
+
         // Safe fallback: keep the simpler behaviour but with prices
         const header =
           `I couldn’t find *${requestedLabel}* exactly in today’s menu.\n` +
           `We do have:\n`;
         const lines = names.map((entry, i) => formatMenuLine(i, entry));
         const footer = "\n\nWould you like to choose one of these instead?";
-  
+
         return header + lines.join("\n") + footer;
       }
     }
-  
+
     // Normal happy path: full match
     if (names.length >= 1) {
       if (names.length >= 2) {
@@ -615,7 +591,7 @@ async function buildSmartInquiryReply(opts: {
           names.map((entry, i) => formatMenuLine(i, entry)).join("\n")
         );
       }
-  
+
       // Single option but still matched cleanly
       const only = names[0];
       const priceText =
@@ -624,7 +600,7 @@ async function buildSmartInquiryReply(opts: {
           : "";
       return `✅ Yes, we have ${only.label}${priceText} available.`;
     }
-  
+
     // Fallback when no variants
     return `✅ Yes, we have ${best.display_name} available.`;
   }
@@ -688,286 +664,6 @@ async function findPendingModifierQuestionForCustomer(opts: {
   }
 }
 
-// Safe auto-edit for "change/remove/make spicy" messages
-// Used only when ingestCore says: result.kind === "modifier"
-async function applySafeOrderModifier(opts: {
-  orgId: string;
-  phoneNumberId: string;
-  from: string; // raw WhatsApp number (no +)
-  text: string;
-  orderId: string;
-}): Promise<boolean> {
-  const { orgId, phoneNumberId, from, text, orderId } = opts;
-  const lower = text.toLowerCase();
-
-  // 1) Load fresh order from DB
-  const { data: ordRow, error: ordErr } = await supa
-    .from("orders")
-    .select("id, items, status")
-    .eq("id", orderId)
-    .maybeSingle();
-
-  if (ordErr || !ordRow || !ordRow.id) {
-    console.warn("[WABA][modifier order load err]", ordErr?.message);
-    await logFlowEvent({
-      orgId,
-      from,
-      event: "modifier_order_missing",
-      msgId: undefined,
-      orderId,
-      text,
-      result: { error: ordErr?.message || "order not found" },
-    });
-    return false; // let caller fall back to old behaviour
-  }
-
-  const status = String((ordRow as any).status || "pending").toLowerCase();
-
-  // Only auto-edit when order is still modifiable
-  const canEdit = status === "pending" || status === "paid";
-  if (!canEdit) {
-    await sendWabaText({
-      phoneNumberId,
-      to: from,
-      orgId,
-      text:
-        "I got your change request, but this order is already being processed.\n" +
-        "The store will try to adjust it if possible.",
-    });
-
-    await logFlowEvent({
-      orgId,
-      from,
-      event: "modifier_order_not_editable",
-      msgId: undefined,
-      orderId,
-      text,
-      result: { status },
-    });
-
-    return true; // handled (we replied), but no auto-edit
-  }
-
-  const items: any[] = Array.isArray((ordRow as any).items)
-    ? ((ordRow as any).items as any[])
-    : [];
-
-  if (!items.length) {
-    return false;
-  }
-
-  // 2) Detect type of change (variant / quantity / remove)
-  const wantsRemove =
-    lower.includes("remove ") ||
-    lower.includes("remove the ") ||
-    lower.includes("dont want") ||
-    lower.includes("don't want") ||
-    lower.includes("no need") ||
-    (lower.includes("cancel") && !/cancel my order|cancel order/.test(lower));
-
-  const hasSpicy = lower.includes("spicy");
-  const hasRegular = lower.includes("regular");
-  const hasLessSpicy =
-    lower.includes("less spicy") || lower.includes("medium spicy");
-
-  // crude qty detection: look for "to 2", "make it 2", "2 qty", etc.
-  let qtyMatch: number | null = null;
-  {
-    const m =
-      lower.match(/(?:to|make it|make|change).*?(\d{1,2})/) ||
-      lower.match(/(\d{1,2})\s*(?:qty|quantity|pieces?|pcs?|plates?)\b/);
-    if (m && m[1]) {
-      const q = parseInt(m[1], 10);
-      if (!Number.isNaN(q) && q > 0 && q <= 99) {
-        qtyMatch = q;
-      }
-    }
-  }
-
-  const wantsQtyChange = qtyMatch != null;
-
-  // If we couldn't recognise *any* supported change type, bail out to old behaviour
-  if (
-    !wantsRemove &&
-    !hasSpicy &&
-    !hasRegular &&
-    !hasLessSpicy &&
-    !wantsQtyChange
-  ) {
-    await logFlowEvent({
-      orgId,
-      from,
-      event: "modifier_unsupported_change_type",
-      msgId: undefined,
-      orderId,
-      text,
-      result: { note: "no recognised change keywords" },
-    });
-    return false;
-  }
-
-  // 3) Find best target line-item using fuzzy match on item names vs the message
-  const keywords = lower
-    .split(/\s+/)
-    .map((w) => w.replace(/[^a-z0-9]/gi, ""))
-    .filter((w) => w.length >= 3);
-
-  type Candidate = { index: number; label: string; score: number };
-  const cands: Candidate[] = [];
-
-  for (let i = 0; i < items.length; i++) {
-    const it = items[i] || {};
-    const baseName = String(it.canonical || it.name || "").trim();
-    if (!baseName) continue;
-
-    const label = baseName.toLowerCase();
-    const fuzzyScore = fuzzyCharOverlapScore(baseName, text); // uses normalized forms internally
-
-    const hasKeywordOverlap = keywords.some((kw) => label.includes(kw));
-    const finalScore = fuzzyScore + (hasKeywordOverlap ? 0.3 : 0);
-
-    if (finalScore >= 0.4) {
-      cands.push({ index: i, label: baseName, score: finalScore });
-    }
-  }
-
-  if (!cands.length) {
-    await logFlowEvent({
-      orgId,
-      from,
-      event: "modifier_no_target_match",
-      msgId: undefined,
-      orderId,
-      text,
-      result: { note: "no fuzzy match to any line item" },
-    });
-    return false; // ambiguous → let store handle
-  }
-
-  // Sort by score desc
-  cands.sort((a, b) => b.score - a.score);
-
-  const best = cands[0];
-  const second = cands[1];
-
-  // If two items are almost equally similar → too risky to auto-edit
-  if (second && best.score - second.score < 0.15) {
-    await logFlowEvent({
-      orgId,
-      from,
-      event: "modifier_ambiguous_multiple_targets",
-      msgId: undefined,
-      orderId,
-      text,
-      result: { candidates: cands.slice(0, 3) },
-    });
-    return false;
-  }
-
-  const targetIndex = best.index;
-  const targetItem = items[targetIndex] || {};
-  const itemName = targetItem.canonical || targetItem.name || "that item";
-
-  let changed = false;
-  let replyText = "";
-
-  // 4A) Remove item
-  if (wantsRemove) {
-    items.splice(targetIndex, 1);
-    changed = true;
-    replyText = `✅ Done — removed *${itemName}* from your order.`;
-  }
-
-  // 4B) Variant change (spicy / regular / less spicy)
-  if (!changed && (hasSpicy || hasRegular || hasLessSpicy)) {
-    let newVariant: string | null = null;
-
-    if (hasLessSpicy) {
-      newVariant = "Less Spicy";
-    } else if (hasSpicy) {
-      newVariant = "Spicy";
-    } else if (hasRegular) {
-      newVariant = "Regular";
-    }
-
-    if (newVariant) {
-      items[targetIndex] = {
-        ...targetItem,
-        variant: newVariant,
-      };
-      changed = true;
-      replyText = `✅ Done — updated your *${itemName}* to *${newVariant}*.`;
-    }
-  }
-
-  // 4C) Quantity change
-  if (!changed && wantsQtyChange && qtyMatch != null) {
-    items[targetIndex] = {
-      ...targetItem,
-      qty: qtyMatch,
-    };
-    changed = true;
-    replyText = `✅ Done — updated *${itemName}* to quantity *${qtyMatch}*.`;
-  }
-
-  if (!changed) {
-    await logFlowEvent({
-      orgId,
-      from,
-      event: "modifier_no_change_applied",
-      msgId: undefined,
-      orderId,
-      text,
-      result: { note: "change type detected but nothing applied" },
-    });
-    return false;
-  }
-
-  // 5) Save back to DB
-  const { error: updErr } = await supa
-    .from("orders")
-    .update({ items })
-    .eq("id", ordRow.id);
-
-  if (updErr) {
-    console.warn("[WABA][modifier save err]", updErr.message);
-    await logFlowEvent({
-      orgId,
-      from,
-      event: "modifier_save_failed",
-      msgId: undefined,
-      orderId,
-      text,
-      result: { error: updErr.message },
-    });
-    return false;
-  }
-
-  // 6) Confirm to customer
-  await sendWabaText({
-    phoneNumberId,
-    to: from,
-    orgId,
-    text: replyText,
-  });
-
-  await logFlowEvent({
-    orgId,
-    from,
-    event: "modifier_auto_edit_applied",
-    msgId: undefined,
-    orderId,
-    text,
-    result: {
-      targetIndex,
-      itemName,
-      replyText,
-    },
-  });
-
-  return true; // ✅ fully handled here
-}
-
 // Start MULTI-TURN CLARIFY session (for items)
 async function startClarifyForOrder(opts: {
   org_id: string;
@@ -1024,40 +720,6 @@ async function startClarifyForOrder(opts: {
 
   return buildClarifyQuestionText(first);
 }
-// Start ADDRESS session (no more item clarifications needed)
-// - next text from this customer will be treated as address, not order.
-
-// Handle a message while clarify/address session is open
-// Returns true if the message was consumed by this handler.
-
-// Edit-like messages we *don’t* support in V1 (we answer safely)
-function isLikelyEditRequest(text: string): boolean {
-  const lower = text.toLowerCase();
-  if (lower.includes("change ")) return true;
-  if (lower.includes("instead of")) return true;
-  if (lower.includes("make it ")) return true;
-  if (lower.includes("make my ")) return true;
-  if (lower.includes("remove ")) return true;
-  if (lower.startsWith("no ")) return true;
-  if (lower.includes("reduce ")) return true;
-  if (lower.includes("increase ")) return true;
-
-  // NEW patterns for "only X", "stop adding", etc.
-  if (lower.includes("only biryani") || lower.includes("only biriyani"))
-    return true;
-  if (lower.includes("only this")) return true;
-  if (lower.includes("dont add") || lower.includes("don't add")) return true;
-  if (lower.includes("no need") && lower.includes("item")) return true;
-  if (lower.includes("wrong") && lower.includes("order")) return true;
-  if (
-    lower.includes("why are u adding") ||
-    lower.includes("why are you adding")
-  )
-    return true;
-
-  return false;
-}
-
 // Explicit user commands: NEW / CANCEL / UPDATE / AGENT
 // when we show "you have multiple active orders, reply 1/2/3",
 // we store the order IDs here for that phone
@@ -2453,10 +2115,67 @@ waba.post("/", async (req, res) => {
             continue;
           }
 
+          // 0.20) MENU SELECTION HANDLER – numeric reply to last menu list
+          // e.g. user replies "3" after seeing the Donne options
+          if (/^\d{1,2}$/.test(lowerText)) {
+            const choiceIndex = parseInt(lowerText, 10) - 1;
+
+            const menuSession = pendingMenuSuggestions.get(from);
+            if (
+              menuSession &&
+              choiceIndex >= 0 &&
+              choiceIndex < menuSession.options.length
+            ) {
+              const chosen = menuSession.options[choiceIndex];
+
+              console.log("[MENU_KW][selection]", {
+                from,
+                queryText: menuSession.queryText,
+                choiceIndex,
+                chosen,
+              });
+
+              try {
+                // 📌 Learn that: "donne biriyani" → this specific product
+                await recordMenuAliasHit({
+                  orgId: org.id,
+                  rawText: menuSession.queryText, // e.g. "donne biriyani"
+                  productId: chosen.productId,
+                });
+              } catch (e: any) {
+                console.warn(
+                  "[MENU_KW][selection alias hit err]",
+                  e?.message || e
+                );
+              }
+
+              // Rewrite this numeric reply into a clean order line
+              // e.g. "1 Chicken Biryani Donne – 1/2 kg"
+              const synthetic = `1 ${chosen.label}`;
+
+              text = synthetic;
+              lowerText = text.toLowerCase().trim();
+
+              // Do NOT reuse this menuSession for future numbers
+              pendingMenuSuggestions.delete(from);
+
+              console.log("[MENU_KW][selection→synthetic]", {
+                from,
+                synthetic,
+              });
+            }
+          }
+
           // LAYER 12: ingestCore (safe)
           const originalText = text; // keep raw for logs / AI / inbox
           let parserText = text; // this is what we send to ingestCore
           let result: any;
+
+          // 👇 NEW: log what we THINK we’re about to send to parser
+          console.log("[WABA][PRE_REWRITE_FOR_PARSER]", {
+            originalText,
+            parserText_initial: parserText,
+          });
 
           // --- Address update detection (override bad parse) ---
           const looksLikeAddressUpdateText =
@@ -2529,12 +2248,38 @@ waba.post("/", async (req, res) => {
               });
 
               if (rew && typeof rew.text === "string" && rew.text.trim()) {
-                parserText = rew.text.trim();
+                const candidate = rew.text.trim();
+
+                const origHasDigit = /\d/.test(originalText);
+                const rewHasDigit = /\d/.test(candidate);
+
+                // 🔒 GUARD: don't allow AI to invent a quantity
+                if (!origHasDigit && rewHasDigit) {
+                  console.log(
+                    "[WABA][REWRITE_GUARD] rejecting rewrite that adds qty",
+                    {
+                      originalText,
+                      candidate,
+                    }
+                  );
+                  parserText = originalText;
+                } else {
+                  parserText = candidate;
+                }
               }
             } catch (e: any) {
               console.warn("[WABA][REWRITER_ERR]", e?.message || e);
               // fail-soft → keep parserText = originalText
             }
+
+            // 👇 NEW: log right before calling ingestCore
+            console.log("[WABA][PRE_INGEST_CORE]", {
+              org_id: org.id,
+              from,
+              msgId,
+              originalText,
+              parserText_final: parserText,
+            });
 
             // 🔹 PHASE 1: send cleaned text into ingestCore
             result = await ingestCoreFromMessage({
@@ -2547,6 +2292,11 @@ waba.post("/", async (req, res) => {
               source: "waba",
               active_order_id: activeOrderId || undefined,
             });
+
+            console.log(
+              "[WABA][DEBUG][INGEST_RESULT_RAW]",
+              JSON.stringify(result, null, 2)
+            );
 
             console.log("[WABA][INGEST-RESULT]", {
               org_id: org.id,
@@ -3474,77 +3224,122 @@ waba.post("/", async (req, res) => {
               ? String(inquiryRaw).toLowerCase()
               : null;
 
-            // keep these in this scope so we can use them everywhere in this block
-            const menuRegex =
-              /\b(menu|price list|pricelist|rate card|ratecard|services list|service menu)\b/i;
-            const looksLikeMenu = menuRegex.test(lowerText);
+            // 👀 Debug: how we are about to route this inquiry
+            console.log("[WABA][DEBUG][INQUIRY_ROUTER]", {
+              text,
+              lowerText,
+              inquiryType,
+              resultKind: result.kind,
+              reason: result.reason,
+              inquiry: result.inquiry || result.inquiry_type,
+              inquiryCanonical: (result as any).inquiry_canonical,
+              ingestReplyPreview:
+                typeof result.reply === "string"
+                  ? result.reply.slice(0, 200)
+                  : null,
+            });
 
-            // Quick special case: delivery time questions
+            // 🛑 FAST-PATH: trust ingestCore when it did a menu keyword match
             if (
-              /deliver|delivery time|how much time.*deliver/i.test(lowerText)
+              result.reason === "menu_keyword_match" &&
+              typeof result.reply === "string" &&
+              result.reply.trim()
             ) {
-              reply =
-                "⏱️ Delivery time depends on your area and current orders. The store will confirm an approximate time.";
-            }
+              reply = result.reply; // ✅ use "Here are the closest items I found for 'donne biriyani'..."
+            } else {
+              const menuRegex =
+                /\b(menu|price list|pricelist|rate card|ratecard|services list|service menu)\b/i;
+              const looksLikeMenu = menuRegex.test(lowerText);
 
-            // (A) --- MENU FLOW ---
-            else if (inquiryType === "menu" || looksLikeMenu) {
-              const menuText = await buildMenuReply({
-                org_id: org.id,
-                text,
-                businessType: normalizeBusinessType(org.primary_business_type),
-              });
+              // 🧠 If this came from menu_keyword_match, remember the options for numeric reply
+              if (
+                result.reason === "menu_keyword_match" &&
+                Array.isArray((result as any).menu_options) &&
+                (result as any).menu_options.length > 0
+              ) {
+                const menuOptions = (result as any).menu_options as {
+                  productId: string;
+                  label: string;
+                }[];
 
-              const fallbackText =
-                menuText ||
-                "📋 Our menu / price list changes often. We’ll share the latest options with you shortly.";
+                const queryText = (result as any).menu_query_text || text; // fallback: original text like "donne biriyani"
 
-              const menuImageUrl = (org as any).wa_menu_image_url as
-                | string
-                | null;
-              const menuCaption = (org as any).wa_menu_caption as string | null;
+                pendingMenuSuggestions.set(from, {
+                  queryText,
+                  options: menuOptions,
+                });
+              }
 
-              if (menuImageUrl) {
-                // Send menu image + caption
-                await sendWabaText({
-                  phoneNumberId,
-                  to: from,
-                  orgId: org.id,
-                  image: menuImageUrl,
-                  caption: menuCaption || fallbackText,
+              // Quick special case: delivery time questions
+              if (
+                /deliver|delivery time|how much time.*deliver/i.test(lowerText)
+              ) {
+                reply =
+                  "⏱️ Delivery time depends on your area and current orders. The store will confirm an approximate time.";
+              }
+
+              // (A) --- MENU FLOW ---
+              else if (inquiryType === "menu" || looksLikeMenu) {
+                const menuText = await buildMenuReply({
+                  org_id: org.id,
+                  text,
+                  businessType: normalizeBusinessType(
+                    org.primary_business_type
+                  ),
                 });
 
-                await logFlowEvent({
-                  orgId: org.id,
-                  from,
-                  event: "menu_image_sent",
-                  msgId,
-                  text,
-                  result: {
+                const fallbackText =
+                  menuText ||
+                  "📋 Our menu / price list changes often. We’ll share the latest options with you shortly.";
+
+                const menuImageUrl = (org as any).wa_menu_image_url as
+                  | string
+                  | null;
+                const menuCaption = (org as any).wa_menu_caption as
+                  | string
+                  | null;
+
+                if (menuImageUrl) {
+                  await sendWabaText({
+                    phoneNumberId,
+                    to: from,
+                    orgId: org.id,
                     image: menuImageUrl,
                     caption: menuCaption || fallbackText,
-                  },
+                  });
+
+                  await logFlowEvent({
+                    orgId: org.id,
+                    from,
+                    event: "menu_image_sent",
+                    msgId,
+                    text,
+                    result: {
+                      image: menuImageUrl,
+                      caption: menuCaption || fallbackText,
+                    },
+                  });
+
+                  // Image already sent → no extra text reply
+                  reply = null;
+                } else {
+                  // No image configured → text-only menu
+                  reply = fallbackText;
+                }
+              }
+
+              // (B) --- SMART INQUIRY FLOW (price / availability / generic) ---
+              else {
+                reply = await buildSmartInquiryReply({
+                  org_id: org.id,
+                  text,
+                  inquiryType,
                 });
 
-                // We already replied with the image
-                reply = null;
-              } else {
-                // No image configured → text-only menu
-                reply = fallbackText;
-              }
-            }
-
-            // (B) --- SMART INQUIRY FLOW (price / availability / generic) ---
-            else {
-              reply = await buildSmartInquiryReply({
-                org_id: org.id,
-                text,
-                inquiryType,
-              });
-
-              if (!reply) {
-                reply =
-                  "💬 Got your question. We’ll confirm the details shortly.";
+                if (!reply) {
+                  reply =
+                    "💬 Got your question. We’ll confirm the details shortly.";
+                }
               }
             }
           }
@@ -3630,6 +3425,19 @@ waba.post("/", async (req, res) => {
               }
             }
           }
+          // 👀 Debug: compare ingestCore reply vs final chosen reply
+          console.log("[WABA][DEBUG][REPLY_SELECTION]", {
+            kind: result?.kind,
+            reason: result?.reason,
+            inquiry: result?.inquiry || result?.inquiry_type,
+            inquiryCanonical: (result as any)?.inquiry_canonical,
+            ingestReplyPreview:
+              typeof result?.reply === "string"
+                ? result.reply.slice(0, 200)
+                : null,
+            finalReplyPreview:
+              typeof reply === "string" ? reply.slice(0, 200) : null,
+          });
           if (reply) {
             // 👇 PAIR: customer text + reply + core result
             console.log("[FLOW][PAIR]", {

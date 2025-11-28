@@ -488,6 +488,309 @@ function buildLineItemsFromList(listLines: string[]) {
     .filter((x): x is NonNullable<typeof x> => !!x);
 }
 
+// ─────────────────────────────────────────
+// MENU-KEYWORD INTERCEPTOR (Option A)
+// Treat short, no-qty, no-question messages like "donne biriyani"
+// as a menu inquiry instead of an order.
+// ─────────────────────────────────────────
+
+function looksLikeBareMenuKeyword(text: string): boolean {
+  const t = (text || "").toLowerCase().trim();
+  if (!t) return false;
+
+  // Too long → probably a sentence, let normal pipeline handle
+  if (t.length > 60) return false;
+
+  // Has digits → likely quantity ("2 biryani", "1kg onion")
+  if (/\d/.test(t)) return false;
+
+  // Obvious question / inquiry phrasing → let inquiry flow handle it
+  if (
+    /(\?|do you have|do u have|can i get|can i have|price|rate|how much|available|availability|in stock|stock)/i.test(
+      t
+    )
+  ) {
+    return false;
+  }
+
+  // Obvious greeting / thanks → already handled elsewhere
+  if (
+    /^(hi|hello|hey|hlo|ok|okay|k|thanks|thank you|thanx|thx|sorry)$/i.test(t)
+  ) {
+    return false;
+  }
+  if (/^(gm|gn|good (morning|evening|night|afternoon))$/i.test(t)) {
+    return false;
+  }
+
+  // Keep it to a short phrase: e.g. "donne biriyani", "chicken biryani"
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length === 0 || words.length > 5) return false;
+
+  return true;
+}
+
+// How much to boost an alias hit (tuned small so scoring still matters)
+function aliasBoostFromHits(hitCount: number | null | undefined): number {
+  const c = hitCount ?? 1;
+  // grows slowly, caps at ~0.35
+  return Math.min(0.35, 0.15 + Math.log10(1 + c) * 0.1);
+}
+
+// Load alias boosts for this normalized query
+async function loadAliasBoostsForQuery(
+  orgId: string,
+  normalizedQuery: string
+): Promise<Map<string, number>> {
+  const boosts = new Map<string, number>();
+
+  try {
+    const { data, error } = await supa
+      .from("product_query_aliases")
+      .select("product_id, hit_count")
+      .eq("org_id", orgId)
+      .eq("normalized_text", normalizedQuery)
+      .limit(50);
+
+    if (error || !data) return boosts;
+
+    for (const row of data as any[]) {
+      const boost = aliasBoostFromHits(row.hit_count);
+      boosts.set(row.product_id, boost);
+    }
+  } catch (e: any) {
+    console.warn("[MENU_ALIAS][load] error", e?.message || e);
+  }
+
+  return boosts;
+}
+
+export async function recordMenuAliasHit(params: {
+  orgId: string;
+  rawText: string; // e.g. "donne biriyani"
+  productId: string; // the product they finally chose
+}) {
+  const normalized = normalizeMenuText(params.rawText);
+  if (!normalized) return;
+
+  try {
+    // 1) Upsert row (ensure it exists)
+    const { error: upsertErr } = await supa
+      .from("product_query_aliases")
+      .upsert(
+        {
+          org_id: params.orgId,
+          product_id: params.productId,
+          raw_text: params.rawText.trim(),
+          normalized_text: normalized,
+          last_used_at: new Date().toISOString(),
+        },
+        { onConflict: "org_id,normalized_text,product_id" }
+      );
+
+    if (upsertErr) {
+      console.warn("[MENU_ALIAS][upsert] error", upsertErr.message);
+      return;
+    }
+
+    // 2) Bump hit_count best-effort
+    const { error: incErr } = await supa
+      .from("product_query_aliases")
+      .update({
+        // simple increment; if you use pg-null default 1, this is fine
+        hit_count: supa.rpc
+          ? undefined // ignore this if supa.rpc typing confuses things
+          : undefined,
+      })
+      .eq("org_id", params.orgId)
+      .eq("normalized_text", normalized)
+      .eq("product_id", params.productId);
+
+    // ❗ If the `hit_count: supa.rpc...` line feels weird, simplest approach:
+    //   - Skip the increment completely for now
+    //   - Or do a raw SQL function later.
+    // To keep it super safe, you can comment out the whole block above.
+
+    if (incErr) {
+      console.warn("[MENU_ALIAS][increment] error", incErr.message);
+    }
+  } catch (e: any) {
+    console.warn("[MENU_ALIAS][record] error", e?.message || e);
+  }
+}
+
+// ─────────────────────────────
+// MENU TEXT NORMALIZATION
+// ─────────────────────────────
+function normalizeMenuText(s: string): string {
+  if (!s) return "";
+  return s
+    .toLowerCase()
+    .normalize("NFKD") // strip accents if any
+    .replace(/[^\p{Letter}\p{Number}\s]/gu, " ") // remove punctuation/dashes
+    .replace(/\s+/g, " ") // collapse spaces
+    .trim();
+}
+
+function tokenizeMenuText(s: string): string[] {
+  const norm = normalizeMenuText(s);
+  if (!norm) return [];
+  return norm.split(" ");
+}
+
+// Jaccard-like token overlap: [0,1]
+function tokenOverlapScore(
+  queryTokens: string[],
+  candTokens: string[]
+): number {
+  if (!queryTokens.length || !candTokens.length) return 0;
+
+  const qSet = new Set(queryTokens);
+  const cSet = new Set(candTokens);
+
+  let intersect = 0;
+  for (const t of qSet) {
+    if (cSet.has(t)) intersect++;
+  }
+
+  // more weight to covering the *query* tokens (user words)
+  return intersect / queryTokens.length;
+}
+
+async function tryMenuKeywordSuggestion(
+  orgId: string,
+  textFlat: string
+): Promise<{ reply: string; canonical: string } | null> {
+  if (!orgId || !textFlat) return null;
+  if (!looksLikeBareMenuKeyword(textFlat)) return null;
+
+  const labelRaw = textFlat.trim();
+  const labelNorm = normalizeMenuText(labelRaw);
+  const queryTokens = tokenizeMenuText(labelNorm);
+  if (!queryTokens.length) return null;
+
+  try {
+    const { data: products, error } = await supa
+      .from("products")
+      .select("id, canonical, display_name, variant")
+      .eq("org_id", orgId)
+      .limit(200);
+
+    if (error || !products || !products.length) return null;
+
+    // 🔹 Load alias boosts for this query (if any)
+    const aliasBoosts = await loadAliasBoostsForQuery(orgId, labelNorm);
+
+    type Candidate = {
+      productId: string;
+      name: string;
+      variant: string | null;
+      canonical: string | null;
+      score: number;
+    };
+
+    const candidates: Candidate[] = [];
+
+    for (const p of products as any[]) {
+      const namePart = String(p.display_name || p.canonical || "").trim();
+      const variantPart = (p.variant || "").toString().trim();
+      if (!namePart) continue;
+
+      const candidateFullRaw = [namePart, variantPart]
+        .filter(Boolean)
+        .join(" ");
+
+      const candidateNorm = normalizeMenuText(candidateFullRaw);
+      const candTokens = tokenizeMenuText(candidateNorm);
+
+      if (!candTokens.length) continue;
+
+      // 1) Token overlap score (how many query tokens covered)
+      const tokenScore = tokenOverlapScore(queryTokens, candTokens);
+
+      // 2) Char-level fuzzy on normalized strings
+      const fuzzyScore = fuzzyCharOverlapScore(labelNorm, candidateNorm);
+
+      // 3) Combine (weights can be tuned)
+      let score = 0.6 * tokenScore + 0.4 * fuzzyScore;
+
+      // 4) Alias boost (if user historically chose this product for this query)
+      const aliasBoost = aliasBoosts.get(p.id) || 0;
+      score += aliasBoost;
+
+      // 5) Minimal floor so we don't keep garbage
+      if (score < 0.4) continue;
+
+      // Debug if you like
+      // console.log("[MENU_KW][candidate_debug_v2]", {
+      //   label: labelRaw,
+      //   candidateFullRaw,
+      //   tokenScore,
+      //   fuzzyScore,
+      //   aliasBoost,
+      //   finalScore: score,
+      // });
+
+      candidates.push({
+        productId: p.id,
+        name: namePart,
+        variant: variantPart || null,
+        canonical: (p.canonical || null) as string | null,
+        score,
+      });
+    }
+
+    if (!candidates.length) return null;
+
+    // Sort best-first
+    candidates.sort((a, b) => b.score - a.score);
+
+    const bestScore = candidates[0].score;
+
+    // Relative cutoff: keep those close to the best
+    const kept = candidates
+      .filter((c) => c.score >= Math.max(0.4, bestScore - 0.15))
+      .slice(0, 8); // show up to 8
+
+    if (!kept.length) return null;
+
+    console.log("[MENU_KW][matches_v2]", {
+      label: labelRaw,
+      bestScore,
+      keptCount: kept.length,
+      keptPreview: kept.map((c) => ({
+        productId: c.productId,
+        name: c.name,
+        variant: c.variant,
+        score: c.score,
+      })),
+    });
+
+    const lines = kept.map((m, idx) => {
+      const variantText = m.variant ? ` – ${m.variant}` : "";
+      return `${idx + 1}) ${m.name}${variantText}`;
+    });
+
+    console.log("[MENU_KW][reply_v2]", {
+      label: labelRaw,
+      topCount: kept.length,
+      replyPreview: lines.join("\n").slice(0, 200),
+    });
+
+    const reply =
+      `Here are the closest items I found for "${labelRaw}":\n` +
+      lines.join("\n") +
+      `\n\nPlease reply with the exact item name and quantity (for example: "1 Donne Biryani half kg").`;
+
+    const canonical = kept[0].canonical || kept[0].name || labelRaw || "menu";
+
+    return { reply, canonical };
+  } catch (e: any) {
+    console.warn("[INGEST][menu_keyword_v2] error", e?.message || e);
+    return null;
+  }
+}
+
 // Fallback for single-line / inline orders when AI under-fires.
 // Example: "1kg onion and 0.5kg chicken"
 function fallbackQtyItems(text: string): IngestItem[] {
@@ -1346,38 +1649,88 @@ export async function ingestCoreFromMessage(
 
     // 🔹 Layer 0b: AI Rewriter – this is what the parser sees
     let textForOrder = baseClean;
-    try {
-      const rew = await rewriteForParser({
-        orgId,
-        phoneKey: phoneKeyForRewrite,
-        text: baseClean,
+
+    // 👇 Always log initial state
+    console.log("[INGEST][core][L0_BEFORE_REWRITE]", {
+      textRaw,
+      cleanedText: baseClean,
+      textForOrder_before: textForOrder,
+      source,
+    });
+
+    if (source === "waba") {
+      // For WABA: rewriter has already run (and been guarded) in waba.ts.
+      // Do NOT re-run rewriteForParser here to avoid double-transform + qty injection.
+      console.log("[INGEST][core][L0_SKIP_REWRITE_FOR_WABA]", {
+        textRaw,
+        cleanedText: baseClean,
       });
+    } else {
+      // For other sources (web, API, dashboard) we still allow the rewriter
+      try {
+        const rew: any = await rewriteForParser({
+          orgId,
+          phoneKey: phoneKeyForRewrite,
+          text: baseClean,
+        });
 
-      if (rew && rew.text) {
-        textForOrder = rew.text;
-      }
-
-      if (cleanStrategy !== "none") {
-        console.log("[INGEST][core][L0_PIPELINE]", {
+        console.log("[INGEST][core][L0_REWRITE_RESULT]", {
           textRaw,
           cleanedText: baseClean,
-          parserText: textForOrder,
-          removedTokens,
-          cleanStrategy,
+          rew_text: rew?.text ?? null,
+          rew_reason: rew?.reason ?? null,
+          source,
         });
-      }
-    } catch (e: any) {
-      console.warn("[INGEST][core][rewriter warn]", e?.message || e);
-      textForOrder = baseClean;
-      if (cleanStrategy !== "none") {
-        console.log("[INGEST][core][cleaner-only]", {
-          textRaw,
-          cleanedText: baseClean,
-          removedTokens,
-          cleanStrategy,
-        });
+
+        if (rew && rew.text) {
+          textForOrder = rew.text;
+        }
+
+        // Optional: keep this diagnostic for non-WABA too
+        const rawHasDigit = /\d/.test(textRaw || "");
+        const cleanHasDigit = /\d/.test(baseClean || "");
+        const orderHasDigit = /\d/.test(textForOrder || "");
+
+        if (!rawHasDigit && !cleanHasDigit && orderHasDigit) {
+          console.log("[INGEST][core][L0_REWRITE_INTRODUCED_QTY]", {
+            textRaw,
+            cleanedText: baseClean,
+            textForOrder_after: textForOrder,
+            source,
+          });
+        }
+
+        if (cleanStrategy !== "none") {
+          console.log("[INGEST][core][L0_PIPELINE]", {
+            textRaw,
+            cleanedText: baseClean,
+            parserText: textForOrder,
+            removedTokens,
+            cleanStrategy,
+          });
+        }
+      } catch (e: any) {
+        console.warn("[INGEST][core][rewriter warn]", e?.message || e);
+        textForOrder = baseClean;
+        if (cleanStrategy !== "none") {
+          console.log("[INGEST][core][cleaner-only]", {
+            textRaw,
+            cleanedText: baseClean,
+            removedTokens,
+            cleanStrategy,
+          });
+        }
       }
     }
+
+    // after the rewriter / skip block, before splitAndCleanLines
+    console.log("[INGEST][core][L0_FULL]", {
+      textRaw,
+      cleanedText: baseClean,
+      textForOrder,
+      removedTokens,
+      cleanStrategy,
+    });
 
     // 1) Line normalization and shape detection (on parser text)
     const rawLines0 = splitAndCleanLines(textForOrder);
@@ -1770,6 +2123,45 @@ export async function ingestCoreFromMessage(
         org_id: orgId,
         reason: "repeat_last_order",
         reply: "I’ve repeated your last order ✅",
+      };
+    }
+
+    // ─────────────────────────────
+    // 7b) MENU-KEYWORD INTERCEPTOR (Option A)
+    // e.g. "donne biriyani" → show variants, do NOT create order
+    // ─────────────────────────────
+    const menuKeywordHit = await tryMenuKeywordSuggestion(orgId, textFlat);
+
+    if (menuKeywordHit) {
+      console.log("[INGEST][core][menu_keyword_hit]", {
+        text: textFlat,
+        canonical: menuKeywordHit.canonical,
+      });
+      console.log("[INGEST][core][menu_keyword_hit_reply]", {
+        replyPreview: menuKeywordHit.reply?.slice(0, 120),
+      });
+
+      if (phoneKey) {
+        await markSessionOnInquiry({
+          org_id: orgId,
+          phone_key: phoneKey,
+          kind: "availability",
+          canonical: menuKeywordHit.canonical,
+          text: textRaw,
+          status: "pending",
+        });
+      }
+
+      return {
+        ok: true,
+        stored: false,
+        kind: "inquiry",
+        used: "inquiry",
+        inquiry: "availability",
+        inquiry_type: "availability",
+        inquiry_canonical: menuKeywordHit.canonical,
+        reply: menuKeywordHit.reply,
+        reason: "menu_keyword_match",
       };
     }
 
@@ -3068,8 +3460,3 @@ export async function ingestCoreFromMessage(
     };
   }
 }
-
-// ─────────────────────────────────────────
-// [INBOX] helpers: conversations + messages
-// (intentionally placed elsewhere in your codebase)
-// ─────────────────────────────────────────
