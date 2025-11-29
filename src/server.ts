@@ -17,7 +17,7 @@ import clarify from './routes/clarify';
 import { clarifyLink } from "./routes/clarifyLink";
 import suggestReply from './routes/suggestReply';
 import availability from './routes/availability';
-import waba from './routes/waba';
+import { waba } from './routes/waba';
 import { inbox } from './routes/inbox';
 import analytics from './routes/analytics';
 import path from "path"; // ⬅️ add this

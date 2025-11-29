@@ -4,8 +4,8 @@ import jwt from "jsonwebtoken";
 import axios from "axios";
 import { supa } from "../db";
 import { interpretMessage } from "../ai/interpreter";
-import { normalizePhoneForKey } from "./waba/clarifyAddress";
-import { findActiveOrderForPhone } from "./waba/clarifyAddress";
+import { normalizePhoneForKey, findActiveOrderForPhone } 
+  from "./waba/clarifyAddress";
 import { getConversationState } from "../util/conversationState";
 
 export const inbox = express.Router();

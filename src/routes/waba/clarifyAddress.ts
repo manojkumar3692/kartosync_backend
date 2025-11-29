@@ -699,7 +699,7 @@ export async function maybeHandleClarifyReply(opts: {
         .single();
 
       if (!orderErr && orderRow && Array.isArray(orderRow.items)) {
-        const { subtotal, lines } = computeOrderTotals(orderRow.items);
+        const { subtotal, lines } = await computeOrderTotals(orderRow.items);
 
         // TODO: later read from org settings; for now hard-code 60 mins
         const etaMinutes = 60;
