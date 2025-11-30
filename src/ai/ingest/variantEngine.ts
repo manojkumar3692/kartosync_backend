@@ -114,3 +114,29 @@ export function findVariantMatches(
     variants,
   }));
 }
+
+
+export function filterVariantsByKeyword(
+  variants: any[],
+  raw: string
+) {
+  const keywords = extractKeywords(raw);
+  if (!keywords.length) return [];
+
+  const out: any[] = [];
+
+  for (const v of variants) {
+    const full = normalize(
+      `${v.name || ""} ${v.variant || ""} ${v.display_name || ""}`
+    );
+
+    const score = getMatchScore(full, keywords);
+    if (score > 0) {
+      out.push({ v, score });
+    }
+  }
+
+  return out
+    .sort((a, b) => b.score - a.score)
+    .map(x => x.v);
+}

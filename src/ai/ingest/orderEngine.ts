@@ -5,7 +5,10 @@ import { loadActiveProducts, ProductRow } from "./productLoader";
 import { findCanonicalMatches } from "./textMatchEngine";
 import { setState, clearState } from "./stateManager";
 import type { IngestContext, IngestResult, ConversationState } from "./types";
-import { findVariantMatches } from "./variantEngine";
+import { filterVariantsByKeyword, findVariantMatches } from "./variantEngine";
+import { detectMetaIntent } from "./metaIntent";
+import { getAttempts, incAttempts, resetAttempts } from "./attempts";
+import { fuzzyChooseOption } from "./fuzzyOption";
 
 // temp_selected_items row
 type TempRow = {
@@ -20,42 +23,26 @@ type TempRow = {
 // Helpers
 // ─────────────────────────────────────────────
 
-function chooseBestVariant(variants: ProductRow[], raw: string): ProductRow | null {
-  const q = raw.toLowerCase().trim();
-  if (!q) return null;
+export function chooseBestVariant(variants: any[], raw: string) {
+  const matches = filterVariantsByKeyword(variants, raw);
 
-  const tokens = q.split(/\s+/).filter(t => t.length > 2);
-  if (!tokens.length) return null;
+  if (matches.length === 1) {
+    return {
+      type: "single",
+      variant: matches[0],
+    };
+  }
 
-  type Scored = { v: ProductRow; score: number };
-  const scored: Scored[] = variants.map(v => {
-    const hay = (
-      (v.display_name || "") + " " +
-      (v.variant || "") + " " +
-      (v.canonical || "")
-    ).toLowerCase();
+  if (matches.length > 1) {
+    return {
+      type: "multiple",
+      list: matches,
+    };
+  }
 
-    let score = 0;
-
-    if (hay.includes(q)) score += 3;
-
-    for (const t of tokens) {
-      if (hay.includes(t)) score += 1;
-    }
-
-    return { v: v as ProductRow, score };
-  });
-
-  const positive = scored.filter(s => s.score > 0);
-  if (!positive.length) return null;
-
-  positive.sort((a, b) => b.score - a.score);
-  const best = positive[0];
-  const second = positive[1];
-
-  if (second && best.score === second.score) return null;
-
-  return best.v;
+  return {
+    type: "none",
+  };
 }
 
 function parsePureNumber(raw: string): number | null {
@@ -69,7 +56,10 @@ function extractQty(text: string): number | null {
   return m ? parseInt(m[1], 10) : null;
 }
 
-async function getTemp(org_id: string, from_phone: string): Promise<TempRow | null> {
+async function getTemp(
+  org_id: string,
+  from_phone: string
+): Promise<TempRow | null> {
   const { data } = await supa
     .from("temp_selected_items")
     .select("*")
@@ -77,7 +67,7 @@ async function getTemp(org_id: string, from_phone: string): Promise<TempRow | nu
     .eq("customer_phone", from_phone)
     .maybeSingle();
 
-  return data as TempRow || null;
+  return (data as TempRow) || null;
 }
 
 async function saveTemp(
@@ -93,6 +83,15 @@ async function saveTemp(
   } as any);
 }
 
+function formatQuickMenu(catalog: ProductRow[]): string {
+  const lines = catalog
+    .slice(0, 8)
+    .map((c) => `• ${c.display_name || c.canonical} (${c.variant || ""})`);
+
+  if (!lines.length) return "No items available right now.";
+  return `Here are some items from today's menu:\n\n${lines.join("\n")}`;
+}
+
 // ─────────────────────────────────────────────
 // MAIN ORDER FLOW
 // ─────────────────────────────────────────────
@@ -101,9 +100,8 @@ export async function handleCatalogFlow(
   ctx: IngestContext,
   state: ConversationState
 ): Promise<IngestResult> {
-
   const { org_id, from_phone, text } = ctx;
-  const raw = (text || "").trim();
+  let raw = (text || "").trim();
 
   // 0) Load catalog
   const catalog = await loadActiveProducts(org_id);
@@ -113,6 +111,59 @@ export async function handleCatalogFlow(
       used: true,
       kind: "order",
       reply: "⚠️ No items available right now.",
+      order_id: null,
+    };
+  }
+
+  // 0.1) META INTENT (back / help / menu / greeting / agent)
+  const meta = detectMetaIntent(raw);
+
+  if (meta === "reset") {
+    await clearState(org_id, from_phone);
+    await resetAttempts(org_id, from_phone);
+    return {
+      used: true,
+      kind: "order",
+      reply:
+        "No problem 👍 Starting fresh.\nPlease type the item name or say *menu*.",
+      order_id: null,
+    };
+  }
+
+  if (meta === "greeting" && state !== "idle") {
+    return {
+      used: true,
+      kind: "order",
+      reply:
+        "You're in the middle of an order.\nReply with a number or type *back* to start again.",
+      order_id: null,
+    };
+  }
+
+  if (meta === "help") {
+    return {
+      used: true,
+      kind: "order",
+      reply:
+        "You can type an item name (e.g. *chicken biryani*), or reply with a number when you see a list.\nType *back* to restart.",
+      order_id: null,
+    };
+  }
+
+  if (meta === "menu") {
+    return {
+      used: true,
+      kind: "order",
+      reply: formatQuickMenu(catalog),
+      order_id: null,
+    };
+  }
+
+  if (meta === "agent") {
+    return {
+      used: true,
+      kind: "order",
+      reply: "A human agent will reach out shortly 😊",
       order_id: null,
     };
   }
@@ -169,6 +220,7 @@ export async function handleCatalogFlow(
       .single();
 
     await clearState(org_id, from_phone);
+    await resetAttempts(org_id, from_phone);
 
     if (error || !saved) {
       return {
@@ -197,9 +249,41 @@ export async function handleCatalogFlow(
   // ─────────────────────────────────────────────
 
   if (state === "ordering_variant") {
-    const row = await getTemp(org_id, from_phone);
+    const tmp = await getTemp(org_id, from_phone);
+    const canonical = tmp?.item?.canonical as string | undefined;
+    const narrowedList = Array.isArray(tmp?.list)
+      ? (tmp!.list as ProductRow[])
+      : null;
 
-    if (!row || !row.item || !row.item.canonical) {
+    // 0) If user replies with a NUMBER and we have a narrowed variant list,
+    //    treat it as "pick from this list"
+    if (/^\d+$/.test(raw) && narrowedList && narrowedList.length > 0) {
+      const idx = parseInt(raw, 10) - 1;
+
+      if (idx < 0 || idx >= narrowedList.length) {
+        return {
+          used: true,
+          kind: "order",
+          reply: "Invalid choice. Please send a valid number.",
+          order_id: null,
+        };
+      }
+
+      const v = narrowedList[idx];
+
+      await saveTemp(org_id, from_phone, { item: v, list: null });
+      await setState(org_id, from_phone, "ordering_qty");
+
+      return {
+        used: true,
+        kind: "order",
+        reply: `How many *${v.display_name || v.canonical} (${v.variant})*?`,
+        order_id: null,
+      };
+    }
+
+    // 1) Safety: if we somehow lost canonical, reset
+    if (!canonical) {
       await clearState(org_id, from_phone);
       return {
         used: true,
@@ -209,13 +293,12 @@ export async function handleCatalogFlow(
       };
     }
 
-    const canonical = String(row.item.canonical);
-
-    const variants = catalog.filter(
+    // 2) Get all variants for this canonical
+    const allVariants = catalog.filter(
       (p) => (p.canonical || "").trim() === canonical.trim()
     );
 
-    if (!variants.length) {
+    if (!allVariants.length) {
       await clearState(org_id, from_phone);
       return {
         used: true,
@@ -225,11 +308,11 @@ export async function handleCatalogFlow(
       };
     }
 
-    // NUMBER SELECT
+    // NUMBER SELECT INSIDE ordering_variant
     if (/^\d+$/.test(raw)) {
-      const choice = parseInt(raw, 10);
+      const idx = parseInt(raw, 10) - 1;
 
-      if (choice < 1 || choice > variants.length) {
+      if (idx < 0 || idx >= allVariants.length) {
         return {
           used: true,
           kind: "order",
@@ -238,123 +321,78 @@ export async function handleCatalogFlow(
         };
       }
 
-      const selected = variants[choice - 1];
+      const v = allVariants[idx];
 
-      await saveTemp(org_id, from_phone, { item: selected, list: null });
+      await saveTemp(org_id, from_phone, { item: v, list: null });
       await setState(org_id, from_phone, "ordering_qty");
 
       return {
         used: true,
         kind: "order",
-        reply:
-          `How many *${selected.display_name || selected.canonical} (${selected.variant})*?`,
+        reply: `How many *${v.display_name || v.canonical} (${v.variant})*?`,
         order_id: null,
       };
     }
 
-    // TEXT MATCH INSIDE VARIANT
-    const bestVariant = chooseBestVariant(variants, raw);
+    // 3) Try smart text match inside these variants (e.g. "donne", "1/2 kg")
+    const match = chooseBestVariant(allVariants, raw);
 
-    if (bestVariant) {
-      await saveTemp(org_id, from_phone, { item: bestVariant, list: null });
+    // CASE A: EXACT 1 VARIANT FOUND → AUTO-SELECT
+    if (match.type === "single") {
+      const v = match.variant;
+
+      await saveTemp(org_id, from_phone, { item: v, list: null });
       await setState(org_id, from_phone, "ordering_qty");
 
       return {
         used: true,
         kind: "order",
-        reply:
-          `How many *${bestVariant.display_name || bestVariant.canonical} (${bestVariant.variant})*?`,
+        reply: `How many *${v.display_name || v.canonical} (${v.variant})*?`,
         order_id: null,
       };
     }
 
-    // FALLBACK to new search
-    const matches = findCanonicalMatches(raw, catalog);
-
-    if (matches.length === 0) {
-      const sample = catalog
-        .slice(0, 6)
-        .map((c) => `• ${c.display_name || c.canonical} (${c.variant})`)
-        .join("\n");
-
-      return {
-        used: true,
-        kind: "order",
-        reply:
-          `I couldn't find that item.\n` +
-          (sample
-            ? `Here are some items from today's menu:\n\n${sample}\n\nPlease type the item name again.`
-            : "Please type the item name again."),
-        order_id: null,
-      };
-    }
-
-    if (matches.length === 1) {
-      const { canonical: newCanonical, variants: newVariants } = matches[0];
-
-      if (newVariants.length === 1) {
-        const item = newVariants[0];
-        await saveTemp(org_id, from_phone, { item, list: null });
-        await setState(org_id, from_phone, "ordering_qty");
-
-        return {
-          used: true,
-          kind: "order",
-          reply:
-            `How many *${item.display_name || item.canonical} (${item.variant})*?`,
-          order_id: null,
-        };
-      }
-
-      await saveTemp(org_id, from_phone, {
-        item: { canonical: newCanonical },
-        list: null,
-      });
-      await setState(org_id, from_phone, "ordering_variant");
-
-      const variantLines = newVariants
+    // CASE B: MULTIPLE MATCHES → user must choose from a narrowed list
+    if (match.type === "multiple") {
+      const lines = match.list
         .map(
-          (v, i) =>
-            `${i + 1}) ${v.display_name || v.canonical} – ${v.variant || ""}`
+          (v: ProductRow, i: number) =>
+            `${i + 1}) ${v.display_name || v.canonical} – ${v.variant}`
         )
         .join("\n");
 
+      await saveTemp(org_id, from_phone, {
+        item: { canonical },
+        list: match.list,
+      });
+
       return {
         used: true,
         kind: "order",
-        reply: `Choose a variant for *${newCanonical}*:\n${variantLines}`,
+        reply: `I found multiple *${raw}* options:\n${lines}\n\nPlease reply with the number.`,
         order_id: null,
       };
     }
 
-    // MULTIPLE CANONICALS
-    const optionsText = matches
-      .map((m, i) => `${i + 1}) ${m.canonical}`)
-      .join("\n");
-
-    await saveTemp(org_id, from_phone, {
-      list: matches.map((m) => ({ canonical: m.canonical })),
-      item: null,
-    });
-    await setState(org_id, from_phone, "ordering_item");
-
+    // CASE C: NO MATCH → stay in variant step, DO NOT fall to global search
     return {
       used: true,
       kind: "order",
       reply:
-        `I found multiple items:\n${optionsText}\n\nPlease reply with the number.`,
+        "I couldn't find that variant.\n" +
+        "Please reply with the number from the list, type the variant name again, or type *back* to start over.",
       order_id: null,
     };
   }
 
   // ─────────────────────────────────────────────
-  // 0.5 NEW VARIANT SEARCH BEFORE GLOBAL
+  // 0.5) VARIANT SEARCH IN IDLE BEFORE GLOBAL
   // ─────────────────────────────────────────────
 
   if (state === "idle") {
     const variantHits = findVariantMatches(raw, catalog);
 
-    if (variantHits.length === 1) {
+    if (variantHits && variantHits.length === 1) {
       const hit = variantHits[0];
 
       if (hit.variants.length === 1) {
@@ -367,7 +405,8 @@ export async function handleCatalogFlow(
           used: true,
           kind: "order",
           reply:
-            `How many *${item.display_name || item.canonical} (${item.variant})*?`,
+            `How many *${item.display_name || item.canonical} (` +
+            `${item.variant})*?`,
           order_id: null,
         };
       }
@@ -388,12 +427,12 @@ export async function handleCatalogFlow(
       return {
         used: true,
         kind: "order",
-        reply: `Choose a variant for *${hit.canonical}*:\n${variantLines}`,
+        reply: `Choose a variant for *${hit.canonical}*:\n${variantLines}\n\nPlease reply with the number.`,
         order_id: null,
       };
     }
 
-    if (variantHits.length > 1) {
+    if (variantHits && variantHits.length > 1) {
       const opts = variantHits
         .map((h, i) => `${i + 1}) ${h.canonical}`)
         .join("\n");
@@ -407,8 +446,7 @@ export async function handleCatalogFlow(
       return {
         used: true,
         kind: "order",
-        reply:
-          `I found multiple items:\n${opts}\n\nPlease reply with the number.`,
+        reply: `I found multiple items:\n${opts}\n\nPlease reply with the number.`,
         order_id: null,
       };
     }
@@ -419,22 +457,32 @@ export async function handleCatalogFlow(
   // ─────────────────────────────────────────────
 
   if (state === "ordering_item") {
-    const num = parsePureNumber(raw);
+    const row = await getTemp(org_id, from_phone);
+    const list = (row?.list || []) as any[];
 
-    if (num !== null) {
-      const row = await getTemp(org_id, from_phone);
-      const list = (row?.list || []) as any[];
+    if (!list || !Array.isArray(list) || list.length === 0) {
+      await clearState(org_id, from_phone);
+      return {
+        used: true,
+        kind: "order",
+        reply: "Let's start again. Please type the item name.",
+        order_id: null,
+      };
+    }
 
-      if (!list || !Array.isArray(list) || list.length === 0) {
-        await clearState(org_id, from_phone);
-        return {
-          used: true,
-          kind: "order",
-          reply: "Let's start again. Please type the item name.",
-          order_id: null,
-        };
+    let num = parsePureNumber(raw);
+
+    // 3A) TEXT → FUZZY OPTION (e.g. type "egg" instead of "2")
+    if (num === null && raw) {
+      const opts = list.map((entry: any) => entry.canonical || String(entry));
+      const idx = fuzzyChooseOption(raw, opts);
+      if (idx !== null) {
+        num = idx + 1;
       }
+    }
 
+    // If still no number → fall through to global search later
+    if (num !== null) {
       if (num < 1 || num > list.length) {
         return {
           used: true,
@@ -471,7 +519,8 @@ export async function handleCatalogFlow(
           used: true,
           kind: "order",
           reply:
-            `How many *${item.display_name || item.canonical} (${item.variant})*?`,
+            `How many *${item.display_name || item.canonical} (` +
+            `${item.variant})*?`,
           order_id: null,
         };
       }
@@ -489,23 +538,31 @@ export async function handleCatalogFlow(
       return {
         used: true,
         kind: "order",
-        reply: `Choose a variant for *${canonical}*:\n${variantLines}`,
+        reply: `Choose a variant for *${canonical}*:\n${variantLines}\n\nPlease reply with the number.`,
         order_id: null,
       };
     }
+
+    // if num is still null → fallthrough to global search below
   }
 
   // ─────────────────────────────────────────────
-  // 4) GLOBAL MATCHING (idle)
+  // 4) GLOBAL MATCHING (idle or fallback)
   // ─────────────────────────────────────────────
 
   const matches = findCanonicalMatches(raw, catalog);
 
   if (matches.length === 0) {
+    await incAttempts(org_id, from_phone);
+    const attempts = await getAttempts(org_id, from_phone);
+
     const sample = catalog
       .slice(0, 6)
       .map((c) => `• ${c.display_name || c.canonical} (${c.variant})`)
       .join("\n");
+
+    const extra =
+      attempts >= 2 ? `\n\nYou can type *back* to start again.` : "";
 
     return {
       used: true,
@@ -514,7 +571,8 @@ export async function handleCatalogFlow(
         `I couldn't find that item.\n` +
         (sample
           ? `Here are some items from today's menu:\n\n${sample}\n\nPlease type the item name again.`
-          : "Please type the item name again."),
+          : "Please type the item name again.") +
+        extra,
       order_id: null,
     };
   }
@@ -532,7 +590,8 @@ export async function handleCatalogFlow(
         used: true,
         kind: "order",
         reply:
-          `How many *${item.display_name || item.canonical} (${item.variant})*?`,
+          `How many *${item.display_name || item.canonical} (` +
+          `${item.variant})*?`,
         order_id: null,
       };
     }
@@ -550,12 +609,14 @@ export async function handleCatalogFlow(
     return {
       used: true,
       kind: "order",
-      reply: `Choose a variant for *${canonical}*:\n${variantLines}`,
+      reply: `Choose a variant for *${canonical}*:\n${variantLines}\n\nPlease reply with the number.`,
       order_id: null,
     };
   }
 
-  const optionsText = matches.map((m, i) => `${i + 1}) ${m.canonical}`).join("\n");
+  const optionsText = matches
+    .map((m, i) => `${i + 1}) ${m.canonical}`)
+    .join("\n");
 
   await saveTemp(org_id, from_phone, {
     list: matches.map((m) => ({ canonical: m.canonical })),
@@ -567,8 +628,7 @@ export async function handleCatalogFlow(
   return {
     used: true,
     kind: "order",
-    reply:
-      `I found multiple items:\n${optionsText}\n\nPlease reply with the number.`,
+    reply: `I found multiple items:\n${optionsText}\n\nPlease reply with the number.`,
     order_id: null,
   };
 }
