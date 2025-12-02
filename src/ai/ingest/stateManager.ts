@@ -15,7 +15,18 @@ const VALID_STATES: ConversationState[] = [
   "ordering_item",
   "ordering_variant",
   "ordering_qty",
-  "awaiting_address",   // 👈 add this
+  "awaiting_address",
+  "address_confirm_confirm", 
+  "awaiting_payment",
+  "confirming_order",
+  "cart_remove_item",
+  "cart_edit_item",
+  "cart_edit_qty",
+  "order_finalised",
+  "awaiting_payment_proof",
+  "status",
+  "cancel",
+  "awaiting_location_pin",
 ];
 
 function asState(s: string | null | undefined): ConversationState {
@@ -47,7 +58,7 @@ export async function setState(
   state: ConversationState
 ): Promise<void> {
   await supa
-  .from("ai_conversation_state")   
+    .from("ai_conversation_state")
     .upsert(
       {
         org_id,

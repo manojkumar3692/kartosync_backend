@@ -11,34 +11,73 @@ const PAY_ONLINE = ["online", "pay online", "link", "payment link"];
 
 type PaymentMode = "cash" | "card" | "upi" | "online";
 
-function detectModeFromWords(msg: string): PaymentMode | null {
-  const m = msg.toLowerCase();
+function detectMode(msg: string): PaymentMode | null {
+  msg = msg.toLowerCase();
 
-  if (PAY_CASH.some(k => m.includes(k))) return "cash";
-  if (PAY_CARD.some(k => m.includes(k))) return "card";
-  if (PAY_UPI.some(k => m.includes(k))) return "upi";
-  if (PAY_ONLINE.some(k => m.includes(k))) return "online";
+  if (PAY_CASH.some((k) => msg.includes(k))) return "cash";
+  if (PAY_CARD.some((k) => msg.includes(k))) return "card";
+  if (PAY_UPI.some((k) => msg.includes(k))) return "upi";
+  if (PAY_ONLINE.some((k) => msg.includes(k))) return "online";
 
   return null;
 }
 
-// Prefer numbers (1 / 2 / 3 / 4), then fall back to words
-function detectMode(msg: string): PaymentMode | null {
-  const clean = msg.trim().toLowerCase();
+// Simple ETA helper – can later read from org settings if needed
+function getEtaLabel(mode: PaymentMode): string {
+  // You can tweak per mode if you want
+  return "⏱ Estimated delivery: 30–45 minutes (depending on location).";
+}
 
-  if (clean === "1") return "cash";
-  if (clean === "2") return "online";
-  if (clean === "3") return "card";
-  if (clean === "4") return "upi";
+// Safely build order summary text + total from order.items
+function buildOrderSummary(order: any | null): { text: string; total: number | null } {
+  if (!order || !Array.isArray(order.items) || order.items.length === 0) {
+    return { text: "", total: null };
+  }
 
-  return detectModeFromWords(clean);
+  const lines: string[] = [];
+  let total = 0;
+
+  for (const it of order.items) {
+    const name = it.name || "Item";
+    const variant = it.variant ? ` (${it.variant})` : "";
+    const qty = Number(it.qty) || 0;
+    const price = Number(it.price) || 0;
+    const lineTotal = qty * price;
+
+    if (qty > 0) {
+      lines.push(`• ${name}${variant} x ${qty}${price ? ` – ${price}` : ""}`);
+    }
+
+    if (!Number.isNaN(lineTotal)) {
+      total += lineTotal;
+    }
+  }
+
+  const body = lines.join("\n");
+  return { text: body, total: Number.isFinite(total) && total > 0 ? total : null };
 }
 
 export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
   const { org_id, from_phone, text } = ctx;
-  const mode = detectMode(text);
+  const raw = (text || "").trim();
+  const msg = raw.toLowerCase();
 
-  // Invalid input → ask again
+  let mode: PaymentMode | null = null;
+
+  // 1️⃣ NUMBER FIRST (your current UI: 1 = Cash, 2 = Online)
+  if (/^[1-4]$/.test(msg)) {
+    if (msg === "1") mode = "cash";
+    else if (msg === "2") mode = "online";
+    else if (msg === "3") mode = "upi";
+    else if (msg === "4") mode = "card";
+  }
+
+  // 2️⃣ TEXT SECOND
+  if (!mode) {
+    mode = detectMode(msg);
+  }
+
+  // 3️⃣ FALLBACK → ask cleanly again
   if (!mode) {
     return {
       used: true,
@@ -46,14 +85,15 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
       reply:
         "💳 Please choose a payment method:\n" +
         "1) Cash\n" +
-        "2) Online Payment\n" +
-        "3) Card\n" +
-        "4) UPI\n\n" +
-        "You can type the number (1–4) or the method name (cash / card / upi / online).",
+        "2) Online Payment\n\n" +
+        "Or type: *cash* / *online* / *upi* / *card*.",
+      order_id: null,
     };
   }
 
-  // 1) Save preference in org_customer_profiles
+  // ─────────────────────────────────────────────
+  // 1) Save payment to customer's profile
+  // ─────────────────────────────────────────────
   await supa
     .from("org_customer_profiles")
     .upsert(
@@ -66,10 +106,13 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
       { onConflict: "org_id,customer_phone" }
     );
 
-  // 2) Attach payment mode to latest pending order via memos[]
+  // ─────────────────────────────────────────────
+  // 2) Attach payment mode to latest "pending" order
+  //    and fetch items for summary
+  // ─────────────────────────────────────────────
   const { data: order } = await supa
     .from("orders")
-    .select("id, memos")
+    .select("id, status, items")
     .eq("org_id", org_id)
     .eq("source_phone", from_phone)
     .eq("status", "pending")
@@ -77,27 +120,16 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
     .limit(1)
     .maybeSingle();
 
-  let orderId: string | null = null;
-
   if (order?.id) {
-    orderId = order.id;
-
-    const existingMemos = Array.isArray(order.memos) ? order.memos : [];
-    const newMemos = [
-      ...existingMemos,
-      {
-        kind: "payment_mode",
-        value: mode,
-        at: new Date().toISOString(),
-      },
-    ];
-
     await supa
       .from("orders")
-      .update({ memos: newMemos })
+      .update({
+        payment_mode: mode,
+      })
       .eq("id", order.id);
   }
 
+  // clear state after payment chosen
   await clearState(org_id, from_phone);
 
   const modeLabel =
@@ -109,14 +141,53 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
       ? "UPI"
       : "Online Payment";
 
+  // Build order summary (if we have an order)
+  const { text: summaryBody, total } = buildOrderSummary(order);
+  const etaLine = order ? getEtaLabel(mode) : "";
+  const totalLine =
+    order && total !== null ? `--------------------------------\nTotal: ${total}\n\n` : "\n";
+
+  let nextStepLine = "";
+  if (!order?.id) {
+    // No order found – keep old fallback
+    nextStepLine = "Payment mode saved for your next order.";
+  } else if (mode === "cash" || mode === "card") {
+    nextStepLine =
+      `${etaLine}\n` +
+      "📞 For any changes, just reply here with your message.";
+  } else if (mode === "upi" || mode === "online") {
+    nextStepLine =
+      `${etaLine}\n` +
+      "💸 You’ll receive a payment link / UPI details shortly to complete the payment.\n" +
+      "📞 For any changes, just reply here with your message.";
+  }
+
+  // If we couldn’t read items for some reason, fall back to simple text
+  if (!order?.id || !summaryBody) {
+    return {
+      used: true,
+      kind: "payment",
+      reply:
+        `💳 Payment method saved: *${modeLabel}*.\n\n` +
+        (order?.id
+          ? `Your order (#${order.id}) is now being processed.\n\n${nextStepLine}`
+          : `Payment mode saved for your next order.`),
+      order_id: order?.id || null,
+    };
+  }
+
+  // Rich confirmation
+  const reply =
+    `💳 Payment method saved: *${modeLabel}*.\n\n` +
+    `🧾 *Order Summary (#${order.id})*\n` +
+    `${summaryBody}\n` +
+    totalLine +
+    `${nextStepLine}`;
+
   return {
     used: true,
     kind: "payment",
-    reply:
-      `💳 Payment method saved: *${modeLabel}*.\n\n` +
-      (orderId
-        ? `Your order (#${orderId}) is now being processed.`
-        : `Payment mode saved for your next order.`),
-    order_id: orderId,
+    reply,
+    order_id: order.id || null,
   };
 }

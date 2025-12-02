@@ -2,8 +2,13 @@
 
 import { getState, clearState } from "./stateManager";
 import { handleCatalogFlow } from "./orderEngine";
+// ⬇️ CHANGE THIS:
 import { handleAddress } from "./addressEngine";
 import type { IngestContext, IngestResult, ConversationState } from "./types";
+import { handlePayment } from "./paymentEngine";
+import { handleStatus } from "./statusEngine";
+import { handleCancel } from "./cancelEngine";
+import { handleFinalConfirmation } from "./finalConfirmationEngine";
 
 // ORDERING FLOW STATES
 function isOrderingState(state: ConversationState): boolean {
@@ -16,6 +21,22 @@ function isOrderingState(state: ConversationState): boolean {
 
 // RESET keywords
 const RESET_WORDS = ["reset", "start again", "new order", "clear"];
+
+const STATUS_WORDS = [
+  "status",
+  "order status",
+  "track",
+  "tracking",
+  "where is my order",
+];
+
+const CANCEL_WORDS = [
+  "cancel",
+  "cancel order",
+  "dont send",
+  "don't send",
+  "cancel my order",
+];
 
 export async function ingestCoreFromMessage(
   ctx: IngestContext
@@ -39,10 +60,35 @@ export async function ingestCoreFromMessage(
     };
   }
 
-  // 3) ADDRESS WAIT STATE — MUST interrupt everything
-  if (state === "awaiting_address") {
-    console.log("[AI][INGEST] → forwarding to addressEngine");
-    return handleAddress(ctx, state);
+// 3) ADDRESS WAIT STATE — MUST interrupt everything
+if (state === "awaiting_address" || state === "awaiting_location_pin") {
+  console.log("[AI][INGEST] → forwarding to addressEngine");
+  return handleAddress(ctx, state);
+}
+
+  // 3.5 Handle Payment Feature
+  if (state === "awaiting_payment") {
+    return await handlePayment(ctx);
+  }
+
+  // 3.7 Final confirmation + cart edit states
+  if (
+    state === "confirming_order" ||
+    state === "cart_edit_item" ||
+    state === "cart_edit_qty" ||
+    state === "cart_remove_item"
+  ) {
+    return await handleFinalConfirmation(ctx, state);
+  }
+
+  // 3.8 STATUS KEYWORDS (global)
+  if (STATUS_WORDS.some((k) => lower.includes(k))) {
+    return await handleStatus(ctx);
+  }
+
+  // 3.9 CANCEL KEYWORDS (global)
+  if (CANCEL_WORDS.some((k) => lower.includes(k))) {
+    return await handleCancel(ctx);
   }
 
   // 4) ORDER FLOW STATES — ordering_item / ordering_variant / ordering_qty

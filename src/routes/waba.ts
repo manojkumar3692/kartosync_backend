@@ -247,16 +247,12 @@ waba.post("/", async (req, res) => {
 
         for (const msg of messages) {
           try {
-            if (msg.type !== "text") continue;
-
             const from = msg.from as string;
-            const text: string = (msg.text?.body || "").trim();
             const msgId = msg.id as string;
             const ts = Number(msg.timestamp || Date.now()) * 1000;
-
-            if (!text) continue;
-
-            // 🔁 Dedup per msgId
+            const msgType = msg.type as string;
+        
+            // 🔁 Dedup per msgId (do this BEFORE type filtering)
             if (seenMsgIds.has(msgId)) {
               console.log("[WABA][DEDUP] skipping already-seen msg", msgId);
               continue;
@@ -265,27 +261,56 @@ waba.post("/", async (req, res) => {
             if (seenMsgIds.size > MAX_SEEN_MSG_IDS) {
               seenMsgIds.clear();
             }
-
+        
+            // 🧩 Normalize text + location
+            let text: string = "";
+            let location_lat: number | null = null;
+            let location_lng: number | null = null;
+        
+            if (msgType === "text") {
+              text = (msg.text?.body || "").trim();
+              if (!text) {
+                // empty text – ignore
+                continue;
+              }
+            } else if (msgType === "location") {
+              text = ""; // addressEngine will use coords only
+              location_lat = msg.location?.latitude ?? null;
+              location_lng = msg.location?.longitude ?? null;
+              console.log("[WABA][LOCATION_MSG]", {
+                from,
+                msgId,
+                location_lat,
+                location_lng,
+              });
+            } else {
+              // ignore other types for now (image, audio, etc.)
+              continue;
+            }
+        
             console.log("[FLOW][INCOMING][V2]", {
               org_id: org.id,
               from,
               msgId,
               text,
+              type: msgType,
+              location_lat,
+              location_lng,
             });
-
+        
             await logInboundMessageToInbox({
               orgId: org.id,
               from,
-              text,
+              text: text || "[non-text message]",
               msgId,
             });
-
+        
             // If org has auto-reply disabled, just log and stop
             if (!org.auto_reply_enabled) {
               console.log("[WABA] auto_reply disabled for org", org.id);
               continue;
             }
-
+        
             // 🧠 Single call into your AI / order brain
             const result = await ingestCoreFromMessage({
               org_id: org.id,
@@ -295,8 +320,10 @@ waba.post("/", async (req, res) => {
               from_name: null,
               msg_id: msgId,
               source: "waba",
+              location_lat,
+              location_lng,
             });
-
+        
             console.log("[WABA][INGEST_RESULT][V2]", {
               org_id: org.id,
               from,
@@ -306,13 +333,12 @@ waba.post("/", async (req, res) => {
               order_id: result?.order_id,
               stored: result?.stored,
             });
-
-            // If `ingestCoreFromMessage` gave us a reply, send it
+        
             const reply =
               typeof result?.reply === "string" && result.reply.trim()
                 ? result.reply.trim()
                 : null;
-
+        
             if (reply) {
               await sendWabaText({
                 phoneNumberId,
@@ -320,7 +346,7 @@ waba.post("/", async (req, res) => {
                 orgId: org.id,
                 text: reply,
               });
-
+        
               console.log("[WABA][AUTO_REPLY][V2]", {
                 org_id: org.id,
                 from,
@@ -330,7 +356,6 @@ waba.post("/", async (req, res) => {
             }
           } catch (msgErr: any) {
             console.error("[WABA][MSG_ERR]", msgErr?.message || msgErr);
-            // swallow per-message error so others still process
           }
         }
       }

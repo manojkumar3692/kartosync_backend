@@ -2,7 +2,7 @@
 // Thin wrapper so existing code (waba, local ingest) still calls the same name,
 // but the logic is now in src/ai/ingest.
 
-import type { IngestInput as LegacyIngestInput } from "../types"; // your existing global type
+import type { IngestInput as LegacyIngestInput } from "../ai/ingest/types"; // your existing global type
 import { ingestCoreFromMessage as aiIngestCore } from "../ai/ingest";
 import type { IngestContext, IngestResult as AiIngestResult } from "../ai/ingest/types";
 // src/ai/ingestCore.ts  (or wherever your helpers live)
@@ -63,6 +63,8 @@ function mapToContext(input: LegacyIngestInput): IngestContext {
     text: input.text,
     ts: input.ts || Date.now(),
     source: (input.source as any) || "waba",
+    location_lat: input.location_lat ?? null,
+    location_lng: input.location_lng ?? null,
   };
 }
 

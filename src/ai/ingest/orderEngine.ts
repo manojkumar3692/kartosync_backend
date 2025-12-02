@@ -17,6 +17,7 @@ type TempRow = {
   item: any | null;
   list: any[] | null;
   updated_at?: string;
+  cart?: any[] | null;  // 🆕 full cart before final confirmation
 };
 
 // ─────────────────────────────────────────────
@@ -75,18 +76,28 @@ async function saveTemp(
   from_phone: string,
   payload: Partial<TempRow>
 ): Promise<void> {
-  await supa.from("temp_selected_items").upsert({
-    org_id,
-    customer_phone: from_phone,
-    updated_at: new Date().toISOString(),
-    ...payload,
-  } as any);
+  const { error } = await supa
+    .from("temp_selected_items")
+    .upsert({
+      org_id,
+      customer_phone: from_phone,
+      updated_at: new Date().toISOString(),
+      ...payload,
+    } as any);
+
+  if (error) {
+    console.error("[TEMP][UPSERT][ERROR]", {
+      org_id,
+      from_phone,
+      error,
+    });
+  }
 }
 
 function formatQuickMenu(catalog: ProductRow[]): string {
   const lines = catalog
     .slice(0, 8)
-    .map((c) => `• ${c.display_name || c.canonical} (${c.variant || ""})`);
+    .map((c) => `• ${c.display_name || c.canonical} (${c.variant || ""}) - ${c.price_per_unit}`);
 
   if (!lines.length) return "No items available right now.";
   return `Here are some items from today's menu:\n\n${lines.join("\n")}`;
@@ -169,7 +180,7 @@ export async function handleCatalogFlow(
   }
 
   // ─────────────────────────────────────────────
-  // 1) QUANTITY STEP
+  // 1) QUANTITY STEP  → add to CART (no DB yet)
   // ─────────────────────────────────────────────
 
   if (state === "ordering_qty") {
@@ -196,51 +207,64 @@ export async function handleCatalogFlow(
 
     const item: ProductRow = row.item as ProductRow;
 
-    const order = {
-      org_id,
-      source_phone: from_phone,
-      raw_text: ctx.text || "",
-      items: [
-        {
-          product_id: item.id,
-          name: item.display_name || item.canonical,
-          variant: item.variant,
-          qty,
-          price: item.price_per_unit,
-        },
-      ],
-      status: "pending",
-      created_at: new Date().toISOString(),
+    // 🧺 Build line item
+    const lineItem = {
+      product_id: item.id,
+      name: item.display_name || item.canonical,
+      variant: item.variant,
+      qty,
+      price: item.price_per_unit,
     };
 
-    const { data: saved, error } = await supa
-      .from("orders")
-      .insert(order as any)
-      .select("id")
-      .single();
+    // 🧺 Merge into cart
+    const existingCart = Array.isArray(row.cart) ? row.cart : [];
+    const newCart = [...existingCart, lineItem];
 
-    await clearState(org_id, from_phone);
+    await saveTemp(org_id, from_phone, {
+      cart: newCart,
+      item: null,
+      list: null,
+    });
+
+    // Move to confirming_order (final confirmation engine)
+    await setState(org_id, from_phone, "confirming_order");
     await resetAttempts(org_id, from_phone);
 
-    if (error || !saved) {
-      return {
-        used: true,
-        kind: "order",
-        order_id: null,
-        reply: "⚠️ Error saving your order. Please try again.",
-      };
-    }
+    // Build cart summary text
+    const lines = newCart.map((li, idx) => {
+      const lineTotal =
+        typeof li.price === "number" ? li.price * li.qty : undefined;
+      const pricePart =
+        lineTotal != null ? ` – ${lineTotal}` : li.price ? ` – ${li.price}` : "";
+      return `${idx + 1}) ${li.name}${li.variant ? ` (${li.variant})` : ""} x ${
+        li.qty
+      }${pricePart}`;
+    });
 
-    await setState(org_id, from_phone, "awaiting_address");
+    const total = newCart.reduce((sum, li: any) => {
+      if (typeof li.price === "number" && typeof li.qty === "number") {
+        return sum + li.price * li.qty;
+      }
+      return sum;
+    }, 0);
+
+    const totalLine = total > 0 ? `\n\n💰 Total: ${total}` : "";
 
     return {
       used: true,
       kind: "order",
-      order_id: saved.id,
+      order_id: null,
       reply:
-        `✅ Order created!\n` +
-        `• ${item.canonical} (${item.variant}) x ${qty}\n\n` +
-        `📍 Please send your delivery address.`,
+        "🧺 Your cart:\n" +
+        lines.join("\n") +
+        totalLine +
+        "\n\n" +
+        "1) Confirm order\n" +
+        "2) Add another item\n" +
+        "3) Change quantity\n" +
+        "4) Remove an item\n" +
+        "5) Cancel\n\n" +
+        "Please reply with the number.",
     };
   }
 
@@ -355,11 +379,11 @@ export async function handleCatalogFlow(
     // CASE B: MULTIPLE MATCHES → user must choose from a narrowed list
     if (match.type === "multiple") {
       const lines = match.list
-        .map(
-          (v: ProductRow, i: number) =>
-            `${i + 1}) ${v.display_name || v.canonical} – ${v.variant}`
-        )
-        .join("\n");
+      .map((v: ProductRow, i: number) => {
+        const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
+        return `${i + 1}) ${v.display_name || v.canonical} – ${v.variant}${price}`;
+      })
+      .join("\n");
 
       await saveTemp(org_id, from_phone, {
         item: { canonical },
@@ -418,11 +442,11 @@ export async function handleCatalogFlow(
       await setState(org_id, from_phone, "ordering_variant");
 
       const variantLines = hit.variants
-        .map(
-          (v, i) =>
-            `${i + 1}) ${v.display_name || v.canonical} – ${v.variant || ""}`
-        )
-        .join("\n");
+      .map((v, i) => {
+        const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
+        return `${i + 1}) ${v.display_name || v.canonical} – ${v.variant || ""}${price}`;
+      })
+      .join("\n");
 
       return {
         used: true,
@@ -529,11 +553,11 @@ export async function handleCatalogFlow(
       await setState(org_id, from_phone, "ordering_variant");
 
       const variantLines = variants
-        .map(
-          (v, i) =>
-            `${i + 1}) ${v.display_name || v.canonical} – ${v.variant || ""}`
-        )
-        .join("\n");
+      .map((v, i) => {
+        const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
+        return `${i + 1}) ${v.display_name || v.canonical} – ${v.variant || ""}${price}`;
+      })
+      .join("\n");
 
       return {
         used: true,
@@ -557,9 +581,14 @@ export async function handleCatalogFlow(
     const attempts = await getAttempts(org_id, from_phone);
 
     const sample = catalog
-      .slice(0, 6)
-      .map((c) => `• ${c.display_name || c.canonical} (${c.variant})`)
-      .join("\n");
+    .slice(0, 6)
+    .map((c) => {
+      const label = c.display_name || c.canonical;
+      const variant = c.variant ? ` (${c.variant})` : "";
+      const price = c.price_per_unit ? ` – ${c.price_per_unit}` : "";
+      return `• ${label}${variant}${price}`;
+    })
+    .join("\n");
 
     const extra =
       attempts >= 2 ? `\n\nYou can type *back* to start again.` : "";
@@ -600,11 +629,11 @@ export async function handleCatalogFlow(
     await setState(org_id, from_phone, "ordering_variant");
 
     const variantLines = variants
-      .map(
-        (v, i) =>
-          `${i + 1}) ${v.display_name || v.canonical} – ${v.variant || ""}`
-      )
-      .join("\n");
+    .map((v, i) => {
+      const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
+      return `${i + 1}) ${v.display_name || v.canonical} – ${v.variant || ""}${price}`;
+    })
+    .join("\n");
 
     return {
       used: true,
@@ -615,8 +644,14 @@ export async function handleCatalogFlow(
   }
 
   const optionsText = matches
-    .map((m, i) => `${i + 1}) ${m.canonical}`)
-    .join("\n");
+  .map((m, i) => {
+    const firstWithPrice = m.variants.find((v) => v.price_per_unit);
+    const priceStr = firstWithPrice?.price_per_unit
+      ? ` – from ${firstWithPrice.price_per_unit}`
+      : "";
+    return `${i + 1}) ${m.canonical}${priceStr}`;
+  })
+  .join("\n");
 
   await saveTemp(org_id, from_phone, {
     list: matches.map((m) => ({ canonical: m.canonical })),
