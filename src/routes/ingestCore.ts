@@ -5,7 +5,6 @@
 import type { IngestInput as LegacyIngestInput } from "../ai/ingest/types"; // your existing global type
 import { ingestCoreFromMessage as aiIngestCore } from "../ai/ingest";
 import type { IngestContext, IngestResult as AiIngestResult } from "../ai/ingest/types";
-// src/ai/ingestCore.ts  (or wherever your helpers live)
 
 import { supa } from "../db";
 
@@ -13,6 +12,7 @@ import { supa } from "../db";
 export async function computeOrderTotals(items: any[]) {
   const outLines: string[] = [];
   let subtotal = 0;
+
 
   for (const it of items || []) {
     if (!it) continue;
@@ -40,12 +40,9 @@ export async function computeOrderTotals(items: any[]) {
     const lineTotal = price * qty;
     subtotal += lineTotal;
 
-    const prettyPrice =
-      price > 0 ? ` — ₹${Math.round(lineTotal)}` : "";
+    const prettyPrice = price > 0 ? ` — ₹${Math.round(lineTotal)}` : "";
 
-    outLines.push(
-      `* ${qty} ${canonical}${brand}${variant}${prettyPrice}`
-    );
+    outLines.push(`* ${qty} ${canonical}${brand}${variant}${prettyPrice}`);
   }
 
   return {
@@ -75,16 +72,16 @@ export async function ingestCoreFromMessage(
   const ctx = mapToContext(input);
   const res: AiIngestResult = await aiIngestCore(ctx);
 
-  // For now, just pass through the new result shape.
-  // waba.ts only reads: kind, reason?, order_id?, stored?, reply?
+  // Pass through the new result shape in the legacy format
   return {
     ok: true,
-    stored: typeof res.order_id === "number",
+    stored: Boolean(res.order_id),          // ✅ works for UUIDs/string IDs as well
     kind: res.kind,
     used: res.used ? "ai" : "none",
     reply: res.reply ?? null,
     order_id: res.order_id ?? null,
     items: (res as any).items ?? null,
     org_id: ctx.org_id,
+    reason: (res as any).reason ?? undefined,
   };
 }

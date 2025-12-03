@@ -4,6 +4,7 @@ import { supa } from "../../db";
 import type { IngestContext, IngestResult, ConversationState } from "./types";
 import { setState, clearState } from "./stateManager";
 
+
 type CartLine = {
   product_id: string | number;
   name: string;
@@ -24,6 +25,7 @@ type TempRow = {
 // ─────────────────────────────────────────────
 // DB helpers (local copy, same table as orderEngine)
 // ─────────────────────────────────────────────
+
 
 async function getTemp(
   org_id: string,

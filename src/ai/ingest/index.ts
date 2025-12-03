@@ -2,13 +2,16 @@
 
 import { getState, clearState } from "./stateManager";
 import { handleCatalogFlow } from "./orderEngine";
-// ⬇️ CHANGE THIS:
 import { handleAddress } from "./addressEngine";
 import type { IngestContext, IngestResult, ConversationState } from "./types";
 import { handlePayment } from "./paymentEngine";
 import { handleStatus } from "./statusEngine";
 import { handleCancel } from "./cancelEngine";
 import { handleFinalConfirmation } from "./finalConfirmationEngine";
+
+// 🆕 Generic intent engine + vertical helper
+import { parseIntent, type Vertical } from "./intentEngine";
+import { supa } from "../../db";
 
 // ORDERING FLOW STATES
 function isOrderingState(state: ConversationState): boolean {
@@ -38,6 +41,24 @@ const CANCEL_WORDS = [
   "cancel my order",
 ];
 
+// 🆕 Helper: map org.business_type → vertical
+async function getOrgVertical(org_id: string): Promise<Vertical> {
+  const { data } = await supa
+    .from("orgs")
+    .select("business_type")
+    .eq("id", org_id)
+    .maybeSingle();
+
+  const t = (data?.business_type || "").toLowerCase();
+
+  if (t.includes("restaurant") || t.includes("cloud_kitchen")) return "restaurant";
+  if (t.includes("grocery") || t.includes("supermarket")) return "grocery";
+  if (t.includes("salon") || t.includes("spa")) return "salon";
+  if (t.includes("pharmacy") || t.includes("medical")) return "pharmacy";
+
+  return "generic";
+}
+
 export async function ingestCoreFromMessage(
   ctx: IngestContext
 ): Promise<IngestResult> {
@@ -60,11 +81,11 @@ export async function ingestCoreFromMessage(
     };
   }
 
-// 3) ADDRESS WAIT STATE — MUST interrupt everything
-if (state === "awaiting_address" || state === "awaiting_location_pin") {
-  console.log("[AI][INGEST] → forwarding to addressEngine");
-  return handleAddress(ctx, state);
-}
+  // 3) ADDRESS WAIT STATE — MUST interrupt everything
+  if (state === "awaiting_address" || state === "awaiting_location_pin") {
+    console.log("[AI][INGEST] → forwarding to addressEngine");
+    return handleAddress(ctx, state);
+  }
 
   // 3.5 Handle Payment Feature
   if (state === "awaiting_payment") {
@@ -94,6 +115,21 @@ if (state === "awaiting_address" || state === "awaiting_location_pin") {
   // 4) ORDER FLOW STATES — ordering_item / ordering_variant / ordering_qty
   if (isOrderingState(state)) {
     console.log("[AI][INGEST] → inside ordering flow");
+
+    // 🆕: parse intent (for logging / future use)
+    try {
+      const vertical = await getOrgVertical(org_id);
+      const intent = await parseIntent(raw, { vertical, state });
+      console.log("[AI][INGEST][INTENT][ORDERING]", {
+        vertical,
+        state,
+        intent,
+      });
+    } catch (e) {
+      console.log("[AI][INGEST][INTENT][ORDERING][ERROR]", (e as Error).message);
+    }
+
+    // Behaviour unchanged: still route to catalog flow with state
     return handleCatalogFlow(ctx, state);
   }
 
@@ -127,6 +163,20 @@ if (state === "awaiting_address" || state === "awaiting_location_pin") {
   }
 
   // 6) EVERYTHING ELSE → go to order engine
-  console.log("[AI][INGEST] → idle → catalogFlow");
-  return handleCatalogFlow(ctx, "idle");
+  console.log("[AI][INGEST] → idle → intent + catalogFlow");
+
+  // 🆕: parse intent also in idle, but only for logging right now
+  try {
+    const vertical = await getOrgVertical(org_id);
+    const intent = await parseIntent(raw, { vertical, state });
+    console.log("[AI][INGEST][INTENT][IDLE]", {
+      vertical,
+      state,
+      intent,
+    });
+  } catch (e) {
+    console.log("[AI][INGEST][INTENT][IDLE][ERROR]", (e as Error).message);
+  }
+
+  return handleCatalogFlow(ctx, "idle"); 
 }

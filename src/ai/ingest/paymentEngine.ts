@@ -35,7 +35,7 @@ function buildOrderSummary(order: any | null): { text: string; total: number | n
   }
 
   const lines: string[] = [];
-  let total = 0;
+  let subtotal = 0;
 
   for (const it of order.items) {
     const name = it.name || "Item";
@@ -45,16 +45,34 @@ function buildOrderSummary(order: any | null): { text: string; total: number | n
     const lineTotal = qty * price;
 
     if (qty > 0) {
-      lines.push(`• ${name}${variant} x ${qty}${price ? ` – ${price}` : ""}`);
+      lines.push(
+        `• ${name}${variant} x ${qty}${price ? ` — ₹${lineTotal}` : ""}`
+      );
     }
 
     if (!Number.isNaN(lineTotal)) {
-      total += lineTotal;
+      subtotal += lineTotal;
     }
   }
 
-  const body = lines.join("\n");
-  return { text: body, total: Number.isFinite(total) && total > 0 ? total : null };
+  const deliveryFee = Number(order.delivery_fee ?? 0);
+  const grandTotal = subtotal + (deliveryFee > 0 ? deliveryFee : 0);
+
+  const feeLine =
+    deliveryFee > 0
+      ? `Delivery Fee: ₹${deliveryFee}`
+      : deliveryFee === 0
+      ? `Delivery Fee: FREE`
+      : `Delivery Fee: will be confirmed`;
+
+  const body =
+    lines.join("\n") +
+    `\n\nSubtotal: ₹${subtotal}` +
+    `\n${feeLine}` +
+    `\n——————————\n` +
+    `*Total Payable: ₹${grandTotal}*`;
+
+  return { text: body, total: grandTotal };
 }
 
 export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
@@ -112,7 +130,7 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
   // ─────────────────────────────────────────────
   const { data: order } = await supa
     .from("orders")
-    .select("id, status, items")
+    .select("id, status, items, total_amount, delivery_fee, delivery_distance_km, delivery_type")
     .eq("org_id", org_id)
     .eq("source_phone", from_phone)
     .eq("status", "pending")
@@ -164,16 +182,24 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
 
   // If we couldn’t read items for some reason, fall back to simple text
   if (!order?.id || !summaryBody) {
-    return {
-      used: true,
-      kind: "payment",
-      reply:
-        `💳 Payment method saved: *${modeLabel}*.\n\n` +
-        (order?.id
-          ? `Your order (#${order.id}) is now being processed.\n\n${nextStepLine}`
-          : `Payment mode saved for your next order.`),
-      order_id: order?.id || null,
-    };
+    const safeSummary =
+    order?.id && summaryBody
+      ? buildOrderSummary(order)
+      : null;
+
+  return {
+    used: true,
+    kind: "payment",
+    reply:
+      `💳 Payment method saved: *${modeLabel}*.\n\n` +
+      (safeSummary
+        ? safeSummary +
+          `\n\n${nextStepLine}`
+        : order?.id
+        ? `Your order (#${order.id}) is now being processed.\n\n${nextStepLine}`
+        : `Payment mode saved for your next order.`),
+    order_id: order?.id || null,
+  };
   }
 
   // Rich confirmation

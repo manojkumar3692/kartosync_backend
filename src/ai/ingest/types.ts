@@ -16,7 +16,8 @@ export type ConversationState =
   | "awaiting_payment"
   | "status"
   | "cancel"
-  | "awaiting_location_pin";
+  | "awaiting_location_pin"
+  | "building_order"
 
 
   // make sure address is in Intent union
