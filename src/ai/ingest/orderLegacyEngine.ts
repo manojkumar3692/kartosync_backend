@@ -109,6 +109,36 @@ function formatQuickMenu(catalog: ProductRow[]): string {
 }
 
 // ─────────────────────────────────────────────
+// 🆕 Helpers for "item 1 of 3" prefix
+// ─────────────────────────────────────────────
+
+function toOrdinal(n: number): string {
+  const s = ["th", "st", "nd", "rd"];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+function buildItemPrefix(row: TempRow | null): string {
+  const queue = row?.multi_item_queue as any[] | undefined;
+  const idx =
+    typeof row?.current_item_index === "number"
+      ? row.current_item_index!
+      : null;
+
+  if (!queue || queue.length === 0 || idx === null) return "";
+
+  const safeIdx = Math.min(Math.max(idx, 0), queue.length - 1);
+  const entry: any = queue[safeIdx] || {};
+  const total = queue.length;
+  const label: string = (entry.raw || entry.name || "").toString().trim() || "";
+
+  if (!label) return "";
+
+  const ord = toOrdinal(safeIdx + 1);
+  return `For your ${ord} item (${safeIdx + 1} of ${total}) – *${label}*:\n`;
+}
+
+// ─────────────────────────────────────────────
 // MAIN ORDER FLOW
 // ─────────────────────────────────────────────
 
@@ -197,10 +227,21 @@ export async function handleCatalogFallbackFlow(
     state === "idle"
   ) {
     // intentEngine usually gives: { itemText, quantity }
-    const queue = ctx.intent.lines.map((l: any) => ({
-      name: l.itemText ?? l.name,
-      qty: l.quantity ?? l.qty ?? 1,
-    }));
+    const queue = ctx.intent.lines.map((l: any) => {
+      // 🆕 keep original line text (with "donne" etc.)
+      const rawLine = (l.rawText || l.line || l.itemText || l.name || "")
+        .toString()
+        .trim();
+
+      const name = (l.itemText || l.name || "").toString().trim() || rawLine;
+      const qty = l.quantity ?? l.qty ?? 1;
+
+      return {
+        raw: rawLine || name, // used later for variant hint + prefix
+        name,
+        qty,
+      };
+    });
 
     // store queue in temp_selected_items
     await saveTemp(org_id, from_phone, {
@@ -275,10 +316,102 @@ export async function handleCatalogFallbackFlow(
 
       // if more items exist → move to next item
       if (nextIndex < tmpRow.multi_item_queue.length) {
-        const nextItem = tmpRow.multi_item_queue[nextIndex];
+        const queue = tmpRow.multi_item_queue as any[];
+        const nextItem = queue[nextIndex];
 
+        // move pointer to next item and clear any old selection
         await saveTemp(org_id, from_phone, {
           current_item_index: nextIndex,
+          item: null,
+          list: null,
+        });
+
+        // build "For your 2nd item (2 of 3) – *1 egg biryani*:"
+        const rowForPrefix = await getTemp(org_id, from_phone);
+        const itemPrefix = buildItemPrefix(rowForPrefix);
+
+        const nextName = nextItem.name;
+        const matches = findCanonicalMatches(nextName, catalog);
+
+        // 🔸 Case 0: we couldn't match even from catalog → ask name once
+        if (matches.length === 0) {
+          await setState(org_id, from_phone, "ordering_item");
+
+          return {
+            used: true,
+            kind: "order",
+            order_id: null,
+            reply:
+              itemPrefix +
+              `I couldn't find *${nextName}* in today's menu.\n` +
+              `You can type a different item name, or send *skip* if you don't want this item..`,
+          };
+        }
+
+        // 🔸 Case 1: exactly one canonical match
+        if (matches.length === 1) {
+          const { canonical, variants } = matches[0];
+
+          // 1a) exactly one variant → go straight to qty
+          if (variants.length === 1) {
+            const item2 = variants[0];
+
+            await saveTemp(org_id, from_phone, { item: item2, list: null });
+            await setState(org_id, from_phone, "ordering_qty");
+
+            return {
+              used: true,
+              kind: "order",
+              order_id: null,
+              reply:
+                itemPrefix +
+                `How many *${item2.display_name || item2.canonical} (` +
+                `${item2.variant})*?`,
+            };
+          }
+
+          // 1b) multiple variants → show variant list
+          await saveTemp(org_id, from_phone, {
+            item: { canonical },
+            list: null,
+          });
+          await setState(org_id, from_phone, "ordering_variant");
+
+          const variantLines = variants
+            .map((v, i) => {
+              const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
+              return `${i + 1}) ${v.display_name || v.canonical} – ${
+                v.variant || ""
+              }${price}`;
+            })
+            .join("\n");
+
+          return {
+            used: true,
+            kind: "order",
+            order_id: null,
+            reply:
+              itemPrefix +
+              `Choose a variant for *${canonical}*:\n${variantLines}\n\nPlease reply with the number.`,
+          };
+        }
+
+        // 🔸 Case 2: multiple canonicals (rare, but possible)
+        const optionsText = matches
+          .map((m, i) => {
+            const firstWithPrice = m.variants.find(
+              (v: any) => v.price_per_unit
+            );
+            const priceStr = firstWithPrice?.price_per_unit
+              ? ` – from ${firstWithPrice.price_per_unit}`
+              : "";
+            return `${i + 1}) ${m.canonical}${priceStr}`;
+          })
+          .join("\n");
+
+        await saveTemp(org_id, from_phone, {
+          list: matches.map((m) => ({ canonical: m.canonical })),
+          item: null,
         });
 
         await setState(org_id, from_phone, "ordering_item");
@@ -288,8 +421,8 @@ export async function handleCatalogFallbackFlow(
           kind: "order",
           order_id: null,
           reply:
-            `Next item: *${nextItem.qty} ${nextItem.name}*` +
-            `\nPlease type the item name (e.g. *${nextItem.name}*).`,
+            itemPrefix +
+            `I found multiple items:\n${optionsText}\n\nPlease reply with the number.`,
         };
       }
     }
@@ -351,6 +484,24 @@ export async function handleCatalogFallbackFlow(
       ? (tmp!.list as ProductRow[])
       : null;
 
+    // 🆕 Build prefix: "For your 1st item (1 of 3) – *1 chicken biryani donne*:"
+    const itemPrefix = buildItemPrefix(tmp);
+
+    // 🆕 Try to use original queue line as hint (e.g. "1 chicken biryani donne")
+    let variantHint = raw;
+    if (
+      tmp?.multi_item_queue &&
+      typeof tmp.current_item_index === "number" &&
+      tmp.current_item_index >= 0 &&
+      tmp.current_item_index < tmp.multi_item_queue.length
+    ) {
+      const entry: any = tmp.multi_item_queue[tmp.current_item_index];
+      const fromQueue = (entry.raw || entry.name || "").toString().trim();
+      if (fromQueue) {
+        variantHint = fromQueue;
+      }
+    }
+
     // 0) If user replies with a NUMBER and we have a narrowed variant list,
     //    treat it as "pick from this list"
     if (/^\d+$/.test(raw) && narrowedList && narrowedList.length > 0) {
@@ -373,7 +524,9 @@ export async function handleCatalogFallbackFlow(
       return {
         used: true,
         kind: "order",
-        reply: `How many *${v.display_name || v.canonical} (${v.variant})*?`,
+        reply: `${itemPrefix}How many *${v.display_name || v.canonical} (${
+          v.variant
+        })*?`,
         order_id: null,
       };
     }
@@ -425,13 +578,15 @@ export async function handleCatalogFallbackFlow(
       return {
         used: true,
         kind: "order",
-        reply: `How many *${v.display_name || v.canonical} (${v.variant})*?`,
+        reply: `${itemPrefix}How many *${v.display_name || v.canonical} (${
+          v.variant
+        })*?`,
         order_id: null,
       };
     }
 
     // 3) Try smart text match inside these variants (e.g. "donne", "1/2 kg")
-    const match = chooseBestVariant(allVariants, raw);
+    const match = chooseBestVariant(allVariants, variantHint);
 
     // CASE A: EXACT 1 VARIANT FOUND → AUTO-SELECT
     if (match.type === "single") {
@@ -443,7 +598,9 @@ export async function handleCatalogFallbackFlow(
       return {
         used: true,
         kind: "order",
-        reply: `How many *${v.display_name || v.canonical} (${v.variant})*?`,
+        reply: `${itemPrefix}How many *${v.display_name || v.canonical} (${
+          v.variant
+        })*?`,
         order_id: null,
       };
     }
@@ -467,7 +624,9 @@ export async function handleCatalogFallbackFlow(
       return {
         used: true,
         kind: "order",
-        reply: `I found multiple *${raw}* options:\n${lines}\n\nPlease reply with the number.`,
+        reply:
+          `${itemPrefix}I found multiple options:\n` +
+          `${lines}\n\nPlease reply with the number.`,
         order_id: null,
       };
     }
@@ -477,7 +636,7 @@ export async function handleCatalogFallbackFlow(
       used: true,
       kind: "order",
       reply:
-        "I couldn't find that variant.\n" +
+        `${itemPrefix}I couldn't find that variant.\n` +
         "Please reply with the number from the list, type the variant name again, or type *back* to start over.",
       order_id: null,
     };
@@ -543,10 +702,16 @@ export async function handleCatalogFallbackFlow(
       });
       await setState(org_id, from_phone, "ordering_item");
 
-      return {
+    // 🆕 prefix "For your 1st item (1 of 3)…"
+    const rowForContext = await getTemp(org_id, from_phone);
+    const itemPrefix = buildItemPrefix(rowForContext);
+
+    return {
         used: true,
         kind: "order",
-        reply: `I found multiple items:\n${opts}\n\nPlease reply with the number.`,
+        reply:
+          itemPrefix +
+          `I found multiple items:\n${opts}\n\nPlease reply with the number.`,
         order_id: null,
       };
     }
@@ -555,6 +720,10 @@ export async function handleCatalogFallbackFlow(
   // ─────────────────────────────────────────────
   // 3) ITEM CHOICE STEP
   // ─────────────────────────────────────────────
+
+  const rowForContext = await getTemp(org_id, from_phone);
+
+  const itemPrefix = buildItemPrefix(rowForContext);
 
   if (state === "ordering_item") {
     const row = await getTemp(org_id, from_phone);
@@ -645,7 +814,9 @@ export async function handleCatalogFallbackFlow(
       return {
         used: true,
         kind: "order",
-        reply: `Choose a variant for *${canonical}*:\n${variantLines}\n\nPlease reply with the number.`,
+        reply:
+          itemPrefix +
+          `Choose a variant for *${canonical}*:\n${variantLines}\n\nPlease reply with the number.`,
         order_id: null,
       };
     }
@@ -774,6 +945,7 @@ export async function handleCatalogFallbackFlow(
       used: true,
       kind: "order",
       reply:
+        itemPrefix +
         `I couldn't find that item.\n` +
         (sample
           ? `Here are some items from today's menu:\n\n${sample}\n\nPlease type the item name again.`
@@ -796,6 +968,7 @@ export async function handleCatalogFallbackFlow(
         used: true,
         kind: "order",
         reply:
+          itemPrefix +
           `How many *${item.display_name || item.canonical} (` +
           `${item.variant})*?`,
         order_id: null,
@@ -842,7 +1015,9 @@ export async function handleCatalogFallbackFlow(
   return {
     used: true,
     kind: "order",
-    reply: `I found multiple items:\n${optionsText}\n\nPlease reply with the number.`,
+    reply:
+      itemPrefix +
+      `I found multiple items:\n${optionsText}\n\nPlease reply with the number.`,
     order_id: null,
   };
 }

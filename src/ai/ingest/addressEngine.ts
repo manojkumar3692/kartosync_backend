@@ -3,7 +3,8 @@ import { supa } from "../../db";
 import { IngestContext, IngestResult, ConversationState } from "./types";
 import { setState, clearState } from "./stateManager";
 import axios from "axios"; // ⬅️ NEW
-
+import { detectMetaIntent } from "./metaIntent"; // ⬅️ NEW
+import { getAttempts, incAttempts, resetAttempts } from "./attempts"; // ⬅️ NEW
 // ─────────────────────────────────────────────
 // Address heuristic (same as your old version)
 // ─────────────────────────────────────────────
@@ -342,6 +343,36 @@ export async function handleAddress(
   if (state === "awaiting_address") {
     const msg = rawText;
 
+    // 🧠 Handle back/reset/agent BEFORE address logic
+    const meta = detectMetaIntent(rawText);
+
+    if (meta === "reset") {
+      await clearState(org_id, from_phone);
+      await resetAttempts(org_id, from_phone);
+
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply:
+          "No problem 👍 I’ve cancelled this step.\nYou can type your order again or say *menu*.",
+      };
+    }
+
+    if (meta === "agent") {
+      await clearState(org_id, from_phone);
+      await resetAttempts(org_id, from_phone);
+      // optionally mark in DB for human follow-up
+
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply:
+          "I’ll ask a human to help you with the address. Someone will contact you shortly 😊",
+      };
+    }
+
     // No text at all → ask again (even if they sent only pin)
     if (!msg && locLat == null && locLng == null) {
       await setState(org_id, from_phone, "awaiting_address");
@@ -355,14 +386,49 @@ export async function handleAddress(
     }
 
     // Text that doesn't look like address → ask again
+    // Text that doesn't look like address → ask again, with retries
     if (locLat == null && locLng == null && !looksLikeAddress(msg)) {
       await setState(org_id, from_phone, "awaiting_address");
+
+      // 🔁 Count how many times they sent a bad address
+      await incAttempts(org_id, from_phone);
+      const attempts = await getAttempts(org_id, from_phone);
+
+      if (attempts === 1) {
+        return {
+          used: true,
+          kind: "order",
+          order_id: null,
+          reply:
+            "📍 That doesn't look like a full address.\n" +
+            "Please send flat/door no, building, street, area and city (with pincode if you know).",
+        };
+      }
+
+      if (attempts === 2) {
+        return {
+          used: true,
+          kind: "order",
+          order_id: null,
+          reply:
+            "📍 I still don’t see a complete address.\n" +
+            "Please send everything in *one message*, for example:\n" +
+            "*Flat 203, Green View Apts, 3rd Street, Anna Nagar, Chennai 600040*\n\n" +
+            "You can also type *back* to restart or *agent* to talk to a human.",
+        };
+      }
+
+      // 3rd time or more → stop looping
+      await clearState(org_id, from_phone);
+      await resetAttempts(org_id, from_phone);
+
       return {
         used: true,
         kind: "order",
-        reply:
-          "📍 That doesn't look like a full address.\nPlease send flat/door no, building, street, area and city (with pincode if you know).",
         order_id: null,
+        reply:
+          "😅 I’m having trouble understanding your address.\n" +
+          "I’ll stop this order for now.\nYou can type *hi* to start again or *agent* if you want a human to help.",
       };
     }
 
@@ -396,6 +462,9 @@ export async function handleAddress(
       updErr,
       addressText,
     });
+
+    // ✅ Address accepted → reset attempts for this stage
+    await resetAttempts(org_id, from_phone);
 
     // Now ask for pin or skip
     await setState(org_id, from_phone, "awaiting_location_pin");

@@ -131,7 +131,7 @@ export async function ingestCoreFromMessage(
     return {
       used: true,
       kind: "greeting",
-      reply: "👋 Hello! How can I help you today?",
+      reply: "👋 Hello! I’m your Human-AI assistant — here to take your order smoothly.\n" + "You can ask for anything or just send item names directly.\n" + "To restart at any time, type back or cancel.",
       order_id: null,
     };
   }

@@ -3,6 +3,7 @@
 import { supa } from "../../db";
 import type { IngestContext, IngestResult, ConversationState } from "./types";
 import { setState, clearState } from "./stateManager";
+import { resetAttempts } from "./attempts";
 
 
 type CartLine = {
@@ -182,6 +183,7 @@ export async function handleFinalConfirmation(
     }
 
     // 1) CONFIRM ORDER → create order in DB
+    // 1) CONFIRM ORDER → create order in DB
     if (choice === 1) {
       const { text: cartText, total } = formatCart(cart);
 
@@ -201,8 +203,7 @@ export async function handleFinalConfirmation(
         .select("id")
         .single();
         
-        console.log("[FINAL_CONFIRM][INSERT]", { error, saved, orderPayload });
-
+      console.log("[FINAL_CONFIRM][INSERT]", { error, saved, orderPayload });
 
       if (error || !saved) {
         return {
@@ -214,8 +215,9 @@ export async function handleFinalConfirmation(
         };
       }
 
-      // Reset cart but keep state machine alive, move to address
+      // Reset cart + reset attempts for address step, then move to address
       await clearCart(org_id, from_phone);
+      await resetAttempts(org_id, from_phone);                 // 🔴 ADD THIS LINE
       await setState(org_id, from_phone, "awaiting_address");
 
       return {
