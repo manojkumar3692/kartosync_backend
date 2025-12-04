@@ -17,7 +17,9 @@ type TempRow = {
   item: any | null;
   list: any[] | null;
   updated_at?: string;
-  cart?: any[] | null;  // 🆕 full cart before final confirmation
+  cart?: any[] | null;
+  multi_item_queue?: any[] | null;
+  current_item_index?: number | null;
 };
 
 // ─────────────────────────────────────────────
@@ -76,14 +78,12 @@ async function saveTemp(
   from_phone: string,
   payload: Partial<TempRow>
 ): Promise<void> {
-  const { error } = await supa
-    .from("temp_selected_items")
-    .upsert({
-      org_id,
-      customer_phone: from_phone,
-      updated_at: new Date().toISOString(),
-      ...payload,
-    } as any);
+  const { error } = await supa.from("temp_selected_items").upsert({
+    org_id,
+    customer_phone: from_phone,
+    updated_at: new Date().toISOString(),
+    ...payload,
+  } as any);
 
   if (error) {
     console.error("[TEMP][UPSERT][ERROR]", {
@@ -97,7 +97,12 @@ async function saveTemp(
 function formatQuickMenu(catalog: ProductRow[]): string {
   const lines = catalog
     .slice(0, 8)
-    .map((c) => `• ${c.display_name || c.canonical} (${c.variant || ""}) - ${c.price_per_unit}`);
+    .map(
+      (c) =>
+        `• ${c.display_name || c.canonical} (${c.variant || ""}) - ${
+          c.price_per_unit
+        }`
+    );
 
   if (!lines.length) return "No items available right now.";
   return `Here are some items from today's menu:\n\n${lines.join("\n")}`;
@@ -113,6 +118,7 @@ export async function handleCatalogFallbackFlow(
 ): Promise<IngestResult> {
   const { org_id, from_phone, text } = ctx;
   let raw = (text || "").trim();
+  const lowerRaw = raw.toLowerCase();
 
   // 0) Load catalog
   const catalog = await loadActiveProducts(org_id);
@@ -180,6 +186,38 @@ export async function handleCatalogFallbackFlow(
   }
 
   // ─────────────────────────────────────────────
+  // 🆕 MULTI-ITEM INLINE PARSE (AI or rule-based)
+  // ─────────────────────────────────────────────
+
+  // detect: "1 chicken biryani, 2 coke"
+  if (
+    ctx.intent?.intent === "add_items" &&
+    Array.isArray(ctx.intent.lines) &&
+    ctx.intent.lines.length > 1 &&
+    state === "idle"
+  ) {
+    // intentEngine usually gives: { itemText, quantity }
+    const queue = ctx.intent.lines.map((l: any) => ({
+      name: l.itemText ?? l.name,
+      qty: l.quantity ?? l.qty ?? 1,
+    }));
+
+    // store queue in temp_selected_items
+    await saveTemp(org_id, from_phone, {
+      multi_item_queue: queue,
+      current_item_index: 0,
+      cart: [],
+    });
+
+    // process first item as if user typed it
+    const first = queue[0];
+
+    raw = first.name || raw; // safety fallback
+
+    // DO NOT return here — let normal flow (variant/global search) run
+  }
+
+  // ─────────────────────────────────────────────
   // 1) QUANTITY STEP  → add to CART (no DB yet)
   // ─────────────────────────────────────────────
 
@@ -226,7 +264,37 @@ export async function handleCatalogFallbackFlow(
       list: null,
     });
 
-    // Move to confirming_order (final confirmation engine)
+    // 🆕 MULTI-ITEM QUEUE HANDLER
+    const tmpRow = await getTemp(org_id, from_phone);
+
+    if (
+      tmpRow?.multi_item_queue &&
+      typeof tmpRow.current_item_index === "number"
+    ) {
+      const nextIndex = tmpRow.current_item_index + 1;
+
+      // if more items exist → move to next item
+      if (nextIndex < tmpRow.multi_item_queue.length) {
+        const nextItem = tmpRow.multi_item_queue[nextIndex];
+
+        await saveTemp(org_id, from_phone, {
+          current_item_index: nextIndex,
+        });
+
+        await setState(org_id, from_phone, "ordering_item");
+
+        return {
+          used: true,
+          kind: "order",
+          order_id: null,
+          reply:
+            `Next item: *${nextItem.qty} ${nextItem.name}*` +
+            `\nPlease type the item name (e.g. *${nextItem.name}*).`,
+        };
+      }
+    }
+
+    // 🧺 otherwise: queue finished → go to confirm
     await setState(org_id, from_phone, "confirming_order");
     await resetAttempts(org_id, from_phone);
 
@@ -235,7 +303,11 @@ export async function handleCatalogFallbackFlow(
       const lineTotal =
         typeof li.price === "number" ? li.price * li.qty : undefined;
       const pricePart =
-        lineTotal != null ? ` – ${lineTotal}` : li.price ? ` – ${li.price}` : "";
+        lineTotal != null
+          ? ` – ${lineTotal}`
+          : li.price
+          ? ` – ${li.price}`
+          : "";
       return `${idx + 1}) ${li.name}${li.variant ? ` (${li.variant})` : ""} x ${
         li.qty
       }${pricePart}`;
@@ -379,11 +451,13 @@ export async function handleCatalogFallbackFlow(
     // CASE B: MULTIPLE MATCHES → user must choose from a narrowed list
     if (match.type === "multiple") {
       const lines = match.list
-      .map((v: ProductRow, i: number) => {
-        const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
-        return `${i + 1}) ${v.display_name || v.canonical} – ${v.variant}${price}`;
-      })
-      .join("\n");
+        .map((v: ProductRow, i: number) => {
+          const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
+          return `${i + 1}) ${v.display_name || v.canonical} – ${
+            v.variant
+          }${price}`;
+        })
+        .join("\n");
 
       await saveTemp(org_id, from_phone, {
         item: { canonical },
@@ -442,11 +516,13 @@ export async function handleCatalogFallbackFlow(
       await setState(org_id, from_phone, "ordering_variant");
 
       const variantLines = hit.variants
-      .map((v, i) => {
-        const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
-        return `${i + 1}) ${v.display_name || v.canonical} – ${v.variant || ""}${price}`;
-      })
-      .join("\n");
+        .map((v, i) => {
+          const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
+          return `${i + 1}) ${v.display_name || v.canonical} – ${
+            v.variant || ""
+          }${price}`;
+        })
+        .join("\n");
 
       return {
         used: true,
@@ -484,7 +560,12 @@ export async function handleCatalogFallbackFlow(
     const row = await getTemp(org_id, from_phone);
     const list = (row?.list || []) as any[];
 
-    if (!list || !Array.isArray(list) || list.length === 0) {
+    // When we are in multi-item queue but no list (like "coke"),
+    // DO NOT reset the whole flow; allow it to fall through to global matching.
+    const inQueue =
+      row?.multi_item_queue && typeof row.current_item_index === "number";
+
+    if ((!list || !Array.isArray(list) || list.length === 0) && !inQueue) {
       await clearState(org_id, from_phone);
       return {
         used: true,
@@ -497,7 +578,7 @@ export async function handleCatalogFallbackFlow(
     let num = parsePureNumber(raw);
 
     // 3A) TEXT → FUZZY OPTION (e.g. type "egg" instead of "2")
-    if (num === null && raw) {
+    if (num === null && raw && list && Array.isArray(list) && list.length > 0) {
       const opts = list.map((entry: any) => entry.canonical || String(entry));
       const idx = fuzzyChooseOption(raw, opts);
       if (idx !== null) {
@@ -506,7 +587,7 @@ export async function handleCatalogFallbackFlow(
     }
 
     // If still no number → fall through to global search later
-    if (num !== null) {
+    if (num !== null && list && Array.isArray(list) && list.length > 0) {
       if (num < 1 || num > list.length) {
         return {
           used: true,
@@ -553,11 +634,13 @@ export async function handleCatalogFallbackFlow(
       await setState(org_id, from_phone, "ordering_variant");
 
       const variantLines = variants
-      .map((v, i) => {
-        const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
-        return `${i + 1}) ${v.display_name || v.canonical} – ${v.variant || ""}${price}`;
-      })
-      .join("\n");
+        .map((v, i) => {
+          const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
+          return `${i + 1}) ${v.display_name || v.canonical} – ${
+            v.variant || ""
+          }${price}`;
+        })
+        .join("\n");
 
       return {
         used: true,
@@ -567,7 +650,7 @@ export async function handleCatalogFallbackFlow(
       };
     }
 
-    // if num is still null → fallthrough to global search below
+    // if num is still null → fallthrough to global search below (where we now handle queues)
   }
 
   // ─────────────────────────────────────────────
@@ -577,18 +660,112 @@ export async function handleCatalogFallbackFlow(
   const matches = findCanonicalMatches(raw, catalog);
 
   if (matches.length === 0) {
+    // 🆕 Special handling when multi-item queue is active (e.g. coke not in menu)
+    const row = await getTemp(org_id, from_phone);
+    const queue = row?.multi_item_queue || [];
+    const idx =
+      typeof row?.current_item_index === "number"
+        ? row.current_item_index!
+        : null;
+
+    const isSkipPhrase = ["skip", "no need", "leave it", "no thanks"].some(
+      (p) => lowerRaw.includes(p)
+    );
+
+    if (queue && idx !== null && idx >= 0 && idx < queue.length) {
+      const current = queue[idx];
+      const cart = Array.isArray(row?.cart) ? row!.cart! : [];
+
+      // If user explicitly said "skip / no need", don't blame menu
+      const unavailableMsg = isSkipPhrase
+        ? ""
+        : `Sorry, *${current.name}* is not available in today's menu.\n`;
+
+      // Move to next item in queue
+      const nextIndex = idx + 1;
+
+      if (nextIndex < queue.length) {
+        const nextItem = queue[nextIndex];
+
+        await saveTemp(org_id, from_phone, {
+          current_item_index: nextIndex,
+        });
+        await setState(org_id, from_phone, "ordering_item");
+
+        return {
+          used: true,
+          kind: "order",
+          order_id: null,
+          reply:
+            unavailableMsg +
+            `Next item: *${nextItem.qty} ${nextItem.name}*` +
+            `\nPlease type the item name (e.g. *${nextItem.name}*).`,
+        };
+      }
+
+      // No more items in queue → if we have cart, go to confirm; else generic fallback
+      if (cart.length > 0) {
+        await setState(org_id, from_phone, "confirming_order");
+        await resetAttempts(org_id, from_phone);
+
+        const lines = cart.map((li: any, i: number) => {
+          const lineTotal =
+            typeof li.price === "number" ? li.price * li.qty : undefined;
+          const pricePart =
+            lineTotal != null
+              ? ` – ${lineTotal}`
+              : li.price
+              ? ` – ${li.price}`
+              : "";
+          return `${i + 1}) ${li.name}${
+            li.variant ? ` (${li.variant})` : ""
+          } x ${li.qty}${pricePart}`;
+        });
+
+        const total = cart.reduce((sum: number, li: any) => {
+          if (typeof li.price === "number" && typeof li.qty === "number") {
+            return sum + li.price * li.qty;
+          }
+          return sum;
+        }, 0);
+
+        const totalLine = total > 0 ? `\n\n💰 Total: ${total}` : "";
+
+        return {
+          used: true,
+          kind: "order",
+          order_id: null,
+          reply:
+            unavailableMsg +
+            "🧺 Your cart:\n" +
+            lines.join("\n") +
+            totalLine +
+            "\n\n" +
+            "1) Confirm order\n" +
+            "2) Add another item\n" +
+            "3) Change quantity\n" +
+            "4) Remove an item\n" +
+            "5) Cancel\n\n" +
+            "Please reply with the number.",
+        };
+      }
+
+      // Queue finished and no cart → normal generic fallback
+    }
+
+    // OLD behaviour when no queue (single-item flow)
     await incAttempts(org_id, from_phone);
     const attempts = await getAttempts(org_id, from_phone);
 
     const sample = catalog
-    .slice(0, 6)
-    .map((c) => {
-      const label = c.display_name || c.canonical;
-      const variant = c.variant ? ` (${c.variant})` : "";
-      const price = c.price_per_unit ? ` – ${c.price_per_unit}` : "";
-      return `• ${label}${variant}${price}`;
-    })
-    .join("\n");
+      .slice(0, 6)
+      .map((c) => {
+        const label = c.display_name || c.canonical;
+        const variant = c.variant ? ` (${c.variant})` : "";
+        const price = c.price_per_unit ? ` – ${c.price_per_unit}` : "";
+        return `• ${label}${variant}${price}`;
+      })
+      .join("\n");
 
     const extra =
       attempts >= 2 ? `\n\nYou can type *back* to start again.` : "";
@@ -629,11 +806,13 @@ export async function handleCatalogFallbackFlow(
     await setState(org_id, from_phone, "ordering_variant");
 
     const variantLines = variants
-    .map((v, i) => {
-      const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
-      return `${i + 1}) ${v.display_name || v.canonical} – ${v.variant || ""}${price}`;
-    })
-    .join("\n");
+      .map((v, i) => {
+        const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
+        return `${i + 1}) ${v.display_name || v.canonical} – ${
+          v.variant || ""
+        }${price}`;
+      })
+      .join("\n");
 
     return {
       used: true,
@@ -644,14 +823,14 @@ export async function handleCatalogFallbackFlow(
   }
 
   const optionsText = matches
-  .map((m, i) => {
-    const firstWithPrice = m.variants.find((v) => v.price_per_unit);
-    const priceStr = firstWithPrice?.price_per_unit
-      ? ` – from ${firstWithPrice.price_per_unit}`
-      : "";
-    return `${i + 1}) ${m.canonical}${priceStr}`;
-  })
-  .join("\n");
+    .map((m, i) => {
+      const firstWithPrice = m.variants.find((v) => v.price_per_unit);
+      const priceStr = firstWithPrice?.price_per_unit
+        ? ` – from ${firstWithPrice.price_per_unit}`
+        : "";
+      return `${i + 1}) ${m.canonical}${priceStr}`;
+    })
+    .join("\n");
 
   await saveTemp(org_id, from_phone, {
     list: matches.map((m) => ({ canonical: m.canonical })),

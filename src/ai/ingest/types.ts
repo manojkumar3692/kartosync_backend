@@ -18,6 +18,8 @@ export type ConversationState =
   | "cancel"
   | "awaiting_location_pin"
   | "building_order"
+  |  "multi_pending: ParsedOrderLine[] | null"
+  |  "multi_active: boolean"                    
 
 
   // make sure address is in Intent union
@@ -63,6 +65,7 @@ export interface IngestContext {
   source: string; // "waba" | "local" | etc.
   location_lat?: number | null;
   location_lng?: number | null;
+  intent?:any
 }
 
 export interface IngestResult {

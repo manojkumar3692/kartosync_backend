@@ -14,7 +14,7 @@ export type Vertical =
 
 export type IntentType =
   | "add_item"
-  | "add_items"   // 🆕 multi-line add
+  | "add_items" // multi-line / multi-item add
   | "remove_item"
   | "change_qty"
   | "modify_item"
@@ -31,7 +31,12 @@ export type ParsedOrderLine = {
   itemText: string;
   /** The segment of the message this line came from (normalized) */
   rawSegment: string;
+  nameText?: any;
+  qty?: any;
 };
+
+
+export type MultiItemLine = ParsedOrderLine;
 
 export type ParsedIntent = {
   intent: IntentType;
@@ -165,16 +170,23 @@ function tryParseMultiItemOrder(
   const normalizedText = normalize(rawText);
 
   // Only attempt in idle-ish situations so we don't fight with other flows.
-  if (state && state !== "idle") {
+  if (state && state !== "idle" && state !== "building_order") {
     return null;
   }
 
   const hasDelimiter =
-    normalizedText.includes(",") || /\sand\s/.test(normalizedText);
+    normalizedText.includes(",") ||
+    normalizedText.includes(";") ||
+    normalizedText.includes("&") ||
+    /\sand\s/.test(normalizedText);
+
   if (!hasDelimiter) return null;
 
-  // Normalize "and" to comma, then split
-  const listText = normalizedText.replace(/\s+and\s+/g, ",");
+  // Normalize "and", ";" and "&" to comma, then split
+  const listText = normalizedText
+    .replace(/\s+and\s+/g, ",")
+    .replace(/[;&]+/g, ",");
+
   const segments = listText
     .split(",")
     .map((s) => s.trim())
@@ -196,7 +208,8 @@ function tryParseMultiItemOrder(
       seg.match(/^(\d+)\s+(.+)$/);
 
     if (m) {
-      const [, qtyStr, _x, itemRaw] = m.length === 4 ? m : [m[0], m[1], undefined, m[2]];
+      const [, qtyStr, _x, itemRaw] =
+        m.length === 4 ? m : [m[0], m[1], undefined, m[2]];
       qty = Number(qtyStr);
       itemPart = (itemRaw || "").trim();
     } else {
@@ -331,8 +344,8 @@ function quickRuleDetect(
     }
   }
 
-  // ── NEW: multi-item parsing: "1 chicken biriyani, 1 coke" ──
-  const multiLines = tryParseMultiItemOrder(rawText, state);
+  // ── Multi-item parsing: "1 chicken biriyani, 1 coke" ──
+  const multiLines = tryParseMultiItemOrder(rawText, state ?? null);
   if (multiLines && multiLines.length > 1) {
     return {
       intent: "add_items",

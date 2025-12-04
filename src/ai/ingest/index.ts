@@ -1,15 +1,13 @@
 // src/ai/ingest/index.ts
-
 import { getState, clearState } from "./stateManager";
-import { handleCatalogFlow } from "./orderEngine";
+// import { handleCatalogFlow } from "./orderEngine";
 import { handleAddress } from "./addressEngine";
 import type { IngestContext, IngestResult, ConversationState } from "./types";
 import { handlePayment } from "./paymentEngine";
 import { handleStatus } from "./statusEngine";
 import { handleCancel } from "./cancelEngine";
 import { handleFinalConfirmation } from "./finalConfirmationEngine";
-
-// 🆕 Generic intent engine + vertical helper
+import { handleCatalogFallbackFlow as handleCatalogFlow } from "./orderLegacyEngine";
 import { parseIntent, type Vertical } from "./intentEngine";
 import { supa } from "../../db";
 
@@ -41,7 +39,7 @@ const CANCEL_WORDS = [
   "cancel my order",
 ];
 
-// 🆕 Helper: map org.business_type → vertical
+// vertical reader
 async function getOrgVertical(org_id: string): Promise<Vertical> {
   const { data } = await supa
     .from("orgs")
@@ -50,12 +48,10 @@ async function getOrgVertical(org_id: string): Promise<Vertical> {
     .maybeSingle();
 
   const t = (data?.business_type || "").toLowerCase();
-
-  if (t.includes("restaurant") || t.includes("cloud_kitchen")) return "restaurant";
-  if (t.includes("grocery") || t.includes("supermarket")) return "grocery";
-  if (t.includes("salon") || t.includes("spa")) return "salon";
-  if (t.includes("pharmacy") || t.includes("medical")) return "pharmacy";
-
+  if (t.includes("restaurant")) return "restaurant";
+  if (t.includes("grocery")) return "grocery";
+  if (t.includes("salon")) return "salon";
+  if (t.includes("pharmacy")) return "pharmacy";
   return "generic";
 }
 
@@ -66,11 +62,10 @@ export async function ingestCoreFromMessage(
   const raw = (text || "").trim();
   const lower = raw.toLowerCase();
 
-  // 1) Get DB state
   const state = await getState(org_id, from_phone);
   console.log("[AI][INGEST][PRE]", { org_id, from_phone, text, state });
 
-  // 2) Hard reset handler
+  // RESET
   if (RESET_WORDS.includes(lower)) {
     await clearState(org_id, from_phone);
     return {
@@ -81,61 +76,53 @@ export async function ingestCoreFromMessage(
     };
   }
 
-  // 3) ADDRESS WAIT STATE — MUST interrupt everything
+  // ADDRESS ENGINE
   if (state === "awaiting_address" || state === "awaiting_location_pin") {
-    console.log("[AI][INGEST] → forwarding to addressEngine");
     return handleAddress(ctx, state);
   }
 
-  // 3.5 Handle Payment Feature
-  if (state === "awaiting_payment") {
-    return await handlePayment(ctx);
-  }
+  // PAYMENT
+  if (state === "awaiting_payment") return handlePayment(ctx);
 
-  // 3.7 Final confirmation + cart edit states
+  // FINAL CONFIRM / CART EDIT
   if (
     state === "confirming_order" ||
     state === "cart_edit_item" ||
     state === "cart_edit_qty" ||
     state === "cart_remove_item"
   ) {
-    return await handleFinalConfirmation(ctx, state);
+    return handleFinalConfirmation(ctx, state);
   }
 
-  // 3.8 STATUS KEYWORDS (global)
+  // STATUS
   if (STATUS_WORDS.some((k) => lower.includes(k))) {
-    return await handleStatus(ctx);
+    return handleStatus(ctx);
   }
 
-  // 3.9 CANCEL KEYWORDS (global)
+  // CANCEL
   if (CANCEL_WORDS.some((k) => lower.includes(k))) {
-    return await handleCancel(ctx);
+    return handleCancel(ctx);
   }
 
-  // 4) ORDER FLOW STATES — ordering_item / ordering_variant / ordering_qty
+  // INSIDE ORDERING FLOW
   if (isOrderingState(state)) {
-    console.log("[AI][INGEST] → inside ordering flow");
+    const vertical = await getOrgVertical(org_id);
+    const intent = await parseIntent(raw, { vertical, state });
 
-    // 🆕: parse intent (for logging / future use)
-    try {
-      const vertical = await getOrgVertical(org_id);
-      const intent = await parseIntent(raw, { vertical, state });
-      console.log("[AI][INGEST][INTENT][ORDERING]", {
-        vertical,
-        state,
-        intent,
-      });
-    } catch (e) {
-      console.log("[AI][INGEST][INTENT][ORDERING][ERROR]", (e as Error).message);
-    }
+    console.log("[AI][INGEST][INTENT][ORDERING]", {
+      vertical,
+      state,
+      intent,
+    });
 
-    // Behaviour unchanged: still route to catalog flow with state
-    return handleCatalogFlow(ctx, state);
+    return handleCatalogFlow({ ...ctx, intent }, state);
   }
 
-  // 5) IDLE STATE (initial interaction only)
+  // -----------------------------
+  // IDLE STATE
+  // -----------------------------
 
-  // GREETING
+  // GREETINGS
   if (
     ["hi", "hello", "hey", "yo"].includes(lower) ||
     lower.startsWith("hi ") ||
@@ -149,7 +136,7 @@ export async function ingestCoreFromMessage(
     };
   }
 
-  // SMALLTALK / ACK
+  // SMALLTALK
   if (
     ["ok", "thanks", "thank you", "tnx"].includes(lower) ||
     lower.includes("thank")
@@ -162,21 +149,17 @@ export async function ingestCoreFromMessage(
     };
   }
 
-  // 6) EVERYTHING ELSE → go to order engine
-  console.log("[AI][INGEST] → idle → intent + catalogFlow");
+  // ➤ Parse intent (REAL variable declared here)
+  const vertical = await getOrgVertical(org_id);
+  const intent = await parseIntent(raw, { vertical, state });
 
-  // 🆕: parse intent also in idle, but only for logging right now
-  try {
-    const vertical = await getOrgVertical(org_id);
-    const intent = await parseIntent(raw, { vertical, state });
-    console.log("[AI][INGEST][INTENT][IDLE]", {
-      vertical,
-      state,
-      intent,
-    });
-  } catch (e) {
-    console.log("[AI][INGEST][INTENT][IDLE][ERROR]", (e as Error).message);
-  }
+  console.log("[AI][INGEST][INTENT][IDLE]", {
+    vertical,
+    state,
+    intent,
+  });
 
-  return handleCatalogFlow(ctx, "idle"); 
+
+  // DEFAULT → legacy engine
+  return handleCatalogFlow({ ...ctx, intent }, "idle");
 }
