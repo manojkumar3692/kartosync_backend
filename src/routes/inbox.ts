@@ -522,6 +522,113 @@ inbox.post("/auto_reply", express.json(), async (req, res) => {
   }
 });
 
+
+// GET /api/inbox/manual_mode?org_id=...&phone=...
+inbox.get("/manual_mode", async (req, res) => {
+  try {
+    const orgId = getOrgId(req) || String(req.query.org_id || "");
+    const phoneRaw = String(req.query.phone || "").trim();
+
+    if (!orgId) {
+      return res.status(401).json({ ok: false, error: "no_org" });
+    }
+    if (!phoneRaw) {
+      return res.status(400).json({ ok: false, error: "phone_required" });
+    }
+
+    const phoneKey = normalizePhoneForKey(phoneRaw);
+
+    const { data, error } = await supa
+      .from("org_customer_settings")
+      .select("manual_mode, manual_mode_until")
+      .eq("org_id", orgId)
+      .eq("customer_phone", phoneKey)
+      .maybeSingle();
+
+    if (error) {
+      console.error("[INBOX][manual_mode GET err]", error.message);
+      return res.status(500).json({ ok: false, error: "db_error" });
+    }
+
+    const enabled = !!data?.manual_mode;
+    const until = data?.manual_mode_until || null;
+
+    return res.json({ ok: true, enabled, until });
+  } catch (e: any) {
+    console.error("[INBOX][manual_mode GET catch]", e?.message || e);
+    return res
+      .status(500)
+      .json({ ok: false, error: "manual_mode_get_failed" });
+  }
+});
+
+
+// POST /api/inbox/manual_mode
+// Body: { org_id?, phone, enabled: boolean }
+inbox.post("/manual_mode", express.json(), async (req, res) => {
+  try {
+    const orgId = getOrgId(req) || String(req.body?.org_id || "");
+    const phoneRaw = String(req.body?.phone || "").trim();
+    const enabled = req.body?.enabled;
+
+    if (!orgId) {
+      return res.status(401).json({ ok: false, error: "no_org" });
+    }
+    if (!phoneRaw || typeof enabled !== "boolean") {
+      return res.status(400).json({
+        ok: false,
+        error: "org_id, phone, enabled(boolean) are required",
+      });
+    }
+
+    const phoneKey = normalizePhoneForKey(phoneRaw);
+
+    // If turning ON → Option A: only 1 customer at a time
+    if (enabled) {
+      await supa
+        .from("org_customer_settings")
+        .update({ manual_mode: false, manual_mode_until: null })
+        .eq("org_id", orgId)
+        .eq("manual_mode", true);
+    }
+
+    const now = new Date();
+    const until = enabled
+      ? new Date(now.getTime() + 10 * 60 * 1000).toISOString() // +10 minutes
+      : null;
+
+    const { data, error } = await supa
+      .from("org_customer_settings")
+      .upsert(
+        {
+          org_id: orgId,
+          customer_phone: phoneKey,
+          manual_mode: enabled,
+          manual_mode_until: until,
+        },
+        { onConflict: "org_id,customer_phone" }
+      )
+      .select("manual_mode, manual_mode_until")
+      .maybeSingle();
+
+    if (error) {
+      console.error("[INBOX][manual_mode POST err]", error.message);
+      return res.status(500).json({ ok: false, error: "db_error" });
+    }
+
+    return res.json({
+      ok: true,
+      enabled: !!data?.manual_mode,
+      until: data?.manual_mode_until || null,
+    });
+  } catch (e: any) {
+    console.error("[INBOX][manual_mode POST catch]", e?.message || e);
+    return res
+      .status(500)
+      .json({ ok: false, error: "manual_mode_post_failed" });
+  }
+});
+
 // POST /api/inbox/inquiry_resolved
 // Body: { org_id, phone, inquiry_at?, canonical? }
 // Marks the last inquiry as resolved for this customer
