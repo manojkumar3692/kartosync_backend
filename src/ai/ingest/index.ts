@@ -65,6 +65,39 @@ export async function ingestCoreFromMessage(
   const state = await getState(org_id, from_phone);
   console.log("[AI][INGEST][PRE]", { org_id, from_phone, text, state });
 
+  // ───────────────────────────────────────────────
+  // MANUAL MODE CHECK — Stop AI immediately
+  // ───────────────────────────────────────────────
+  try {
+    const phoneKey = from_phone.replace(/[^\d]/g, "");
+
+    const { data: cust, error: custErr } = await supa
+      .from("org_customer_settings")
+      .select("manual_mode, manual_mode_until")
+      .eq("org_id", org_id)
+      .eq("customer_phone", phoneKey)
+      .maybeSingle();
+
+    if (!custErr && cust?.manual_mode) {
+      const until = cust.manual_mode_until
+        ? new Date(cust.manual_mode_until).getTime()
+        : null;
+      const now = Date.now();
+
+      // Manual mode still active?
+      if (!until || until > now) {
+        return {
+          used: false, // AI NOT used
+          kind: "manual_mode", // internal helper type
+          reply: null, // DO NOT auto-reply
+          order_id: null,
+        };
+      }
+    }
+  } catch (e) {
+    console.warn("[AI][MANUAL_MODE_CHECK][ERR]", e);
+  }
+
   // RESET
   if (RESET_WORDS.includes(lower)) {
     await clearState(org_id, from_phone);
@@ -131,7 +164,10 @@ export async function ingestCoreFromMessage(
     return {
       used: true,
       kind: "greeting",
-      reply: "👋 Hello! I’m your Human-AI assistant — here to take your order smoothly.\n" + "You can ask for anything or just send item names directly.\n" + "To restart at any time, type back or cancel.",
+      reply:
+        "👋 Hello! I’m your Human-AI assistant — here to take your order smoothly.\n" +
+        "You can ask for anything or just send item names directly.\n" +
+        "To restart at any time, type back or cancel.",
       order_id: null,
     };
   }
@@ -158,7 +194,6 @@ export async function ingestCoreFromMessage(
     state,
     intent,
   });
-
 
   // DEFAULT → legacy engine
   return handleCatalogFlow({ ...ctx, intent }, "idle");

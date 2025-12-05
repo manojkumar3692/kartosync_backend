@@ -187,16 +187,95 @@ export async function sendWabaText(opts: {
   }
 }
 
-// Simple optional log helper (you can wire this to your existing inbox logger)
+// Simple inbound → conversations + messages logger
 async function logInboundMessageToInbox(args: {
   orgId: string;
   from: string;
   text: string;
   msgId: string;
 }) {
-  console.log("[INBOX][INCOMING]", args);
-  // If you already have a real logger, call it here instead of console.log
-  // await realLogInboundMessageToInbox(args);
+  try {
+    const { orgId, from, text, msgId } = args;
+    const body = (text || "").trim() || "[non-text message]";
+
+    // normalize phone: digits only (same logic as normalizePhoneForKey)
+    const phoneKey = from.replace(/[^\d]/g, "");
+    if (!orgId || !phoneKey) return;
+
+    const nowIso = new Date().toISOString();
+
+    // 1) Find existing conversation
+    const { data: existing, error: convErr } = await supa
+      .from("conversations")
+      .select("id")
+      .eq("org_id", orgId)
+      .eq("customer_phone", phoneKey)
+      .maybeSingle();
+
+    if (convErr) {
+      console.warn("[INBOX][logInbound] conv lookup err", convErr.message);
+      return;
+    }
+
+    let conversationId: string | null = existing?.id ?? null;
+
+    // 2) If no conversation → create one
+    if (!conversationId) {
+      const { data: created, error: insErr } = await supa
+        .from("conversations")
+        .insert({
+          org_id: orgId,
+          customer_phone: phoneKey,
+          customer_name: null,
+          source: "waba",
+          last_message_at: nowIso,
+          last_message_preview: body.slice(0, 120),
+        })
+        .select("id")
+        .maybeSingle();
+
+      if (insErr) {
+        console.warn("[INBOX][logInbound] conv insert err", insErr.message);
+        return;
+      }
+
+      conversationId = created?.id ?? null;
+    } else {
+      // 3) Update existing conversation preview
+      const { error: updErr } = await supa
+        .from("conversations")
+        .update({
+          last_message_at: nowIso,
+          last_message_preview: body.slice(0, 120),
+          source: "waba",
+        })
+        .eq("id", conversationId)
+        .eq("org_id", orgId);
+
+      if (updErr) {
+        console.warn("[INBOX][logInbound] conv update err", updErr.message);
+      }
+    }
+
+    if (!conversationId) return;
+
+    // 4) Insert message row
+    const { error: msgErr } = await supa.from("messages").insert({
+      org_id: orgId,
+      conversation_id: conversationId,
+      direction: "in",
+      sender_type: "customer",
+      channel: "waba",
+      body,
+      wa_msg_id: msgId,
+    });
+
+    if (msgErr) {
+      console.warn("[INBOX][logInbound] msg insert err", msgErr.message);
+    }
+  } catch (e: any) {
+    console.warn("[INBOX][logInbound] catch", e?.message || e);
+  }
 }
 
 waba.post("/", async (req, res) => {

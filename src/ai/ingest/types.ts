@@ -70,7 +70,7 @@ export interface IngestContext {
 
 export interface IngestResult {
   used: boolean; // did AI actually handle it
-  kind: "greeting" | "smalltalk" | "order" | "unknown" | "payment" | "status" | "cancel";
+  kind: "greeting" | "smalltalk" | "order" | "unknown" | "payment" | "status" | "cancel" | "manual_mode";
   reply: string | null;
   order_id?: string | null;  
   reason?: string | null;
