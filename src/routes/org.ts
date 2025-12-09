@@ -1,7 +1,7 @@
 import express from "express";
 import jwt from "jsonwebtoken";
-import multer from "multer";        // ⬅️ added
-import path from "path";           // ⬅️ added
+import multer from "multer";
+import path from "path";
 import { supa } from "../db";
 import fs from "fs";
 
@@ -26,7 +26,7 @@ function ensureAuth(req: any, res: any, next: any) {
 }
 
 // ─────────────────────────────────────────────
-// GET /api/org/me  (EXISTING)
+// GET /api/org/me
 // ─────────────────────────────────────────────
 org.get("/me", ensureAuth, async (req: any, res) => {
   const { data, error } = await supa
@@ -39,7 +39,7 @@ org.get("/me", ensureAuth, async (req: any, res) => {
 });
 
 // ─────────────────────────────────────────────
-// POST /api/org/map-wa  (EXISTING)
+// POST /api/org/map-wa
 // ─────────────────────────────────────────────
 org.post("/map-wa", ensureAuth, async (req: any, res) => {
   const { wa_phone_number_id } = req.body || {};
@@ -53,13 +53,13 @@ org.post("/map-wa", ensureAuth, async (req: any, res) => {
 
 // ─────────────────────────────────────────────
 // GET /api/org/settings
-// Returns payment + currency settings for current org
+// Returns payment + currency + store location settings for current org
 // ─────────────────────────────────────────────
 org.get("/settings", ensureAuth, async (req: any, res) => {
   try {
     const { data, error } = await supa
       .from("orgs")
-      .select("*") // 👈 tolerant: don't require new columns to exist
+      .select("*") // tolerant: we just pick what exists
       .eq("id", req.org_id)
       .single();
 
@@ -74,10 +74,29 @@ org.get("/settings", ensureAuth, async (req: any, res) => {
       ok: true,
       id: data.id,
       name: data.name,
+
+      // 💳 Payments
       payment_enabled: !!data.payment_enabled,
       payment_qr_url: data.payment_qr_url || null,
       payment_instructions: data.payment_instructions || "",
+
+      // 💱 Currency
       default_currency: data.default_currency || "AED",
+
+      // 📍 Store location (used by addressEngine + deliveryEngine)
+      store_address: data.store_address || "",
+      store_lat:
+        typeof data.store_lat === "number" || data.store_lat === null
+          ? data.store_lat
+          : data.store_lat != null
+          ? Number(data.store_lat)
+          : null,
+      store_lng:
+        typeof data.store_lng === "number" || data.store_lng === null
+          ? data.store_lng
+          : data.store_lng != null
+          ? Number(data.store_lng)
+          : null,
     });
   } catch (e: any) {
     console.error("[ORG][settings GET] fatal:", e?.message || e);
@@ -86,9 +105,8 @@ org.get("/settings", ensureAuth, async (req: any, res) => {
 });
 
 // ─────────────────────────────────────────────
-// NEW: POST /api/org/settings
-// Body: { payment_enabled?, payment_qr_url?, payment_instructions?, default_currency? }
-// Updates those columns on orgs table
+// POST /api/org/settings
+// Body: payment + currency + store location
 // ─────────────────────────────────────────────
 org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
   try {
@@ -97,10 +115,14 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
       payment_qr_url,
       payment_instructions,
       default_currency,
+      store_address,
+      store_lat,
+      store_lng,
     } = req.body || {};
 
     const patch: any = {};
 
+    // 💳 Payments
     if (typeof payment_enabled === "boolean") {
       patch.payment_enabled = payment_enabled;
     }
@@ -113,8 +135,38 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
     ) {
       patch.payment_instructions = payment_instructions;
     }
+
+    // 💱 Currency
     if (typeof default_currency === "string") {
       patch.default_currency = default_currency;
+    }
+
+    // 📍 Store address text
+    if (typeof store_address === "string" || store_address === null) {
+      patch.store_address = store_address;
+    }
+
+    // 📍 Store lat/lng (normalize to number | null, ignore bad values)
+    if (store_lat !== undefined) {
+      if (store_lat === null || store_lat === "") {
+        patch.store_lat = null;
+      } else {
+        const latNum = Number(store_lat);
+        if (!Number.isNaN(latNum)) {
+          patch.store_lat = latNum;
+        }
+      }
+    }
+
+    if (store_lng !== undefined) {
+      if (store_lng === null || store_lng === "") {
+        patch.store_lng = null;
+      } else {
+        const lngNum = Number(store_lng);
+        if (!Number.isNaN(lngNum)) {
+          patch.store_lng = lngNum;
+        }
+      }
     }
 
     // Nothing to update
@@ -127,7 +179,17 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
       .update(patch)
       .eq("id", req.org_id)
       .select(
-        "id, name, payment_enabled, payment_qr_url, payment_instructions, default_currency"
+        `
+        id,
+        name,
+        payment_enabled,
+        payment_qr_url,
+        payment_instructions,
+        default_currency,
+        store_address,
+        store_lat,
+        store_lng
+      `
       )
       .single();
 
@@ -144,6 +206,19 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
       payment_qr_url: data.payment_qr_url || null,
       payment_instructions: data.payment_instructions || "",
       default_currency: data.default_currency || "AED",
+      store_address: data.store_address || "",
+      store_lat:
+        typeof data.store_lat === "number" || data.store_lat === null
+          ? data.store_lat
+          : data.store_lat != null
+          ? Number(data.store_lat)
+          : null,
+      store_lng:
+        typeof data.store_lng === "number" || data.store_lng === null
+          ? data.store_lng
+          : data.store_lng != null
+          ? Number(data.store_lng)
+          : null,
     });
   } catch (e: any) {
     console.error("[ORG][settings POST] fatal:", e?.message || e);
@@ -152,8 +227,7 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
 });
 
 // ─────────────────────────────────────────────
-// NEW: POST /api/org/payment-qr (file upload)
-// Frontend: uploadPaymentQr(file) → multipart/form-data with "file"
+// POST /api/org/payment-qr (file upload)
 // ─────────────────────────────────────────────
 org.post(
   "/payment-qr",
@@ -169,24 +243,19 @@ org.post(
 
       const file = req.file;
 
-      // ensure directory
       const qrDir = path.join(__dirname, "..", "..", "static", "qr");
       if (!fs.existsSync(qrDir)) {
         fs.mkdirSync(qrDir, { recursive: true });
       }
 
-      // give the file a nicer name (optional)
       const ext = path.extname(file.originalname || "") || ".png";
       const filename = `org-${req.org_id}-qr-${Date.now()}${ext}`;
       const finalPath = path.join(qrDir, filename);
 
-      // ⬇️ IMPORTANT: memoryStorage → write buffer to disk
       fs.writeFileSync(finalPath, file.buffer);
       console.log("[ORG][payment-qr] saved file at:", finalPath);
 
       const urlPath = `/static/qr/${filename}`;
-
-      // IMPORTANT: build a full public URL for WhatsApp
       const baseUrl =
         process.env.PUBLIC_BASE_URL ||
         `${req.protocol}://${req.get("host") || ""}`;
@@ -194,7 +263,6 @@ org.post(
       const publicUrl = `${baseUrl}${urlPath}`;
       console.log("[ORG][payment-qr] public URL:", publicUrl);
 
-      // store on org row
       const { error } = await supa
         .from("orgs")
         .update({ payment_qr_url: publicUrl, payment_enabled: true })
@@ -207,7 +275,6 @@ org.post(
           .json({ ok: false, error: "update_failed" });
       }
 
-      // return URL to frontend (OrgSettings preview)
       return res.json({ ok: true, url: publicUrl });
     } catch (e: any) {
       console.error("[ORG][payment-qr] ERR", e?.message || e);
@@ -219,9 +286,7 @@ org.post(
 );
 
 // ─────────────────────────────────────────────
-// NEW: POST /api/org/auto-reply
-// Body: { enabled: boolean }
-// Updates orgs.auto_reply_enabled
+// POST /api/org/auto-reply
 // ─────────────────────────────────────────────
 org.post("/auto-reply", ensureAuth, express.json(), async (req: any, res) => {
   try {
@@ -259,14 +324,7 @@ function normalizePhone(raw: string): string {
 }
 
 // ─────────────────────────────────────────────
-// NEW: POST /api/org/customer-auto-reply
-// Body: { phone: string; enabled: boolean }
-// Stores per-customer auto-reply override
-// Table expected: org_customer_settings
-//   - org_id (text)
-//   - customer_phone (text)
-//   - auto_reply_enabled (boolean)
-//   - created_at / updated_at (optional)
+// POST /api/org/customer-auto-reply
 // ─────────────────────────────────────────────
 org.post(
   "/customer-auto-reply",
@@ -327,8 +385,7 @@ org.post(
 );
 
 // ─────────────────────────────────────────────
-// NEW (optional): GET /api/org/customer-auto-reply?phone=...
-// Returns per-customer override if it exists
+// GET /api/org/customer-auto-reply?phone=...
 // ─────────────────────────────────────────────
 org.get("/customer-auto-reply", ensureAuth, async (req: any, res) => {
   try {

@@ -74,6 +74,7 @@ export interface IngestResult {
   reply: string | null;
   order_id?: string | null;  
   reason?: string | null;
+  image?: any
 }
 
 export interface IngestInput {

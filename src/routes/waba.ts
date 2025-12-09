@@ -411,6 +411,7 @@ waba.post("/", async (req, res) => {
               reason: result?.reason,
               order_id: result?.order_id,
               stored: result?.stored,
+              image: result?.image || null,   
             });
         
             const reply =
@@ -424,6 +425,8 @@ waba.post("/", async (req, res) => {
                 to: from,
                 orgId: org.id,
                 text: reply,
+                image: result?.image || null,    
+                caption: reply,
               });
         
               console.log("[WABA][AUTO_REPLY][V2]", {

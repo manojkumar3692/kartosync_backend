@@ -10,16 +10,25 @@ router.post("/send-qr", async (req: any, res) => {
   try {
     const { org_id, order_id } = req.body || {};
     if (!org_id || !order_id) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "missing_fields", details: "org_id and order_id are required" });
+      return res.status(400).json({
+        ok: false,
+        error: "missing_fields",
+        details: "org_id and order_id are required",
+      });
     }
 
     // 1) Load org (NOTE: table name = orgs, not org)
     const { data: orgRow, error: orgErr } = await supa
       .from("orgs")
       .select(
-        "id, wa_phone_number_id, payment_enabled, payment_qr_url, payment_instructions, default_currency"
+        `
+        id,
+        wa_phone_number_id,
+        payment_enabled,
+        payment_qr_url,
+        payment_instructions,
+        default_currency
+      `
       )
       .eq("id", org_id)
       .single();
@@ -44,10 +53,21 @@ router.post("/send-qr", async (req: any, res) => {
       return res.json({ ok: false, error: "missing_wa_phone_number_id" });
     }
 
-    // 2) Load order
+    // 2) Load order (include more fields for rich summary)
     const { data: orderRow, error: orderErr } = await supa
       .from("orders")
-      .select("id, items, source_phone, status")
+      .select(
+        `
+        id,
+        items,
+        source_phone,
+        status,
+        total_amount,
+        delivery_fee,
+        delivery_distance_km,
+        delivery_type
+      `
+      )
       .eq("id", order_id)
       .eq("org_id", org_id)
       .single();
@@ -70,44 +90,104 @@ router.post("/send-qr", async (req: any, res) => {
         .json({ ok: false, error: "missing_customer_phone" });
     }
 
-    // 3) Compute total
-    let total = 0;
-    for (const it of order.items || []) {
-      if (it && (it as any).line_total) {
-        total += Number((it as any).line_total);
+    // 3) Build rich line items + totals (similar style to AI payment flow)
+    const items: any[] = Array.isArray(order.items) ? order.items : [];
+    const lines: string[] = [];
+    let subtotal = 0;
+
+    for (const it of items) {
+      if (!it) continue;
+
+      const qty = Number(it.qty || 1);
+      const name = it.name || it.canonical || "Item";
+      const variant = it.variant ? ` (${it.variant})` : "";
+      const brand = it.brand ? ` (${it.brand})` : "";
+
+      const lineTotal =
+        (it as any).line_total != null
+          ? Number((it as any).line_total)
+          : 0;
+
+      if (!Number.isNaN(lineTotal)) {
+        subtotal += lineTotal;
       }
+
+      const prettyLineTotal =
+        !Number.isNaN(lineTotal) && lineTotal > 0
+          ? ` — ₹${Math.round(lineTotal)}`
+          : "";
+
+      lines.push(
+        `• ${name}${brand}${variant} x ${qty}${prettyLineTotal}`
+      );
     }
 
-    const currency = orgRow.default_currency || "AED";
-    const shortId = String(order.id).slice(-5);
+    // Fallback: if subtotal is 0 but total_amount exists, use that
+    if (subtotal === 0 && order.total_amount != null) {
+      const ta = Number(order.total_amount);
+      if (!Number.isNaN(ta)) subtotal = ta;
+    }
 
-    // 4) Build message text
-    const msg =
-      `🧾 *Order #${shortId} Payment*\n\n` +
-      `Total: *${total} ${currency}*\n\n` +
+    const deliveryFeeVal =
+      order.delivery_fee != null ? Number(order.delivery_fee) : null;
+
+    const deliveryLabel =
+      deliveryFeeVal == null
+        ? "will be confirmed"
+        : deliveryFeeVal === 0
+        ? "FREE"
+        : `₹${Math.round(deliveryFeeVal)}`;
+
+    const totalPayable =
+      subtotal + (deliveryFeeVal != null ? deliveryFeeVal : 0);
+
+    const linesText =
+      lines.length > 0 ? `${lines.join("\n")}\n\n` : "";
+
+    const currency = orgRow.default_currency || "AED";
+    const symbol =
+      currency === "INR"
+        ? "₹"
+        : currency === "AED"
+        ? "AED "
+        : `${currency} `;
+
+    // If you prefer short ID in text, you can still compute it:
+    // const shortId = String(order.id).slice(-5);
+
+    const summaryMsg =
+      `🧾 *Order Summary (#${order.id})*\n` +
+      linesText +
+      `Subtotal: ${symbol}${Math.round(subtotal)}\n` +
+      `Delivery Fee: ${deliveryLabel}\n` +
+      `——————————\n` +
+      `*Total Payable: ${symbol}${Math.round(totalPayable)}*\n` +
+      `--------------------------------\n` +
+      `Total: ${Math.round(totalPayable)}\n\n` +
+      `⏱ Estimated delivery: 30–45 minutes (depending on location).\n` +
+      `📷 Please scan the QR code below to complete the payment.\n` +
       (orgRow.payment_instructions
-        ? String(orgRow.payment_instructions) + "\n\n"
+        ? String(orgRow.payment_instructions) + "\n"
         : "") +
-      `📌 When paying, please add note: *ORD-${shortId}*\n\n` +
-      `Scan the QR below to pay.`;
+      `📞 For any changes, just reply here with your message.`;
 
     const phoneNumberId = orgRow.wa_phone_number_id as string;
 
-    // 5) Send text
-    await sendWabaText({
-      phoneNumberId,
+    console.log("[payments/send-qr] SENDING", {
+      org_id,
+      order_id,
       to,
-      text: msg,
-      orgId: orgRow.id,
+      phoneNumberId,
+      qr: orgRow.payment_qr_url,
     });
 
-    // 6) Send QR image with caption
+    // 4) Send ONE WhatsApp message: image + caption (summary)
     await sendWabaText({
       phoneNumberId,
       to,
-      image: orgRow.payment_qr_url as string,
-      caption: `Pay ${total} ${currency} for Order #${shortId}`,
       orgId: orgRow.id,
+      image: orgRow.payment_qr_url as string,
+      text: summaryMsg, // used as caption when image is present
     });
 
     return res.json({ ok: true });

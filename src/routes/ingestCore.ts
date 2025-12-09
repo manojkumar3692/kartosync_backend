@@ -83,5 +83,6 @@ export async function ingestCoreFromMessage(
     items: (res as any).items ?? null,
     org_id: ctx.org_id,
     reason: (res as any).reason ?? undefined,
+    image: (res as any).image ?? null,
   };
 }

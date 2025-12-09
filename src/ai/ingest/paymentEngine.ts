@@ -130,7 +130,9 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
   // ─────────────────────────────────────────────
   const { data: order } = await supa
     .from("orders")
-    .select("id, status, items, total_amount, delivery_fee, delivery_distance_km, delivery_type")
+    .select(
+      "id, status, items, total_amount, delivery_fee, delivery_distance_km, delivery_type"
+    )
     .eq("org_id", org_id)
     .eq("source_phone", from_phone)
     .eq("status", "pending")
@@ -146,6 +148,37 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
       })
       .eq("id", order.id);
   }
+
+  // ─────────────────────────────────────────────
+  // 3) Decide if this is an "online" mode and load org QR + note
+  //    RULE: anything that is NOT cash/card is treated as online
+  // ─────────────────────────────────────────────
+  const isOnlineMode = mode !== "cash" && mode !== "card";
+
+  let qrUrl: string | null = null;
+  let paymentNote: string | null = null;
+
+  if (isOnlineMode) {
+    const { data: orgRow, error: orgErr } = await supa
+      .from("orgs")
+      .select("payment_qr_url, payment_instructions")
+      .eq("id", org_id)
+      .maybeSingle();
+
+    console.log("[PAYMENT][ORG_ROW]", { orgErr, orgRow });
+
+    if (!orgErr && orgRow) {
+      qrUrl = (orgRow as any).payment_qr_url || null;
+      paymentNote = (orgRow as any).payment_instructions || null;
+    }
+  }
+
+  console.log("[PAYMENT][MODE_FLAGS]", {
+    mode,
+    isOnlineMode,
+    qrUrl,
+    paymentNote,
+  });
 
   // clear state after payment chosen
   await clearState(org_id, from_phone);
@@ -163,43 +196,58 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
   const { text: summaryBody, total } = buildOrderSummary(order);
   const etaLine = order ? getEtaLabel(mode) : "";
   const totalLine =
-    order && total !== null ? `--------------------------------\nTotal: ${total}\n\n` : "\n";
+    order && total !== null
+      ? `--------------------------------\nTotal: ${total}\n\n`
+      : "\n";
 
   let nextStepLine = "";
   if (!order?.id) {
     // No order found – keep old fallback
     nextStepLine = "Payment mode saved for your next order.";
-  } else if (mode === "cash" || mode === "card") {
+  } else if (!isOnlineMode) {
+    // Cash / Card on delivery
     nextStepLine =
       `${etaLine}\n` +
       "📞 For any changes, just reply here with your message.";
-  } else if (mode === "upi" || mode === "online") {
-    nextStepLine =
-      `${etaLine}\n` +
-      "💸 You’ll receive a payment link / UPI details shortly to complete the payment.\n" +
-      "📞 For any changes, just reply here with your message.";
+  } else {
+    // Any ONLINE mode (UPI / link / other)
+    if (qrUrl) {
+      // 🔹 We HAVE a QR → tell customer to scan it
+      nextStepLine =
+        `${etaLine}\n` +
+        "📷 Please scan the QR code below to complete the payment.\n" +
+        (paymentNote ? `${paymentNote}\n` : "") +
+        "📞 For any changes, just reply here with your message.";
+    } else {
+      // 🔹 No QR configured → old fallback
+      nextStepLine =
+        `${etaLine}\n` +
+        "💸 You’ll receive a payment link / UPI details shortly to complete the payment.\n" +
+        "📞 For any changes, just reply here with your message.";
+    }
   }
 
   // If we couldn’t read items for some reason, fall back to simple text
   if (!order?.id || !summaryBody) {
-    const safeSummary =
-    order?.id && summaryBody
-      ? buildOrderSummary(order)
-      : null;
+    const safeSummary = summaryBody || null;
 
-  return {
-    used: true,
-    kind: "payment",
-    reply:
-      `💳 Payment method saved: *${modeLabel}*.\n\n` +
-      (safeSummary
-        ? safeSummary +
-          `\n\n${nextStepLine}`
-        : order?.id
-        ? `Your order (#${order.id}) is now being processed.\n\n${nextStepLine}`
-        : `Payment mode saved for your next order.`),
-    order_id: order?.id || null,
-  };
+    const resultFallback = {
+      used: true as const,
+      kind: "payment" as const,
+      reply:
+        `💳 Payment method saved: *${modeLabel}*.\n\n` +
+        (safeSummary
+          ? safeSummary + `\n\n${nextStepLine}`
+          : order?.id
+          ? `Your order (#${order.id}) is now being processed.\n\n${nextStepLine}`
+          : `Payment mode saved for your next order.`),
+      order_id: order?.id || null,
+      // 👇 Only non-null for online modes + QR configured
+      image: isOnlineMode && qrUrl ? qrUrl : null,
+    };
+
+    console.log("[PAYMENT][RESULT_FALLBACK]", resultFallback);
+    return resultFallback;
   }
 
   // Rich confirmation
@@ -210,10 +258,15 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
     totalLine +
     `${nextStepLine}`;
 
-  return {
-    used: true,
-    kind: "payment",
+  const resultRich = {
+    used: true as const,
+    kind: "payment" as const,
     reply,
     order_id: order.id || null,
+    // 👇 This is what your WABA layer will see and send as image
+    image: isOnlineMode && qrUrl ? qrUrl : null,
   };
+
+  console.log("[PAYMENT][RESULT_RICH]", resultRich);
+  return resultRich;
 }
