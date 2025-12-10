@@ -9,7 +9,7 @@ import { filterVariantsByKeyword, findVariantMatches } from "./variantEngine";
 import { detectMetaIntent } from "./metaIntent";
 import { getAttempts, incAttempts, resetAttempts } from "./attempts";
 import { fuzzyChooseOption } from "./fuzzyOption";
-
+import { normalizeCustomerText } from "../lang/normalize";
 // temp_selected_items row
 type TempRow = {
   org_id: string;
@@ -150,6 +150,15 @@ export async function handleCatalogFallbackFlow(
   let raw = (text || "").trim();
   const lowerRaw = raw.toLowerCase();
 
+    // Prefer AI-normalized text (from intent) for catalog matching.
+  // This is usually English + cleaned (e.g. "bro oru biriyani kodunga" → "give me a biryani").
+  const semanticText =
+    (ctx.intent?.normalized && ctx.intent.normalized.trim()) ||
+    (ctx.intent?.rawText && ctx.intent.rawText.trim()) ||
+    raw;
+
+  const semanticLower = semanticText.toLowerCase();
+
   // 0) Load catalog
   const catalog = await loadActiveProducts(org_id);
 
@@ -168,6 +177,14 @@ export async function handleCatalogFallbackFlow(
   if (meta === "reset") {
     await clearState(org_id, from_phone);
     await resetAttempts(org_id, from_phone);
+
+    // 🔥 NEW: also clear temp_selected_items (queue, cart, etc.)
+    await supa
+      .from("temp_selected_items")
+      .delete()
+      .eq("org_id", org_id)
+      .eq("customer_phone", from_phone);
+
     return {
       used: true,
       kind: "order",
@@ -647,8 +664,8 @@ export async function handleCatalogFallbackFlow(
   // ─────────────────────────────────────────────
 
   if (state === "idle") {
-    const variantHits = findVariantMatches(raw, catalog);
-
+    const variantHits = findVariantMatches(semanticText, catalog);
+    
     if (variantHits && variantHits.length === 1) {
       const hit = variantHits[0];
 
@@ -702,11 +719,11 @@ export async function handleCatalogFallbackFlow(
       });
       await setState(org_id, from_phone, "ordering_item");
 
-    // 🆕 prefix "For your 1st item (1 of 3)…"
-    const rowForContext = await getTemp(org_id, from_phone);
-    const itemPrefix = buildItemPrefix(rowForContext);
+      // 🆕 prefix "For your 1st item (1 of 3)…"
+      const rowForContext = await getTemp(org_id, from_phone);
+      const itemPrefix = buildItemPrefix(rowForContext);
 
-    return {
+      return {
         used: true,
         kind: "order",
         reply:
@@ -828,7 +845,9 @@ export async function handleCatalogFallbackFlow(
   // 4) GLOBAL MATCHING (idle or fallback)
   // ─────────────────────────────────────────────
 
-  const matches = findCanonicalMatches(raw, catalog);
+  // 🧠 Use normalized text so "biriayni" → "biryani", Tamil → English, etc.
+  const searchText = normalizeCustomerText(raw || "");
+  const matches = findCanonicalMatches(searchText, catalog);
 
   if (matches.length === 0) {
     // 🆕 Special handling when multi-item queue is active (e.g. coke not in menu)
@@ -839,9 +858,9 @@ export async function handleCatalogFallbackFlow(
         ? row.current_item_index!
         : null;
 
-    const isSkipPhrase = ["skip", "no need", "leave it", "no thanks"].some(
-      (p) => lowerRaw.includes(p)
-    );
+        const isSkipPhrase = ["skip", "no need", "leave it", "no thanks"].some(
+          (p) => lowerRaw.includes(p) || semanticLower.includes(p)
+        );
 
     if (queue && idx !== null && idx >= 0 && idx < queue.length) {
       const current = queue[idx];
@@ -924,32 +943,24 @@ export async function handleCatalogFallbackFlow(
       // Queue finished and no cart → normal generic fallback
     }
 
-    // OLD behaviour when no queue (single-item flow)
+    // OLD behaviour when no queue (single-item flow) – now generic, no food-specific hacks
     await incAttempts(org_id, from_phone);
     const attempts = await getAttempts(org_id, from_phone);
 
-    const sample = catalog
-      .slice(0, 6)
-      .map((c) => {
-        const label = c.display_name || c.canonical;
-        const variant = c.variant ? ` (${c.variant})` : "";
-        const price = c.price_per_unit ? ` – ${c.price_per_unit}` : "";
-        return `• ${label}${variant}${price}`;
-      })
-      .join("\n");
-
     const extra =
       attempts >= 2 ? `\n\nYou can type *back* to start again.` : "";
+
+    // Use our standard quick menu snippet
+    const sampleBlock = formatQuickMenu(catalog); // already includes heading
 
     return {
       used: true,
       kind: "order",
       reply:
         itemPrefix +
-        `I couldn't find that item.\n` +
-        (sample
-          ? `Here are some items from today's menu:\n\n${sample}\n\nPlease type the item name again.`
-          : "Please type the item name again.") +
+        "I couldn't find that item.\n" +
+        sampleBlock +
+        "\n\nPlease type the item name again." +
         extra,
       order_id: null,
     };

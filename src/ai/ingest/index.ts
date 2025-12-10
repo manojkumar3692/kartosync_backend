@@ -1,6 +1,5 @@
 // src/ai/ingest/index.ts
 import { getState, clearState } from "./stateManager";
-// import { handleCatalogFlow } from "./orderEngine";
 import { handleAddress } from "./addressEngine";
 import type { IngestContext, IngestResult, ConversationState } from "./types";
 import { handlePayment } from "./paymentEngine";
@@ -11,6 +10,11 @@ import { handleCatalogFallbackFlow as handleCatalogFlow } from "./orderLegacyEng
 import { parseIntent, type Vertical } from "./intentEngine";
 import { supa } from "../../db";
 
+// 🔤 NEW: language + alias helpers
+import { normalizeCustomerText } from "../lang/normalize";
+import { detectAndTranslate } from "../lang/detectTranslate";
+import { getAliasHints } from "../aliases";
+
 // ORDERING FLOW STATES
 function isOrderingState(state: ConversationState): boolean {
   return (
@@ -20,7 +24,6 @@ function isOrderingState(state: ConversationState): boolean {
   );
 }
 
-// RESET keywords
 const RESET_WORDS = ["reset", "start again", "new order", "clear"];
 
 const STATUS_WORDS = [
@@ -39,7 +42,29 @@ const CANCEL_WORDS = [
   "cancel my order",
 ];
 
-// vertical reader
+const GREETING_WORDS = [
+  "hi",
+  "hello",
+  "hey",
+  "yo",
+  "hola",
+  "vanakkam",
+  "namaste",
+  "gm",
+  "good morning",
+  "good afternoon",
+  "good evening",
+];
+
+const GREETING_FILLERS = [
+  "bro",
+  "dear",
+  "sir",
+  "team",
+  "anna",
+  "machi",
+];
+
 async function getOrgVertical(org_id: string): Promise<Vertical> {
   const { data } = await supa
     .from("orgs")
@@ -60,14 +85,14 @@ export async function ingestCoreFromMessage(
 ): Promise<IngestResult> {
   const { org_id, from_phone, text } = ctx;
   const raw = (text || "").trim();
-  const lower = raw.toLowerCase();
+  const lowerRaw = raw.toLowerCase();
 
   const state = await getState(org_id, from_phone);
   console.log("[AI][INGEST][PRE]", { org_id, from_phone, text, state });
 
-  // ───────────────────────────────────────────────
-  // MANUAL MODE CHECK — Stop AI immediately
-  // ───────────────────────────────────────────────
+  // ------------------------------------------------------
+  // MANUAL MODE CHECK
+  // ------------------------------------------------------
   try {
     const phoneKey = from_phone.replace(/[^\d]/g, "");
 
@@ -84,12 +109,11 @@ export async function ingestCoreFromMessage(
         : null;
       const now = Date.now();
 
-      // Manual mode still active?
       if (!until || until > now) {
         return {
-          used: false, // AI NOT used
-          kind: "manual_mode", // internal helper type
-          reply: null, // DO NOT auto-reply
+          used: false,
+          kind: "manual_mode",
+          reply: null,
           order_id: null,
         };
       }
@@ -99,7 +123,7 @@ export async function ingestCoreFromMessage(
   }
 
   // RESET
-  if (RESET_WORDS.includes(lower)) {
+  if (RESET_WORDS.includes(lowerRaw)) {
     await clearState(org_id, from_phone);
     return {
       used: true,
@@ -109,7 +133,7 @@ export async function ingestCoreFromMessage(
     };
   }
 
-  // ADDRESS ENGINE
+  // ADDRESS
   if (state === "awaiting_address" || state === "awaiting_location_pin") {
     return handleAddress(ctx, state);
   }
@@ -117,7 +141,7 @@ export async function ingestCoreFromMessage(
   // PAYMENT
   if (state === "awaiting_payment") return handlePayment(ctx);
 
-  // FINAL CONFIRM / CART EDIT
+  // FINAL CONFIRM
   if (
     state === "confirming_order" ||
     state === "cart_edit_item" ||
@@ -128,39 +152,72 @@ export async function ingestCoreFromMessage(
   }
 
   // STATUS
-  if (STATUS_WORDS.some((k) => lower.includes(k))) {
+  if (STATUS_WORDS.some((k) => lowerRaw.includes(k))) {
     return handleStatus(ctx);
   }
 
   // CANCEL
-  if (CANCEL_WORDS.some((k) => lower.includes(k))) {
+  if (CANCEL_WORDS.some((k) => lowerRaw.includes(k))) {
     return handleCancel(ctx);
   }
 
+  // ------------------------------------------------------
   // INSIDE ORDERING FLOW
+  // ------------------------------------------------------
   if (isOrderingState(state)) {
-    const vertical = await getOrgVertical(org_id);
-    const intent = await parseIntent(raw, { vertical, state });
+    let intentText = raw;
 
-    console.log("[AI][INGEST][INTENT][ORDERING]", {
-      vertical,
-      state,
-      intent,
-    });
+    if (raw) {
+      try {
+        console.log("[AI][LANG][ORDERING][RAW]", { org_id, from_phone, text: raw });
+
+        const { detected_lang, translated_text } = await detectAndTranslate(raw);
+        const normalized = normalizeCustomerText(translated_text);
+
+        const aliasHints = await getAliasHints(org_id, normalized);
+
+        intentText = normalized;
+
+        console.log("[AI][LANG][ORDERING][NORM]", {
+          org_id,
+          from_phone,
+          detected_lang,
+          norm_preview: intentText.slice(0, 160),
+          aliasHints,
+        });
+      } catch (e: any) {
+        console.warn("[AI][LANG][ORDERING][ERR]", e?.message || String(e));
+        intentText = raw;
+      }
+    }
+
+    const vertical = await getOrgVertical(org_id);
+    const intent = await parseIntent(intentText, { vertical, state });
+
+    console.log("[AI][INGEST][INTENT][ORDERING]", { vertical, state, intent });
 
     return handleCatalogFlow({ ...ctx, intent }, state);
   }
 
-  // -----------------------------
+  // ------------------------------------------------------
   // IDLE STATE
-  // -----------------------------
+  // ------------------------------------------------------
 
-  // GREETINGS
-  if (
-    ["hi", "hello", "hey", "yo"].includes(lower) ||
-    lower.startsWith("hi ") ||
-    lower.startsWith("hello ")
-  ) {
+  // Greetings (only if it's basically just a greeting)
+  const tokens = lowerRaw.split(/\s+/).filter(Boolean);
+
+  const isPureGreeting =
+    // exact match with a greeting phrase
+    GREETING_WORDS.some((w) => lowerRaw === w) ||
+    // short messages (<= 3 words) like "hi bro", "hello sir", "hi team"
+    (
+      tokens.length > 0 &&
+      tokens.length <= 3 &&
+      GREETING_WORDS.includes(tokens[0]) &&
+      tokens.slice(1).every((t) => GREETING_FILLERS.includes(t))
+    );
+
+  if (isPureGreeting) {
     return {
       used: true,
       kind: "greeting",
@@ -172,10 +229,10 @@ export async function ingestCoreFromMessage(
     };
   }
 
-  // SMALLTALK
+  // Smalltalk
   if (
-    ["ok", "thanks", "thank you", "tnx"].includes(lower) ||
-    lower.includes("thank")
+    ["ok", "thanks", "thank you", "tnx"].includes(lowerRaw) ||
+    lowerRaw.includes("thank")
   ) {
     return {
       used: true,
@@ -185,16 +242,51 @@ export async function ingestCoreFromMessage(
     };
   }
 
-  // ➤ Parse intent (REAL variable declared here)
+  // IDLE TEXT → normalize & alias hints
+  let idleIntentText = raw;
+  if (raw) {
+    try {
+      console.log("[AI][LANG][IDLE][RAW]", { org_id, from_phone, text: raw });
+
+      const { detected_lang, translated_text } = await detectAndTranslate(raw);
+      const normalized = normalizeCustomerText(translated_text);
+
+      const aliasHints = await getAliasHints(org_id, normalized);
+
+      idleIntentText = normalized;
+
+      console.log("[AI][LANG][IDLE][NORM]", {
+        org_id,
+        from_phone,
+        detected_lang,
+        norm_preview: idleIntentText.slice(0, 160),
+        aliasHints,
+      });
+    } catch (e: any) {
+      console.warn("[AI][LANG][IDLE][ERR]", e?.message || String(e));
+      idleIntentText = raw;
+    }
+  }
+
   const vertical = await getOrgVertical(org_id);
-  const intent = await parseIntent(raw, { vertical, state });
+  let intent = await parseIntent(idleIntentText, { vertical, state });
 
-  console.log("[AI][INGEST][INTENT][IDLE]", {
-    vertical,
-    state,
-    intent,
-  });
+  // 🛡 Guard: don't treat messages with NO digits as multi-item "add_items"
+  if (intent.intent === "add_items" && !/\d/.test(idleIntentText)) {
+    console.log("[AI][INGEST][INTENT][IDLE][DOWNGRADE_ADD_ITEMS_NO_DIGITS]", {
+      idleIntentText,
+      intentBefore: intent,
+    });
 
-  // DEFAULT → legacy engine
+    intent = {
+      ...intent,
+      intent: "unknown",
+      lines: null,
+      ruleTag: (intent.ruleTag || "") + "|DOWNGRADED_NO_DIGITS",
+    };
+  }
+
+  console.log("[AI][INGEST][INTENT][IDLE]", { vertical, state, intent });
+
   return handleCatalogFlow({ ...ctx, intent }, "idle");
 }
