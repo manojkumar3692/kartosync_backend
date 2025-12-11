@@ -19,7 +19,8 @@ export type ConversationState =
   | "awaiting_location_pin"
   | "building_order"
   |  "multi_pending: ParsedOrderLine[] | null"
-  |  "multi_active: boolean"                    
+  |  "multi_active: boolean"   
+  | "agent"                 
 
 
   // make sure address is in Intent union
@@ -70,7 +71,7 @@ export interface IngestContext {
 
 export interface IngestResult {
   used: boolean; // did AI actually handle it
-  kind: "greeting" | "smalltalk" | "order" | "unknown" | "payment" | "status" | "cancel" | "manual_mode" | "service_inquiry";
+  kind: "greeting" | "smalltalk" | "order" | "unknown" | "payment" | "status" | "cancel" | "manual_mode" | "service_inquiry" | "agent" | "inquiry";
   reply: string | null;
   order_id?: string | null;  
   reason?: string | null;
