@@ -5,6 +5,7 @@ import { parseOrder as ruleParse } from "../parser";
 import {
   addSpendUSD,
   canSpendMoreUSD,
+  estimateCostUSD,
   estimateCostUSDApprox,
 } from "./cost"; // keep your existing budget guard
 import { supa } from "../db";
@@ -232,7 +233,8 @@ You MUST:
 
 async function callOrderModelRaw(
   input: string,
-  menu: CandidateProduct[]
+  menu: CandidateProduct[],
+  orgId?: string
 ): Promise<string | null> {
   if (!openai) {
     console.warn("[AI][order] OPENAI_API_KEY missing, skip AI");
@@ -242,22 +244,33 @@ async function callOrderModelRaw(
   const model = getOrderModelName();
   const userPrompt = buildUserPrompt(input, menu);
 
+  // ─────────────────────────────────────────────
+  // 1) Pre-flight cost estimate + budget guard
+  // ─────────────────────────────────────────────
   try {
     const approxCost = estimateCostUSDApprox({
       prompt_tokens: Math.ceil(userPrompt.length / 4),
       completion_tokens: 0,
     });
-    if (!canSpendMoreUSD(approxCost)) {
+
+    const pre = await canSpendMoreUSD(approxCost);
+    if (!pre.ok) {
       console.warn("[AI][order] budget guard blocked call", {
         approxCost,
         model,
+        reason: pre.reason,
+        today: pre.today,
+        cap: pre.cap,
       });
       return null;
     }
   } catch (e: any) {
-    console.warn("[AI][order] cost estimate failed", e?.message || e);
+    console.warn("[AI][order] cost estimate / guard failed", e?.message || e);
   }
 
+  // ─────────────────────────────────────────────
+  // 2) Actual OpenAI call
+  // ─────────────────────────────────────────────
   const start = Date.now();
   const completion = await openai.chat.completions.create({
     model,
@@ -274,16 +287,41 @@ async function callOrderModelRaw(
   const content = completion.choices[0]?.message?.content || "";
   console.log("[AI][order] model used:", model, "latency_ms:", ms);
 
+  // ─────────────────────────────────────────────
+  // 3) Track spend (global + per-org)
+  // ─────────────────────────────────────────────
   try {
-    const promptTokens = completion.usage?.prompt_tokens ?? 0;
-    const completionTokens = completion.usage?.completion_tokens ?? 0;
-    const approxCost = estimateCostUSDApprox({
-      prompt_tokens: promptTokens,
-      completion_tokens: completionTokens,
-    });
-    addSpendUSD(approxCost);
+    const usage = completion.usage;
+    if (usage) {
+      const actualCost = estimateCostUSD(
+        {
+          prompt_tokens: usage.prompt_tokens ?? 0,
+          completion_tokens: usage.completion_tokens ?? 0,
+        },
+        model
+      );
+
+      // Global daily bucket (ai_daily_spend + RPC)
+      await addSpendUSD(actualCost);
+
+      // Per-org usage log (for SpendTab + org analytics)
+      if (orgId) {
+        await supa.from("ai_usage_log").insert({
+          org_id: orgId,
+          prompt_tokens: usage.prompt_tokens ?? null,
+          completion_tokens: usage.completion_tokens ?? null,
+          total_tokens: usage.total_tokens ?? null,
+          model,
+          cost_usd: actualCost,
+          raw: JSON.stringify({
+            response_id: completion.id,
+            system_fingerprint: (completion as any).system_fingerprint ?? null,
+          }),
+        });
+      }
+    }
   } catch (e: any) {
-    console.warn("[AI][order] addSpendUSD failed", e?.message || e);
+    console.warn("[AI][order] spend / usage logging failed", e?.message || e);
   }
 
   return content || null;
@@ -382,8 +420,7 @@ export async function aiParseOrder(
       menu_count: menu.length,
     });
 
-    const raw = await callOrderModelRaw(input, menu);
-
+    const raw = await callOrderModelRaw(input, menu, opts?.org_id);
     if (!raw) {
       // budget-guard or other skip → rules fallback
       const items = ruleParse(input) || [];

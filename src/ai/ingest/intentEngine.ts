@@ -12,7 +12,7 @@ export type Vertical =
   | "pharmacy"
   | "generic";
 
-export type IntentType =
+  export type IntentType =
   | "add_item"
   | "add_items" // multi-line / multi-item add
   | "remove_item"
@@ -22,7 +22,23 @@ export type IntentType =
   | "checkout"
   | "new_order"
   | "cancel_order"
+  | "service_delivery_now_check"   // 🔹 NEW
   | "unknown";
+
+  const DELIVERY_NOW_KEYWORDS = [
+    "do you deliver now",
+    "do u deliver now",
+    "are you delivering now",
+    "are u delivering now",
+    "are you open now",
+    "are u open now",
+    "is delivery available now",
+    "delivery now",
+    "do you deliver",
+    "do u deliver",
+    "delivery available",
+  ];
+
 
 export type ParsedOrderLine = {
   /** Parsed quantity for that segment (null if unknown) */
@@ -270,6 +286,16 @@ function quickRuleDetect(
   }
 
   const { state } = opts;
+
+  // 🔹 Delivery / “are you open now?” kind of questions
+  if (containsAny(normalizedText, DELIVERY_NOW_KEYWORDS)) {
+    return {
+      intent: "service_delivery_now_check",
+      rawText,
+      normalized: normalizedText,
+      ruleTag: "RULE_DELIVERY_NOW_CHECK",
+    };
+  }
 
   // ── Checkout / place order ──
   if (containsAny(normalizedText, CHECKOUT_KEYWORDS)) {

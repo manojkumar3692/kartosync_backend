@@ -132,54 +132,73 @@ admin.get("/ai-corrections", ensureAdmin, async (req, res) => {
  * Falls back to summing ai_usage_log if RPC not available.
  * Returns: { total_usd, since, range, caps }
  */
-admin.get("/ai-spend/summary", ensureAdmin, async (req, res) => {
+// GET /api/admin/ai-spend/summary
+admin.get("/ai-spend/summary", async (req, res) => {
   try {
-    const range = String(req.query.range || "daily");
-    const now = new Date();
-    const since = new Date();
-    if (range === "weekly") since.setDate(now.getDate() - 7);
-    else if (range === "monthly") since.setMonth(now.getMonth() - 1);
-    else since.setDate(now.getDate() - 1); // daily (last 24h)
+    const range = (req.query.range as string) || "daily";
+    const orgId = (req.query.org_id as string | undefined) || undefined;
 
-    // Try RPC first
+    // ----- 1) Compute time window -----
+    let since: Date;
+    if (range === "weekly") {
+      since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    } else if (range === "monthly") {
+      since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    } else {
+      // daily (last 24 hours)
+      since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    }
+
+    const DAILY_CAP = 5;     // USD per org per day
+    const MONTHLY_CAP = 150; // USD per org per month
+
+    // ----- 2) Build Supabase query -----
+    let q = supa
+      .from("ai_usage_log")
+      .select("cost_usd, created_at, model")
+      .gte("created_at", since.toISOString());
+
+    if (orgId) {
+      q = q.eq("org_id", orgId);
+    }
+
+    const { data, error } = await q;
+
+    if (error) {
+      console.error("[ADMIN][AI_SPEND] supa error", error.message);
+      return res.status(500).json({ error: "failed_to_load_ai_spend" });
+    }
+
+    // ----- 3) Aggregate in code -----
     let total = 0;
-    let triedRpc = false;
+    let firstTs: string | null = null;
+    let model: string | null = null;
 
-    try {
-      const { data, error } = await supa.rpc("sum_ai_spend_since", {
-        since_ts: since.toISOString(),
-      });
-      triedRpc = true;
-      if (error) throw error;
-      total = (data && typeof (data as any).total === "number") ? (data as any).total : 0;
-    } catch (rpcErr) {
-      // Fallback: sum from table
-      const { data, error } = await supa
-        .from("ai_usage_log")
-        .select("cost_usd, created_at")
-        .gte("created_at", since.toISOString());
-      if (error) throw error;
-      total = (data || []).reduce((sum, r: any) => sum + (Number(r.cost_usd) || 0), 0);
-      if (triedRpc) {
-        console.warn("[ai-spend] RPC unavailable/failed; using table fallback.");
+    for (const r of data || []) {
+      total += Number(r.cost_usd || 0);
+
+      if (!firstTs || r.created_at < firstTs) {
+        firstTs = r.created_at;
+      }
+
+      if (!model && r.model) {
+        model = r.model;
       }
     }
 
-    const caps = {
-      daily_cap: Number(process.env.AI_DAILY_USD || 5),
-      monthly_cap: Number(process.env.AI_MONTHLY_USD || 150),
-      model: process.env.AI_MODEL || "gpt-4o-mini",
-    };
-
-    res.json({
-      total_usd: Number(total.toFixed(6)),
-      since: since.toISOString(),
-      range,
-      caps,
+    // ----- 4) Response -----
+    return res.json({
+      total_usd: total,
+      since: firstTs || since.toISOString(),
+      caps: {
+        daily_cap: DAILY_CAP,
+        monthly_cap: MONTHLY_CAP,
+        model: model || process.env.AI_MODEL || "unknown",
+      },
     });
   } catch (e: any) {
-    console.error("admin ai-spend summary error:", e);
-    res.status(500).json({ error: e.message || "ai_spend_failed" });
+    console.error("[ADMIN][AI_SPEND] catch", e?.message || e);
+    return res.status(500).json({ error: "unexpected_error" });
   }
 });
 
@@ -208,5 +227,228 @@ admin.post("/retrain", ensureAdmin, async (req, res) => {
     res.status(500).json({ error: e.message || "retrain_failed" });
   }
 });
+
+// GET /api/admin/orgs/:id/stats
+admin.get("/orgs/:id/stats", async (req, res) => {
+  const orgId = req.params.id;
+
+  try {
+    const { data, error } = await supa
+      .from("org_stats")
+      .select("*")
+      .eq("org_id", orgId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("[ADMIN][ORG_STATS] error", error.message);
+      return res.status(500).json({ error: error.message });
+    }
+
+    if (!data) {
+      return res.status(404).json({ error: "No stats for this org." });
+    }
+
+    return res.json(data);
+  } catch (e: any) {
+    console.error("[ADMIN][ORG_STATS] catch", e?.message || e);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+admin.get("/orgs/:orgId/stats", async (req, res) => {
+  const orgId = req.params.orgId;
+
+  try {
+    const { data, error } = await supa
+      .from("org_stats")
+      .select("*")
+      .eq("org_id", orgId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("[ADMIN][ORG_STATS] supa error", error.message);
+      return res.status(500).json({ error: "Failed to load org stats" });
+    }
+
+    // If no orders yet, return zeroed structure
+    if (!data) {
+      return res.json({
+        org_id: orgId,
+        total_orders: 0,
+        completed_orders: 0,
+        open_orders: 0,
+        total_revenue: 0,
+        completed_revenue: 0,
+        ai_orders: 0,
+        ai_completed_orders: 0,
+        ai_revenue: 0,
+        manual_orders: 0,
+        manual_revenue: 0,
+        first_order_at: null,
+        last_order_at: null,
+      });
+    }
+
+    return res.json(data);
+  } catch (e: any) {
+    console.error("[ADMIN][ORG_STATS] catch", e?.message || e);
+    return res.status(500).json({ error: "Failed to load org stats" });
+  }
+});
+
+
+
+const AI_DAILY_CAP = Number(process.env.AI_DAILY_USD ?? 5);
+const AI_MONTHLY_CAP = Number(process.env.AI_MONTHLY_USD ?? 150);
+const AI_MODEL =
+  process.env.AI_ORDER_MODEL || process.env.AI_MODEL || "gpt-4o-mini";
+
+admin.get("/ai/spend/:orgId/daily", async (req, res) => {
+  try {
+    const orgId = req.params.orgId;
+    if (!orgId) {
+      return res.status(400).json({ error: "Missing orgId in path" });
+    }
+
+    // Today in UTC (date bucket)
+    const now = new Date();
+    const dayStartUTC = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+    );
+    const dayEndUTC = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)
+    );
+
+    const dayStartIso = dayStartUTC.toISOString();
+    const dayEndIso = dayEndUTC.toISOString();
+
+    // Fetch all today's rows for this org and sum cost_usd
+    const { data, error } = await supa
+      .from("ai_usage_log")
+      .select("cost_usd, created_at")
+      .eq("org_id", orgId)
+      .gte("created_at", dayStartIso)
+      .lt("created_at", dayEndIso);
+
+    if (error) {
+      console.error("[ADMIN][AI_SPEND_DAILY] DB error:", error.message);
+      return res.status(500).json({ error: "DB error", details: error.message });
+    }
+
+    const totalUsd = (data || []).reduce((sum, row: any) => {
+      const n = Number(row.cost_usd ?? 0);
+      return sum + (Number.isFinite(n) ? n : 0);
+    }, 0);
+
+    return res.json({
+      org_id: orgId,
+      range: "daily",
+      dt: dayStartIso.slice(0, 10),
+      total_usd: Number(totalUsd.toFixed(6)),
+      caps: {
+        daily_cap: AI_DAILY_CAP,
+        monthly_cap: AI_MONTHLY_CAP,
+        model: AI_MODEL,
+      },
+      since: dayStartIso,
+    });
+  } catch (e: any) {
+    console.error("[ADMIN][AI_SPEND_DAILY] exception:", e?.message || e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+async function getOrgSpendInRange(orgId: string, from: Date, to: Date) {
+  const fromIso = from.toISOString();
+  const toIso = to.toISOString();
+
+  const { data, error } = await supa
+    .from("ai_usage_log")
+    .select("cost_usd")
+    .eq("org_id", orgId)
+    .gte("created_at", fromIso)
+    .lte("created_at", toIso);
+
+  if (error) {
+    console.warn("[ADMIN][AI_SPEND] range query error:", error.message);
+    return 0;
+  }
+
+  const total = (data || []).reduce((sum, row: any) => {
+    const v = Number(row.cost_usd ?? 0);
+    return sum + (Number.isFinite(v) ? v : 0);
+  }, 0);
+
+  // keep numeric stable
+  return Number(total.toFixed(6));
+}
+
+admin.get("/ai/spend/:orgId/weekly", async (req, res) => {
+  try {
+    const orgId = req.params.orgId;
+    if (!orgId) {
+      return res.status(400).json({ error: "orgId is required" });
+    }
+
+    const now = new Date();
+    // last 7 days INCLUDING today
+    const from = new Date(now);
+    from.setDate(from.getDate() - 6); // 6 days back + today = 7
+
+    const totalUsd = await getOrgSpendInRange(orgId, from, now);
+
+    return res.json({
+      org_id: orgId,
+      range: "weekly",
+      since: from.toISOString(),
+      until: now.toISOString(),
+      total_usd: totalUsd,
+      caps: {
+        daily_cap: AI_DAILY_CAP,
+        monthly_cap: AI_MONTHLY_CAP,
+        model: AI_MODEL,
+      },
+    });
+  } catch (e: any) {
+    console.error("[ADMIN][AI_SPEND][weekly] error:", e?.message || e);
+    return res.status(500).json({ error: "Failed to fetch weekly AI spend" });
+  }
+});
+
+
+admin.get("/ai/spend/:orgId/monthly", async (req, res) => {
+  try {
+    const orgId = req.params.orgId;
+    if (!orgId) {
+      return res.status(400).json({ error: "orgId is required" });
+    }
+
+    const now = new Date();
+    // last 30 days INCLUDING today
+    const from = new Date(now);
+    from.setDate(from.getDate() - 29); // 29 days back + today = 30
+
+    const totalUsd = await getOrgSpendInRange(orgId, from, now);
+
+    return res.json({
+      org_id: orgId,
+      range: "monthly",
+      since: from.toISOString(),
+      until: now.toISOString(),
+      total_usd: totalUsd,
+      caps: {
+        daily_cap: AI_DAILY_CAP,
+        monthly_cap: AI_MONTHLY_CAP,
+        model: AI_MODEL,
+      },
+    });
+  } catch (e: any) {
+    console.error("[ADMIN][AI_SPEND][monthly] error:", e?.message || e);
+    return res.status(500).json({ error: "Failed to fetch monthly AI spend" });
+  }
+});
+
 
 export default admin;

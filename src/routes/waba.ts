@@ -41,17 +41,64 @@ waba.get("/", (req, res) => {
 // ─────────────────────────────
 // Send via Cloud API + log to inbox
 // ─────────────────────────────
+// ─────────────────────────────
+// Send via Cloud API + log to inbox
+// ─────────────────────────────
 export async function sendWabaText(opts: {
   phoneNumberId: string;
   to: string;
   text?: string;
-  image?: string; // <── NEW
-  caption?: string; // <── NEW
+  image?: string;
+  caption?: string;
   orgId?: string;
 }) {
-  const token = process.env.WA_ACCESS_TOKEN || process.env.META_WA_TOKEN;
+  // 1) We now require orgId to resolve the per-org WA token
+  if (!opts.orgId) {
+    console.warn(
+      "[WABA] sendWabaText called without orgId – cannot resolve wa_access_token"
+    );
+    return;
+  }
+
+  // 2) Load org settings, including is_disabled + wa_access_token
+  let token: string | null = null;
+
+  try {
+    const { data: row, error } = await supa
+      .from("orgs")
+      .select("is_disabled, wa_access_token")
+      .eq("id", opts.orgId)
+      .maybeSingle();
+
+    if (error) {
+      console.warn("[WABA] sendWabaText org lookup err", error.message);
+      return;
+    }
+
+    if (!row) {
+      console.warn("[WABA] sendWabaText org not found for id", opts.orgId);
+      return;
+    }
+
+    if (row.is_disabled) {
+      console.log("[WABA] org is_disabled, blocking outbound send", {
+        org_id: opts.orgId,
+      });
+      return;
+    }
+
+    token = row.wa_access_token || null;
+  } catch (e: any) {
+    console.warn("[WABA] sendWabaText org check err", e?.message || e);
+    return;
+  }
+
+  // 3) Hard stop if org has no token configured
   if (!token) {
-    console.warn("[WABA] WA_ACCESS_TOKEN missing, cannot send reply");
+    console.warn(
+      "[WABA] wa_access_token missing for org, cannot send reply",
+      opts.orgId
+    );
     return;
   }
 
@@ -65,9 +112,6 @@ export async function sendWabaText(opts: {
     image: opts.image || null,
   });
 
-  // -------------------------------------------
-  // 🚀 1) SEND IMAGE (NEW)
-  // -------------------------------------------
   let payload: any;
 
   if (opts.image) {
@@ -81,9 +125,6 @@ export async function sendWabaText(opts: {
       },
     };
   } else {
-    // -------------------------------------------
-    // 🚀 2) FALLBACK → TEXT (EXACT OLD LOGIC)
-    // -------------------------------------------
     payload = {
       messaging_product: "whatsapp",
       to: toNorm,
@@ -300,7 +341,9 @@ waba.post("/", async (req, res) => {
         // 🔍 Find org for this WABA number
         const { data: orgs, error: orgErr } = await supa
           .from("orgs")
-          .select("id, name, ingest_mode, auto_reply_enabled")
+          .select(
+            "id, name, ingest_mode, auto_reply_enabled, is_disabled, parse_mode"
+          )
           .eq("wa_phone_number_id", phoneNumberId)
           .limit(1);
 
@@ -315,14 +358,14 @@ waba.post("/", async (req, res) => {
           continue;
         }
 
-        // Optional: only process if org is in WABA mode
-        if (org.ingest_mode && org.ingest_mode !== "waba") {
-          console.log("[WABA] org not in waba ingest_mode, skipping", {
-            org_id: org.id,
-            ingest_mode: org.ingest_mode,
-          });
-          continue;
-        }
+        // // Optional: only process if org is in WABA mode
+        // if (org.ingest_mode && org.ingest_mode !== "waba") {
+        //   console.log("[WABA] org not in waba ingest_mode, skipping", {
+        //     org_id: org.id,
+        //     ingest_mode: org.ingest_mode,
+        //   });
+        //   continue;
+        // }
 
         for (const msg of messages) {
           try {
@@ -330,7 +373,7 @@ waba.post("/", async (req, res) => {
             const msgId = msg.id as string;
             const ts = Number(msg.timestamp || Date.now()) * 1000;
             const msgType = msg.type as string;
-        
+
             // 🔁 Dedup per msgId (do this BEFORE type filtering)
             if (seenMsgIds.has(msgId)) {
               console.log("[WABA][DEDUP] skipping already-seen msg", msgId);
@@ -340,12 +383,12 @@ waba.post("/", async (req, res) => {
             if (seenMsgIds.size > MAX_SEEN_MSG_IDS) {
               seenMsgIds.clear();
             }
-        
+
             // 🧩 Normalize text + location
             let text: string = "";
             let location_lat: number | null = null;
             let location_lng: number | null = null;
-        
+
             if (msgType === "text") {
               text = (msg.text?.body || "").trim();
               if (!text) {
@@ -366,7 +409,7 @@ waba.post("/", async (req, res) => {
               // ignore other types for now (image, audio, etc.)
               continue;
             }
-        
+
             console.log("[FLOW][INCOMING][V2]", {
               org_id: org.id,
               from,
@@ -376,21 +419,54 @@ waba.post("/", async (req, res) => {
               location_lat,
               location_lng,
             });
-        
+
             await logInboundMessageToInbox({
               orgId: org.id,
               from,
               text: text || "[non-text message]",
               msgId,
             });
-        
-            // If org has auto-reply disabled, just log and stop
-            if (!org.auto_reply_enabled) {
-              console.log("[WABA] auto_reply disabled for org", org.id);
+
+            // 🛑 1) Hard block: org.disabled → no AI, no outgoing
+            if (org.is_disabled) {
+              console.log("[WABA] org is_disabled, skipping AI + reply", {
+                org_id: org.id,
+              });
               continue;
             }
-        
-            // 🧠 Single call into your AI / order brain
+
+            // 🧭 2) Ingest mode guard (keep existing behaviour)
+            if (org.ingest_mode && org.ingest_mode !== "waba") {
+              console.log(
+                "[WABA] org not in waba ingest_mode after log, skipping AI",
+                {
+                  org_id: org.id,
+                  ingest_mode: org.ingest_mode,
+                }
+              );
+              continue;
+            }
+
+            // ⏸ 3) Parse mode: manual = AI paused / manual mode
+            const parseMode = org.parse_mode || "ai";
+            if (parseMode !== "ai") {
+              console.log("[WABA] parse_mode != 'ai', skipping AI auto-reply", {
+                org_id: org.id,
+                parse_mode: parseMode,
+              });
+              continue;
+            }
+
+            // 🔕 4) Auto-reply toggle: logs ok, but no automatic replies
+            if (!org.auto_reply_enabled) {
+              console.log(
+                "[WABA] auto_reply disabled for org, logging only",
+                org.id
+              );
+              continue;
+            }
+
+            // 🧠 5) Single call into your AI / order brain
             const result = await ingestCoreFromMessage({
               org_id: org.id,
               text,
@@ -402,7 +478,7 @@ waba.post("/", async (req, res) => {
               location_lat,
               location_lng,
             });
-        
+
             console.log("[WABA][INGEST_RESULT][V2]", {
               org_id: org.id,
               from,
@@ -411,24 +487,24 @@ waba.post("/", async (req, res) => {
               reason: result?.reason,
               order_id: result?.order_id,
               stored: result?.stored,
-              image: result?.image || null,   
+              image: result?.image || null,
             });
-        
+
             const reply =
               typeof result?.reply === "string" && result.reply.trim()
                 ? result.reply.trim()
                 : null;
-        
+
             if (reply) {
               await sendWabaText({
                 phoneNumberId,
                 to: from,
                 orgId: org.id,
                 text: reply,
-                image: result?.image || null,    
+                image: result?.image || null,
                 caption: reply,
               });
-        
+
               console.log("[WABA][AUTO_REPLY][V2]", {
                 org_id: org.id,
                 from,

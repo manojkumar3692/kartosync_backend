@@ -167,3 +167,56 @@ export async function addSpendUSD(usd: number) {
     if (IS_DEV_LOG) console.warn("[AI$] addSpendUSD exception:", e?.message || e);
   }
 }
+
+
+// ⬇️ ADD THIS NEW HELPER
+export async function logAiUsageForCall(params: {
+  orgId?: string | null;
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number | null } | null;
+  model?: string | null;
+  raw?: any; // optional: prompt/response metadata
+}) {
+  try {
+    const { orgId, usage, model, raw } = params;
+    if (!usage) return;
+
+    const promptTokens = usage.prompt_tokens ?? 0;
+    const completionTokens = usage.completion_tokens ?? 0;
+    const totalTokens =
+      usage.total_tokens ?? promptTokens + completionTokens;
+
+    // 💰 Reuse your existing cost estimator
+    const costUsd = estimateCostUSD(
+      {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+      },
+      model || undefined
+    );
+
+    // 🔄 Keep your existing daily-budget tracking working
+    if (costUsd > 0) {
+      await addSpendUSD(costUsd);
+    }
+
+    // 🧾 Per-call, per-org log in ai_usage_log
+    const payload = {
+      org_id: orgId ?? null,
+      model: model ?? null,
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: totalTokens,
+      cost_usd: costUsd > 0 ? Number(costUsd.toFixed(4)) : null,
+      raw: raw ? JSON.stringify(raw).slice(0, 50000) : null, // avoid insane blobs
+    };
+
+    const { error } = await supa.from("ai_usage_log").insert(payload);
+    if (error && IS_DEV_LOG) {
+      console.warn("[AI_USAGE_LOG] insert error:", error.message);
+    }
+  } catch (e: any) {
+    if (IS_DEV_LOG) {
+      console.warn("[AI_USAGE_LOG] exception:", e?.message || e);
+    }
+  }
+}

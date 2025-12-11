@@ -9,6 +9,7 @@ import { handleFinalConfirmation } from "./finalConfirmationEngine";
 import { handleCatalogFallbackFlow as handleCatalogFlow } from "./orderLegacyEngine";
 import { parseIntent, type Vertical } from "./intentEngine";
 import { supa } from "../../db";
+import { detectServiceIntentAndReply } from "./serviceIntentEngine";
 
 // 🔤 NEW: language + alias helpers
 import { normalizeCustomerText } from "../lang/normalize";
@@ -269,14 +270,35 @@ export async function ingestCoreFromMessage(
   }
 
   const vertical = await getOrgVertical(org_id);
+
+  // 🔍 NEW: service intent layer for "do you deliver now", "are you open", "price?" etc.
+  const serviceResult = await detectServiceIntentAndReply(org_id, idleIntentText, {
+    raw,
+    vertical,
+  });
+
+  if (serviceResult) {
+    console.log("[AI][INGEST][SERVICE_INTENT]", {
+      org_id,
+      from_phone,
+      kind: serviceResult.kind,
+      preview: (serviceResult.reply || "").slice(0, 140),
+    });
+    return serviceResult;
+  }
+
+  // Normal order / product intent logic
   let intent = await parseIntent(idleIntentText, { vertical, state });
 
   // 🛡 Guard: don't treat messages with NO digits as multi-item "add_items"
   if (intent.intent === "add_items" && !/\d/.test(idleIntentText)) {
-    console.log("[AI][INGEST][INTENT][IDLE][DOWNGRADE_ADD_ITEMS_NO_DIGITS]", {
-      idleIntentText,
-      intentBefore: intent,
-    });
+    console.log(
+      "[AI][INGEST][INTENT][IDLE][DOWNGRADE_ADD_ITEMS_NO_DIGITS]",
+      {
+        idleIntentText,
+        intentBefore: intent,
+      }
+    );
 
     intent = {
       ...intent,

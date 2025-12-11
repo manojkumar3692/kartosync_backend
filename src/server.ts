@@ -24,6 +24,7 @@ import path from "path"; // ⬅️ add this
 import adminBusiness from './routes/admin_business';
 import testing from './routes/testing';
 import { customerInsight } from "./routes/customerInsight";
+import { adminAiFaq } from "./routes/adminAiFaq";
 
 // ─────────────────────────────
 // Boot diagnostics
@@ -120,7 +121,7 @@ app.use("/customer-insight", customerInsight);
 // new changes
 app.use("/admin/business", adminBusiness);
 app.use("/api/testing", testing);
-
+app.use("/admin/ai", adminAiFaq);
 // ─────────────────────────────
 // Server start
 // ─────────────────────────────

@@ -112,39 +112,68 @@ inbox.get("/conversations/:conversationId/messages", async (req, res) => {
 
 // ───────────────── POST /send ─────────────────
 // Body: { org_id, phone, text }  (phone optional if you prefer conversation_id later)
+// ───────────────── POST /send ─────────────────
 inbox.post("/send", express.json(), async (req, res) => {
   try {
     const orgId = getOrgId(req) || String(req.body?.org_id || "");
     // accept either `phone` or legacy `to`
     const phoneRaw = String(req.body?.phone || req.body?.to || "");
     const text = String(req.body?.text || "");
-    if (!orgId) return res.status(401).json({ ok: false, error: "no_org" });
+
+    if (!orgId) {
+      return res.status(401).json({ ok: false, error: "no_org" });
+    }
     if (!phoneRaw || !text) {
-      return res.status(400).json({ ok: false, error: "phone_and_text_required" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "phone_and_text_required" });
     }
 
-    // find org → phone_number_id
-    const { data: orgs, error: orgErr } = await supa
+    // find org → phone_number_id + wa_access_token + is_disabled
+    const { data: orgRow, error: orgErr } = await supa
       .from("orgs")
-      .select("id, wa_phone_number_id")
+      .select("id, wa_phone_number_id, wa_access_token, is_disabled")
       .eq("id", orgId)
       .limit(1)
-      .single();
+      .maybeSingle();
 
-    if (orgErr) throw orgErr;
-    const phoneNumberId = (orgs as any)?.wa_phone_number_id;
-    if (!phoneNumberId) {
-      return res.status(400).json({ ok: false, error: "org_missing_wa_phone_number_id" });
+    if (orgErr) {
+      console.error("[INBOX][send] org lookup err", orgErr.message);
+      return res.status(500).json({ ok: false, error: "org_lookup_failed" });
+    }
+    if (!orgRow) {
+      return res.status(404).json({ ok: false, error: "org_not_found" });
     }
 
-    if (!META_WA_TOKEN) {
-      console.warn("[INBOX][send] META_WA_TOKEN/WA_ACCESS_TOKEN missing");
-      return res.status(500).json({ ok: false, error: "wa_token_missing" });
+    const phoneNumberId = (orgRow as any).wa_phone_number_id;
+    const waToken = String((orgRow as any).wa_access_token || "").trim();
+    const isDisabled = !!(orgRow as any).is_disabled;
+
+    if (!phoneNumberId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "org_missing_wa_phone_number_id" });
+    }
+
+    if (!waToken) {
+      console.warn("[INBOX][send] org missing wa_access_token", { orgId });
+      return res
+        .status(400)
+        .json({ ok: false, error: "org_missing_wa_access_token" });
+    }
+
+    if (isDisabled) {
+      console.log("[INBOX][send] org is_disabled, blocking outbound send", {
+        orgId,
+      });
+      return res
+        .status(403)
+        .json({ ok: false, error: "org_disabled" });
     }
 
     const toNorm = normE164(phoneRaw);
 
-    // Send via Cloud API
+    // Send via Cloud API (per-org token)
     const resp = await axios.post(
       `${META_WA_BASE}/${phoneNumberId}/messages`,
       {
@@ -155,7 +184,7 @@ inbox.post("/send", express.json(), async (req, res) => {
       },
       {
         headers: {
-          Authorization: `Bearer ${META_WA_TOKEN}`,
+          Authorization: `Bearer ${waToken}`,
           "Content-Type": "application/json",
         },
       }
