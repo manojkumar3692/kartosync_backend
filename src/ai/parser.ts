@@ -3,10 +3,10 @@ import OpenAI from "openai";
 import { z } from "zod";
 import { parseOrder as ruleParse } from "../parser";
 import {
-  addSpendUSD,
   canSpendMoreUSD,
   estimateCostUSD,
   estimateCostUSDApprox,
+  logAiUsageForCall
 } from "./cost"; // keep your existing budget guard
 import { supa } from "../db";
 
@@ -288,38 +288,20 @@ async function callOrderModelRaw(
   console.log("[AI][order] model used:", model, "latency_ms:", ms);
 
   // ─────────────────────────────────────────────
-  // 3) Track spend (global + per-org)
+  // 3) Track spend (global + per-org) via helper
   // ─────────────────────────────────────────────
   try {
-    const usage = completion.usage;
-    if (usage) {
-      const actualCost = estimateCostUSD(
-        {
-          prompt_tokens: usage.prompt_tokens ?? 0,
-          completion_tokens: usage.completion_tokens ?? 0,
-        },
-        model
-      );
-
-      // Global daily bucket (ai_daily_spend + RPC)
-      await addSpendUSD(actualCost);
-
-      // Per-org usage log (for SpendTab + org analytics)
-      if (orgId) {
-        await supa.from("ai_usage_log").insert({
-          org_id: orgId,
-          prompt_tokens: usage.prompt_tokens ?? null,
-          completion_tokens: usage.completion_tokens ?? null,
-          total_tokens: usage.total_tokens ?? null,
-          model,
-          cost_usd: actualCost,
-          raw: JSON.stringify({
-            response_id: completion.id,
-            system_fingerprint: (completion as any).system_fingerprint ?? null,
-          }),
-        });
-      }
-    }
+    await logAiUsageForCall({
+      orgId,
+      usage: completion.usage,
+      model,
+      raw: {
+        source: "aiParseOrder",
+        response_id: completion.id,
+        latency_ms: ms,
+        org_id: orgId ?? null,
+      },
+    });
   } catch (e: any) {
     console.warn("[AI][order] spend / usage logging failed", e?.message || e);
   }

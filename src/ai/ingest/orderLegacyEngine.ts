@@ -150,7 +150,7 @@ export async function handleCatalogFallbackFlow(
   let raw = (text || "").trim();
   const lowerRaw = raw.toLowerCase();
 
-    // Prefer AI-normalized text (from intent) for catalog matching.
+  // Prefer AI-normalized text (from intent) for catalog matching.
   // This is usually English + cleaned (e.g. "bro oru biriyani kodunga" → "give me a biryani").
   const semanticText =
     (ctx.intent?.normalized && ctx.intent.normalized.trim()) ||
@@ -161,6 +161,21 @@ export async function handleCatalogFallbackFlow(
 
   // 0) Load catalog
   const catalog = await loadActiveProducts(org_id);
+
+  // 🛡 Safety: if we are in idle state but a stale multi-item queue exists,
+  // clear it so a fresh order doesn't show "2 of 2" from an old conversation.
+  const possibleStale = await getTemp(org_id, from_phone);
+  if (
+    state === "idle" &&
+    possibleStale?.multi_item_queue &&
+    Array.isArray(possibleStale.multi_item_queue) &&
+    possibleStale.multi_item_queue.length > 0
+  ) {
+    await saveTemp(org_id, from_phone, {
+      multi_item_queue: null,
+      current_item_index: null,
+    });
+  }
 
   if (!catalog || catalog.length === 0) {
     return {
@@ -445,6 +460,13 @@ export async function handleCatalogFallbackFlow(
     }
 
     // 🧺 otherwise: queue finished → go to confirm
+
+    // 🔚 Queue is fully processed – clear multi-item context so it won't leak
+    await saveTemp(org_id, from_phone, {
+      multi_item_queue: null,
+      current_item_index: null,
+    });
+
     await setState(org_id, from_phone, "confirming_order");
     await resetAttempts(org_id, from_phone);
 
@@ -665,7 +687,7 @@ export async function handleCatalogFallbackFlow(
 
   if (state === "idle") {
     const variantHits = findVariantMatches(semanticText, catalog);
-    
+
     if (variantHits && variantHits.length === 1) {
       const hit = variantHits[0];
 
@@ -858,9 +880,9 @@ export async function handleCatalogFallbackFlow(
         ? row.current_item_index!
         : null;
 
-        const isSkipPhrase = ["skip", "no need", "leave it", "no thanks"].some(
-          (p) => lowerRaw.includes(p) || semanticLower.includes(p)
-        );
+    const isSkipPhrase = ["skip", "no need", "leave it", "no thanks"].some(
+      (p) => lowerRaw.includes(p) || semanticLower.includes(p)
+    );
 
     if (queue && idx !== null && idx >= 0 && idx < queue.length) {
       const current = queue[idx];
@@ -895,6 +917,11 @@ export async function handleCatalogFallbackFlow(
 
       // No more items in queue → if we have cart, go to confirm; else generic fallback
       if (cart.length > 0) {
+        // 🔚 Queue finished here as well (e.g. skipped last item) – clear queue context
+        await saveTemp(org_id, from_phone, {
+          multi_item_queue: null,
+          current_item_index: null,
+        });
         await setState(org_id, from_phone, "confirming_order");
         await resetAttempts(org_id, from_phone);
 
@@ -939,7 +966,11 @@ export async function handleCatalogFallbackFlow(
             "Please reply with the number.",
         };
       }
-
+      // Even if no cart, clear any stale multi-item context to avoid leaking into next order
+      await saveTemp(org_id, from_phone, {
+        multi_item_queue: null,
+        current_item_index: null,
+      });
       // Queue finished and no cart → normal generic fallback
     }
 

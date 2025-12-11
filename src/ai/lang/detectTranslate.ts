@@ -1,5 +1,6 @@
 // src/ai/lang/detectTranslate.ts
 import OpenAI from "openai";
+import { logAiUsageForCall } from "../cost";
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
@@ -41,6 +42,26 @@ export async function detectAndTranslate(
         },
       ],
     });
+
+
+     // ✅ Log usage (counts toward ai_daily_spend + ai_usage_log)
+     try {
+      await logAiUsageForCall({
+        orgId: null, // or pass an org id if you wire it in later
+        usage: completion.usage,
+        model: completion.model || AI_MODEL,
+        raw: {
+          source: "detectAndTranslate",
+          text_len: input.length,
+          response_id: completion.id,
+        },
+      });
+    } catch (e: any) {
+      console.warn(
+        "[lang] detectAndTranslate usage log failed",
+        e?.message || e
+      );
+    }
 
     const messageContent:any = completion.choices[0]?.message?.content;
 
