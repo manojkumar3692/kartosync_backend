@@ -96,7 +96,7 @@ async function saveTemp(
 
 function formatQuickMenu(catalog: ProductRow[]): string {
   const lines = catalog
-    .slice(0, 8)
+    .slice(0, 13)
     .map(
       (c) =>
         `• ${c.display_name || c.canonical} (${c.variant || ""}) - ${

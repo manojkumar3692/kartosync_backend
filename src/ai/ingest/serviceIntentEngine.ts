@@ -7,6 +7,7 @@ type ServiceIntent =
   | "opening_hours"
   | "pricing_generic"
   | "delivery_area"
+  | "store_location"
   | "none";
 
 type OrgServiceConfig = {
@@ -15,18 +16,69 @@ type OrgServiceConfig = {
   store_address_text?: string | null;
   delivery_free_km?: number | null;
   delivery_max_km?: number | null;
-  delivery_fee_type?: string | null;     // 'flat' | 'per_km'
+  delivery_fee_type?: string | null; 
   delivery_flat_fee?: number | null;
   delivery_per_km_fee?: number | null;
   faq_delivery_answer?: string | null;
   faq_opening_hours_answer?: string | null;
   faq_pricing_answer?: string | null;
   faq_delivery_area_answer?: string | null;
+  delivery_open_time?: string | null;  
+  delivery_close_time?: string | null;  
+  store_timezone?: string | null;      
+  phone?: string | null;
+  store_lat?: number | null;
+  store_lng?: number | null; 
 };
 
 // Simple helper: lower + trimmed
 function norm(text: string): string {
   return (text || "").toLowerCase().trim();
+}
+
+function parseHHMM(s?: string | null) {
+  if (!s) return null;
+  const m = String(s).match(/^(\d{1,2}):(\d{2})/); // supports "10:30" or "10:30:00"
+  if (!m) return null;
+  return { h: Number(m[1]), m: Number(m[2]) };
+}
+
+function getMinutesInTimeZone(tz: string) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+
+  const hh = Number(parts.find((p) => p.type === "hour")?.value ?? "0");
+  const mm = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
+  return hh * 60 + mm;
+}
+
+function isOpenNowInTz(tz: string, openHHMM: string | null, closeHHMM: string | null) {
+  const o = parseHHMM(openHHMM);
+  const c = parseHHMM(closeHHMM);
+  if (!o || !c) return { hasHours: false, isOpen: false };
+
+  const openMin = o.h * 60 + o.m;
+  const closeMin = c.h * 60 + c.m;
+  const nowMin = getMinutesInTimeZone(tz);
+
+  // same-day window
+  if (closeMin > openMin) {
+    return { hasHours: true, isOpen: nowMin >= openMin && nowMin < closeMin };
+  }
+
+  // overnight window (e.g. 18:00 → 02:00)
+  return { hasHours: true, isOpen: nowMin >= openMin || nowMin < closeMin };
+}
+
+function fmtHours(openHHMM: string | null, closeHHMM: string | null) {
+  if (!openHHMM || !closeHHMM) return "";
+  const o = (openHHMM || "").slice(0, 5);
+  const c = (closeHHMM || "").slice(0, 5);
+  return `Today’s hours: *${o} – ${c}*`;
 }
 
 function detectServiceIntent(text: string): ServiceIntent {
@@ -74,6 +126,21 @@ function detectServiceIntent(text: string): ServiceIntent {
     return "opening_hours";
   }
 
+  // Store location / address
+if (
+  t.includes("where is your store") ||
+  t.includes("where is the store") ||
+  t.includes("store address") ||
+  t.includes("address") ||
+  t.includes("location") ||
+  t.includes("google map") ||
+  t.includes("map") ||
+  t.includes("how to reach") ||
+  t.includes("route")
+) {
+  return "store_location";
+}
+
   // Generic price / pricing questions (not tied to a specific item)
   if (
     t.includes("price") ||
@@ -90,6 +157,33 @@ function detectServiceIntent(text: string): ServiceIntent {
   return "none";
 }
 
+function buildStoreLocationReply(cfg: OrgServiceConfig): string {
+  const name = cfg.name || "We";
+  const addr = (cfg.store_address_text || "").trim();
+  const phone = (cfg.phone || "").trim();
+  const lat = typeof cfg.store_lat === "number" ? cfg.store_lat : null;
+  const lng = typeof cfg.store_lng === "number" ? cfg.store_lng : null;
+
+  const lines: string[] = [];
+  lines.push(`📍 *${name}* location:`);
+
+  if (addr) lines.push(`Address: *${addr}*`);
+
+  if (lat != null && lng != null) {
+    lines.push(`🗺️ Google Maps: https://www.google.com/maps?q=${lat},${lng}`);
+  }
+
+  if (phone) lines.push(`📞 Call/WhatsApp: *${phone}*`);
+
+  if (!addr && (lat == null || lng == null)) {
+    lines.push(
+      "Please share your *location pin* (📎 → Location) and I’ll guide you."
+    );
+  }
+
+  return lines.join("\n");
+}
+
 function buildDeliveryNowReply(
   cfg: OrgServiceConfig,
   text: string
@@ -100,6 +194,15 @@ function buildDeliveryNowReply(
   }
 
   const name = cfg.name || "we";
+  const tz = cfg.store_timezone || "Asia/Kolkata";
+  const openT = cfg.delivery_open_time ?? null;
+  const closeT = cfg.delivery_close_time ?? null;
+
+  const st = isOpenNowInTz(tz, openT, closeT);
+  const hoursLine = fmtHours(openT, closeT);
+  if (st.hasHours && !st.isOpen) {
+    return `❌ Sorry, *${name}* is *closed* right now, so we’re *not delivering now*.\n${hoursLine}\n\nYou can still send your order — we’ll confirm it when we open.`;
+  }
   const freeKm = Number(cfg.delivery_free_km ?? 0);
   const maxKm = Number(cfg.delivery_max_km ?? 0);
   const feeType = (cfg.delivery_fee_type || "").toLowerCase();
@@ -108,7 +211,8 @@ function buildDeliveryNowReply(
 
   const lines: string[] = [];
 
-  lines.push(`Yes, ${name} can deliver to you during our working hours.`);
+  lines.push(`✅ Yes, ${name} can deliver now.`);
+  if (hoursLine) lines.push(hoursLine);
 
   if (maxKm > 0) {
     lines.push(`We usually deliver within *${maxKm} km* from the store.`);
@@ -147,12 +251,26 @@ function buildOpeningHoursReply(cfg: OrgServiceConfig): string {
     return cfg.faq_opening_hours_answer.trim();
   }
 
-  // We don't know exact hours from DB yet → generic but useful answer
-  const name = cfg.name || "we";
+  const name = cfg.name || "We";
+  const tz = cfg.store_timezone || "Asia/Kolkata";
 
+  const openT = cfg.delivery_open_time ?? null;
+  const closeT = cfg.delivery_close_time ?? null;
+
+  const st = isOpenNowInTz(tz, openT, closeT);
+  const hoursLine = fmtHours(openT, closeT);
+
+  if (st.hasHours) {
+    if (st.isOpen) {
+      return `✅ Yes, *${name}* is *OPEN* now.\n${hoursLine}\n\nType *menu* or send items (e.g. *2 Chicken Biryani, 1 Coke*).`;
+    }
+    return `❌ *${name}* is *CLOSED* right now.\n${hoursLine}\n\nYou can still send your order — we’ll confirm it when we open.`;
+  }
+
+  // fallback if hours not configured
   return [
-    `${name} is open daily during our regular working hours.`,
-    "For the most accurate timing, please check our Google listing or ask the staff here.",
+    `${name} is open during our working hours.`,
+    "Please ask the staff here for exact timings.",
     "",
     "You can still send your order any time — we’ll process it during working hours.",
   ].join("\n");
@@ -227,8 +345,14 @@ export async function detectServiceIntentAndReply(
       .select(
         `
         name,
+        phone,
         business_type,
         store_address_text,
+        store_lat,
+        store_lng,
+        delivery_open_time,
+        delivery_close_time,
+        store_timezone,
         delivery_free_km,
         delivery_max_km,
         delivery_fee_type,
@@ -263,6 +387,9 @@ export async function detectServiceIntentAndReply(
         break;
       case "delivery_area":
         reply = buildDeliveryAreaReply(cfg);
+        break;
+      case "store_location":
+        reply = buildStoreLocationReply(cfg);
         break;
       default:
         return null;
