@@ -108,6 +108,102 @@ function formatQuickMenu(catalog: ProductRow[]): string {
   return `Here are some items from today's menu:\n\n${lines.join("\n")}`;
 }
 
+type UpsellOption = {
+  source_product_id: string;
+  upsell_product_id: string;
+  name: string;
+  variant?: string | null;
+  price?: number | null;
+  max_qty: number;
+  custom_prompt?: string | null;
+};
+
+async function loadUpsellOptionForSource(
+  org_id: string,
+  source_product_id: string
+): Promise<UpsellOption[]> {
+  const { data, error } = await supa
+    .from("product_upsells")
+    .select(
+      `
+      source_product_id,
+      upsell_product_id,
+      max_qty,
+      custom_prompt,
+      upsell:products!product_upsells_upsell_fk(
+        id,
+        display_name,
+        canonical,
+        variant,
+        price_per_unit
+      )
+    `
+    )
+    .eq("org_id", org_id)
+    .eq("source_product_id", source_product_id)
+    .eq("is_active", true);
+
+  if (error) {
+    console.error("[UPSELL][LOAD][ERROR]", {
+      org_id,
+      source_product_id,
+      error,
+    });
+    return [];
+  }
+
+  const rows = Array.isArray(data) ? data : [];
+  return rows
+    .map((r: any) => {
+      const p = r.upsell;
+      if (!p?.id) return null;
+      return {
+        source_product_id: r.source_product_id,
+        upsell_product_id: p.id,
+        name: p.display_name || p.canonical,
+        variant: p.variant ?? null,
+        price: typeof p.price_per_unit === "number" ? p.price_per_unit : null,
+        max_qty: typeof r.max_qty === "number" ? r.max_qty : 2,
+        custom_prompt: r.custom_prompt ?? null,
+      } as UpsellOption;
+    })
+    .filter(Boolean) as UpsellOption[];
+}
+
+function buildUpsellPrompt(prefix: string, opt: UpsellOption): string {
+  const v = opt.variant ? ` (${opt.variant})` : "";
+  const price = opt.price != null ? ` – ${opt.price}` : "";
+
+  const base =
+    (opt.custom_prompt && opt.custom_prompt.trim()) ||
+    `Would you like to add *${opt.name}${v}*${price}?`;
+
+  return (
+    prefix +
+    `${base}\n` +
+    `1) Yes\n` +
+    `2) No\n` +
+    `3) Skip\n\n` +
+    `Please reply with the number.`
+  );
+}
+
+function parseUpsellReply(raw: string, _maxQty: number): number | null {
+  const t = (raw || "").trim().toLowerCase();
+
+  // numbers
+  if (t === "1") return 1; // yes -> add 1
+  if (t === "2") return 0; // no
+  if (t === "3") return 0; // skip
+
+  // words
+  if (t === "yes" || t === "y") return 1;
+  if (t === "no" || t === "n") return 0;
+  if (t === "skip") return 0;
+
+  return null;
+}
+
 // ─────────────────────────────────────────────
 // 🆕 Helpers for "item 1 of 3" prefix
 // ─────────────────────────────────────────────
@@ -165,6 +261,22 @@ export async function handleCatalogFallbackFlow(
   // 🛡 Safety: if we are in idle state but a stale multi-item queue exists,
   // clear it so a fresh order doesn't show "2 of 2" from an old conversation.
   const possibleStale = await getTemp(org_id, from_phone);
+
+    // 🛟 RECOVERY: if state was lost but temp has an upsell context,
+  // force the flow back into ordering_upsell so "1/0/skip" works.
+  if (state === "idle") {
+    const tmp = await getTemp(org_id, from_phone);
+    const maybeUpsell = tmp?.item as any;
+
+    // detect our stored upsell object shape
+    if (maybeUpsell?.upsell_product_id && maybeUpsell?.source_product_id) {
+      await setState(org_id, from_phone, "ordering_upsell");
+      // re-run same message but now with correct state
+      return handleCatalogFallbackFlow(ctx, "ordering_upsell" as any);
+    }
+  }
+
+
   if (
     state === "idle" &&
     possibleStale?.multi_item_queue &&
@@ -336,7 +448,27 @@ export async function handleCatalogFallbackFlow(
       item: null,
       list: null,
     });
-    
+
+    // ✅ Check upsell for this selected variant (source_product_id = item.id)
+    const upsells = await loadUpsellOptionForSource(org_id, item.id);
+
+    if (upsells.length > 0) {
+      const opt = upsells[0]; // unique(org_id, source_product_id) => at most one
+      const tmp = await getTemp(org_id, from_phone);
+      const prefix = buildItemPrefix(tmp);
+
+      // store upsell context in `item` (existing column)
+      await saveTemp(org_id, from_phone, { item: opt as any, list: null });
+      await setState(org_id, from_phone, "ordering_upsell");
+
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply: buildUpsellPrompt(prefix, opt),
+      };
+    }
+
     // 🆕 MULTI-ITEM QUEUE HANDLER
     const tmpRow = await getTemp(org_id, from_phone);
 
@@ -494,6 +626,213 @@ export async function handleCatalogFallbackFlow(
 
     const totalLine = total > 0 ? `\n\n💰 Total: ${total}` : "";
 
+    return {
+      used: true,
+      kind: "order",
+      order_id: null,
+      reply:
+        "🧺 Your cart:\n" +
+        lines.join("\n") +
+        totalLine +
+        "\n\n" +
+        "1) Confirm order\n" +
+        "2) Add another item\n" +
+        "3) Change quantity\n" +
+        "4) Remove an item\n" +
+        "5) Cancel\n\n" +
+        "Please reply with the number.",
+    };
+  }
+
+  // ─────────────────────────────────────────────
+  // 1.5) UPSELL STEP (after qty, before moving queue / confirm)
+  // ─────────────────────────────────────────────
+  if (state === "ordering_upsell") {
+    const row = await getTemp(org_id, from_phone);
+    const prefix = buildItemPrefix(row);
+
+    const opt = row?.item as UpsellOption | null;
+    if (!opt) {
+      // safety: if upsell context missing, just continue
+      await setState(org_id, from_phone, "ordering_item");
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply: prefix + "Okay 👍 Please type the next item.",
+      };
+    }
+
+    const qtyToAdd = parseUpsellReply(raw, opt.max_qty);
+
+    if (qtyToAdd === null) {
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply: buildUpsellPrompt(prefix, opt),
+      };
+    }
+
+    const cart = Array.isArray(row?.cart) ? row!.cart! : [];
+    let newCart = cart;
+
+    if (qtyToAdd > 0) {
+      newCart = [
+        ...cart,
+        {
+          product_id: opt.upsell_product_id,
+          name: opt.name,
+          variant: opt.variant ?? null,
+          qty: qtyToAdd,
+          price: opt.price ?? null,
+          meta: { upsell: true, source_product_id: opt.source_product_id },
+        },
+      ];
+    }
+
+    // clear upsell context
+    await saveTemp(org_id, from_phone, {
+      cart: newCart,
+      item: null,
+      list: null,
+    });
+
+    // ✅ Continue: if queue active -> next item, else confirm
+    const queue = row?.multi_item_queue || null;
+    const idx =
+      typeof row?.current_item_index === "number"
+        ? row.current_item_index!
+        : null;
+
+    if (queue && idx !== null) {
+      const nextIndex = idx + 1;
+
+      if (nextIndex < queue.length) {
+        const nextItem: any = queue[nextIndex];
+
+        await saveTemp(org_id, from_phone, {
+          current_item_index: nextIndex,
+          item: null,
+          list: null,
+        });
+
+        const rowForPrefix = await getTemp(org_id, from_phone);
+        const itemPrefix = buildItemPrefix(rowForPrefix);
+
+        const nextName = nextItem.name;
+        const matches = findCanonicalMatches(nextName, catalog);
+
+        if (matches.length === 0) {
+          await setState(org_id, from_phone, "ordering_item");
+          return {
+            used: true,
+            kind: "order",
+            order_id: null,
+            reply:
+              itemPrefix +
+              `I couldn't find *${nextName}* in today's menu.\n` +
+              `You can type a different item name, or send *skip* if you don't want this item..`,
+          };
+        }
+
+        if (matches.length === 1) {
+          const { canonical, variants } = matches[0];
+
+          if (variants.length === 1) {
+            const item2 = variants[0];
+            await saveTemp(org_id, from_phone, { item: item2, list: null });
+            await setState(org_id, from_phone, "ordering_qty");
+            return {
+              used: true,
+              kind: "order",
+              order_id: null,
+              reply:
+                itemPrefix +
+                `How many *${item2.display_name || item2.canonical} (${
+                  item2.variant
+                })*?`,
+            };
+          }
+
+          await saveTemp(org_id, from_phone, {
+            item: { canonical },
+            list: null,
+          });
+          await setState(org_id, from_phone, "ordering_variant");
+
+          const variantLines = variants
+            .map((v, i) => {
+              const price = v.price_per_unit ? ` – ${v.price_per_unit}` : "";
+              return `${i + 1}) ${v.display_name || v.canonical} – ${
+                v.variant || ""
+              }${price}`;
+            })
+            .join("\n");
+
+          return {
+            used: true,
+            kind: "order",
+            order_id: null,
+            reply:
+              itemPrefix +
+              `Choose a variant for *${canonical}*:\n${variantLines}\n\nPlease reply with the number.`,
+          };
+        }
+
+        const optionsText = matches
+          .map((m, i) => `${i + 1}) ${m.canonical}`)
+          .join("\n");
+        await saveTemp(org_id, from_phone, {
+          list: matches.map((m) => ({ canonical: m.canonical })),
+          item: null,
+        });
+        await setState(org_id, from_phone, "ordering_item");
+
+        return {
+          used: true,
+          kind: "order",
+          order_id: null,
+          reply:
+            itemPrefix +
+            `I found multiple items:\n${optionsText}\n\nPlease reply with the number.`,
+        };
+      }
+
+      // queue finished -> confirm
+      await saveTemp(org_id, from_phone, {
+        multi_item_queue: null,
+        current_item_index: null,
+      });
+    }
+
+    await setState(org_id, from_phone, "confirming_order");
+    await resetAttempts(org_id, from_phone);
+    
+    // rebuild cart summary (same as ordering_qty confirm block)
+    const lines = newCart.map((li: any, idx: number) => {
+      const lineTotal =
+        typeof li.price === "number" ? li.price * li.qty : undefined;
+      const pricePart =
+        lineTotal != null
+          ? ` – ${lineTotal}`
+          : li.price
+          ? ` – ${li.price}`
+          : "";
+      return `${idx + 1}) ${li.name}${li.variant ? ` (${li.variant})` : ""} x ${
+        li.qty
+      }${pricePart}`;
+    });
+    
+    const total = newCart.reduce((sum: number, li: any) => {
+      if (typeof li.price === "number" && typeof li.qty === "number") {
+        return sum + li.price * li.qty;
+      }
+      return sum;
+    }, 0);
+    
+    const totalLine = total > 0 ? `\n\n💰 Total: ${total}` : "";
+    
     return {
       used: true,
       kind: "order",
