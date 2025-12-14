@@ -170,17 +170,31 @@ async function loadUpsellOptionForSource(
     .filter(Boolean) as UpsellOption[];
 }
 
-function buildUpsellPrompt(prefix: string, opt: UpsellOption): string {
+function buildUpsellPrompt(
+  prefix: string,
+  opt: UpsellOption,
+  vertical: "restaurant" | "grocery" | "salon" | "pharmacy" | "generic"
+): string {
   const v = opt.variant ? ` (${opt.variant})` : "";
   const price = opt.price != null ? ` – ${opt.price}` : "";
 
-  const base =
-    (opt.custom_prompt && opt.custom_prompt.trim()) ||
-    `Would you like to add *${opt.name}${v}*${price}?`;
+  const adminHeader = (opt.custom_prompt || "").trim();
+
+  // Restaurant-only default header (only if admin didn't provide one)
+  const defaultHeader =
+    vertical === "restaurant"
+      ? `Popular add-on 🔥\nIt goes well with your order 😊`
+      : "";
+
+  const header = adminHeader || defaultHeader;
+
+  // ✅ Always include the actual item line
+  const itemLine = `Would you like to add *${opt.name}${v}*${price}?`;
 
   return (
     prefix +
-    `${base}\n` +
+    (header ? `${header}\n\n` : "") +
+    `${itemLine}\n\n` +
     `1) Yes\n` +
     `2) No\n` +
     `3) Skip\n\n` +
@@ -242,7 +256,7 @@ export async function handleCatalogFallbackFlow(
   ctx: IngestContext,
   state: ConversationState
 ): Promise<IngestResult> {
-  const { org_id, from_phone, text } = ctx;
+  const { org_id, from_phone, text, vertical } = ctx;
   let raw = (text || "").trim();
   const lowerRaw = raw.toLowerCase();
 
@@ -465,7 +479,7 @@ export async function handleCatalogFallbackFlow(
         used: true,
         kind: "order",
         order_id: null,
-        reply: buildUpsellPrompt(prefix, opt),
+        reply: buildUpsellPrompt(prefix, opt, vertical),
       };
     }
 
@@ -670,7 +684,7 @@ export async function handleCatalogFallbackFlow(
         used: true,
         kind: "order",
         order_id: null,
-        reply: buildUpsellPrompt(prefix, opt),
+        reply: buildUpsellPrompt(prefix, opt, vertical),
       };
     }
 

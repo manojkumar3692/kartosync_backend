@@ -73,7 +73,8 @@ function isOrderingState(state: ConversationState): boolean {
   return (
     state === "ordering_item" ||
     state === "ordering_variant" ||
-    state === "ordering_qty"
+    state === "ordering_qty" ||
+    state === "ordering_upsell"
   );
 }
 
@@ -303,7 +304,7 @@ export async function ingestCoreFromMessage(
 
     console.log("[AI][INGEST][INTENT][ORDERING]", { vertical, state, intent });
 
-    return handleCatalogFlow({ ...ctx, intent }, state);
+    return handleCatalogFlow({ ...ctx, intent, vertical }, state);
   }
 
   // ------------------------------------------------------
@@ -547,5 +548,5 @@ export async function ingestCoreFromMessage(
 
   console.log("[AI][INGEST][INTENT][IDLE]", { vertical, state, intent });
 
-  return handleCatalogFlow({ ...ctx, intent }, "idle");
+  return handleCatalogFlow({ ...ctx, intent, vertical }, "idle");
 }
