@@ -9,12 +9,64 @@ import { handleFinalConfirmation } from "./finalConfirmationEngine";
 import { handleCatalogFallbackFlow as handleCatalogFlow } from "./orderLegacyEngine";
 import { parseIntent, type Vertical } from "./intentEngine";
 import { supa } from "../../db";
-import { detectServiceIntentAndReply } from "./serviceIntentEngine";
-
-// 🔤 NEW: language + alias helpers
+import { routeIntent, learnOverride, type IntentLane } from "./intentRouter";
+import {
+  handleServiceLaneAndReply,
+  type ServiceLane,
+} from "./serviceIntentEngine";
 import { normalizeCustomerText } from "../lang/normalize";
 import { detectAndTranslate } from "../lang/detectTranslate";
 import { getAliasHints } from "../aliases";
+
+console.log("🔥🔥 INGEST INDEX.TS RUNNING v999");
+
+function isCorrectionMessage(t: string) { 
+  const s = (t || "").toLowerCase();
+
+  // English
+  if (
+    (s.startsWith("no") &&
+      (s.includes("i asked") ||
+        s.includes("i meant") ||
+        s.includes("wrong") ||
+        s.includes("not that"))) ||
+    s.includes("not that") ||
+    s.includes("wrong") ||
+    s.includes("i asked") ||
+    s.includes("i meant") ||
+    s.includes("i was asking")
+  )
+    return true;
+
+  // Tamil common “correction” patterns (romanized)
+  if (
+    s.includes("illa") || // no
+    s.includes("athu illa") || // not that
+    s.includes("keten") || // i asked
+    s.includes("kett") || // asked (variants)
+    s.includes("nu keten") || // i asked that
+    s.includes("naan keten") // i asked
+  )
+    return true;
+
+  return false;
+}
+
+async function getLastIntentEvent(
+  orgId: string,
+  customerPhone: string,
+  offset = 0
+) {
+  const { data } = await supa
+    .from("org_intent_events")
+    .select("id, normalized_text, decided_intent, created_at")
+    .eq("org_id", orgId)
+    .eq("customer_phone", customerPhone)
+    .order("created_at", { ascending: false })
+    .range(offset, offset); // ✅ offset 0 = latest, 1 = previous
+
+  return data && data[0] ? (data[0] as any) : null;
+}
 
 // ORDERING FLOW STATES
 function isOrderingState(state: ConversationState): boolean {
@@ -57,14 +109,7 @@ const GREETING_WORDS = [
   "good evening",
 ];
 
-const GREETING_FILLERS = [
-  "bro",
-  "dear",
-  "sir",
-  "team",
-  "anna",
-  "machi",
-];
+const GREETING_FILLERS = ["bro", "dear", "sir", "team", "anna", "machi"];
 
 async function getOrgVertical(org_id: string): Promise<Vertical> {
   const { data } = await supa
@@ -168,11 +213,20 @@ export async function ingestCoreFromMessage(
   if (isOrderingState(state)) {
     let intentText = raw;
 
+    // -------------------------------
+    // Normalize text (same as before)
+    // -------------------------------
     if (raw) {
       try {
-        console.log("[AI][LANG][ORDERING][RAW]", { org_id, from_phone, text: raw });
+        console.log("[AI][LANG][ORDERING][RAW]", {
+          org_id,
+          from_phone,
+          text: raw,
+        });
 
-        const { detected_lang, translated_text } = await detectAndTranslate(raw);
+        const { detected_lang, translated_text } = await detectAndTranslate(
+          raw
+        );
         const normalized = normalizeCustomerText(translated_text);
 
         const aliasHints = await getAliasHints(org_id, normalized);
@@ -193,6 +247,58 @@ export async function ingestCoreFromMessage(
     }
 
     const vertical = await getOrgVertical(org_id);
+    const phoneKey = from_phone.replace(/[^\d]/g, "");
+
+    // ------------------------------------------------------
+    // 🔥 SERVICE INTERRUPT (CRITICAL FIX)
+    // Allow service intents EVEN during ordering
+    // ------------------------------------------------------
+    try {
+      const routed = await routeIntent({
+        orgId: org_id,
+        customerPhone: phoneKey,
+        rawText: raw,
+        normalizedText: intentText,
+        state,
+      });
+
+      console.log("[AI][ROUTED][ORDERING]", routed);
+
+      const serviceLanes: ServiceLane[] = [
+        "opening_hours",
+        "delivery_now",
+        "delivery_area",
+        "store_location",
+        "pricing_generic",
+        "contact",
+        "delivery_time_specific",
+      ];
+
+      if (
+        routed &&
+        routed.source !== "fallback" &&
+        serviceLanes.includes(routed.intent as ServiceLane)
+      ) {
+        console.log("[AI][ORDERING][SERVICE_INTERRUPT]", {
+          intent: routed.intent,
+          text: intentText,
+        });
+
+        const serviceReply = await handleServiceLaneAndReply(
+          org_id,
+          routed.intent as ServiceLane,
+          { raw, normalizedText: intentText }
+        );
+
+        if (serviceReply) return serviceReply;
+      }
+    } catch (e: any) {
+      console.warn("[AI][ORDERING][SERVICE_ROUTER_ERR]", e?.message || e);
+    }
+
+    // ------------------------------------------------------
+    // ⬇️ NORMAL ORDER FLOW (unchanged)
+    // ------------------------------------------------------
     const intent = await parseIntent(intentText, { vertical, state });
 
     console.log("[AI][INGEST][INTENT][ORDERING]", { vertical, state, intent });
@@ -203,45 +309,6 @@ export async function ingestCoreFromMessage(
   // ------------------------------------------------------
   // IDLE STATE
   // ------------------------------------------------------
-
-  // Greetings (only if it's basically just a greeting)
-  const tokens = lowerRaw.split(/\s+/).filter(Boolean);
-
-  const isPureGreeting =
-    // exact match with a greeting phrase
-    GREETING_WORDS.some((w) => lowerRaw === w) ||
-    // short messages (<= 3 words) like "hi bro", "hello sir", "hi team"
-    (
-      tokens.length > 0 &&
-      tokens.length <= 3 &&
-      GREETING_WORDS.includes(tokens[0]) &&
-      tokens.slice(1).every((t) => GREETING_FILLERS.includes(t))
-    );
-
-  if (isPureGreeting) {
-    return {
-      used: true,
-      kind: "greeting",
-      reply:
-        "👋 Hello! I’m your Human-AI assistant — here to take your order smoothly.\n" +
-        "You can ask for anything or just send item names directly.\n" +
-        "To restart at any time, type back or cancel.",
-      order_id: null,
-    };
-  }
-
-  // Smalltalk
-  if (
-    ["ok", "thanks", "thank you", "tnx"].includes(lowerRaw) ||
-    lowerRaw.includes("thank")
-  ) {
-    return {
-      used: true,
-      kind: "smalltalk",
-      reply: "👍 Sure! You can send your order whenever you're ready.",
-      order_id: null,
-    };
-  }
 
   // IDLE TEXT → normalize & alias hints
   let idleIntentText = raw;
@@ -270,35 +337,205 @@ export async function ingestCoreFromMessage(
   }
 
   const vertical = await getOrgVertical(org_id);
+  const phoneKey = from_phone.replace(/[^\d]/g, "");
 
-  // 🔍 NEW: service intent layer for "do you deliver now", "are you open", "price?" etc.
-  const serviceResult = await detectServiceIntentAndReply(org_id, idleIntentText, {
-    raw,
-    vertical,
-  });
+  // ------------------------------------------------------
+  // 🔒 SERVICE SHORT-CIRCUIT (MUST RUN BEFORE parseIntent)
+  // ------------------------------------------------------
 
-  if (serviceResult) {
-    console.log("[AI][INGEST][SERVICE_INTENT]", {
-      org_id,
-      from_phone,
-      kind: serviceResult.kind,
-      preview: (serviceResult.reply || "").slice(0, 140),
-    });
-    return serviceResult;
+  // Greetings (only if it's basically just a greeting)
+  const tokens = lowerRaw.split(/\s+/).filter(Boolean);
+
+  const isPureGreeting =
+    GREETING_WORDS.some((w) => lowerRaw === w) ||
+    (tokens.length > 0 &&
+      tokens.length <= 3 &&
+      GREETING_WORDS.includes(tokens[0]) &&
+      tokens.slice(1).every((t) => GREETING_FILLERS.includes(t)));
+
+  if (isPureGreeting) {
+    return {
+      used: true,
+      kind: "greeting",
+      reply:
+        "👋 Hello! I’m your Human-AI assistant — here to take your order smoothly.\n" +
+        "You can ask for anything or just send item names directly.\n" +
+        "To restart at any time, type back or cancel.",
+      order_id: null,
+    };
   }
 
-  // Normal order / product intent logic
+  // Smalltalk
+  if (
+    ["ok", "thanks", "thank you", "tnx"].includes(lowerRaw) ||
+    lowerRaw.includes("thank")
+  ) {
+    return {
+      used: true,
+      kind: "smalltalk",
+      reply: "👍 Sure! You can send your order whenever you're ready.",
+      order_id: null,
+    };
+  }
+
+  // ------------------------------------------------------
+  // ✅ 1) ROUTE the message (logs current event inside routeIntent)
+  // ------------------------------------------------------
+  let routed: Awaited<ReturnType<typeof routeIntent>> | null = null;
+
+  try {
+    routed = await routeIntent({
+      orgId: org_id,
+      customerPhone: phoneKey,
+      rawText: raw,
+      normalizedText: idleIntentText,
+      state,
+    });
+    console.log("[AI][ROUTED]", routed);
+
+    // 🔥 HARD STOP — MUST BE HERE
+    // BEFORE learning
+    // BEFORE resetState
+    // BEFORE parseIntent
+    if (routed?.source === "override") {
+      console.log("[AI][OVERRIDE][HARD_STOP]", {
+        text: idleIntentText,
+        intent: routed.intent,
+      });
+    
+      const serviceReply = await handleServiceLaneAndReply(
+        org_id,
+        routed.intent as ServiceLane,
+        { raw, normalizedText: idleIntentText }
+      );
+    
+      // If service engine didn't return anything, still stop parsing
+      return (
+        serviceReply ?? {
+          used: true,
+          kind: "service_inquiry",
+          intentLane: routed.intent,
+          reply: routed.reply || null, // (optional) only if router sometimes provides a real reply
+          order_id: null,
+        }
+      );
+    }
+    // 🔥 SERVICE HANDLING (IDLE)
+    // MUST BE HERE — ONLY HERE
+    if (routed) {
+      const serviceLanes: ServiceLane[] = [
+        "opening_hours",
+        "delivery_now",
+        "delivery_area",
+        "store_location",
+        "pricing_generic",
+        "contact",
+        "delivery_time_specific",
+      ];
+
+      if (serviceLanes.includes(routed.intent as ServiceLane)) {
+        const serviceReply = await handleServiceLaneAndReply(
+          org_id,
+          routed.intent as ServiceLane,
+          { raw, normalizedText: idleIntentText }
+        );
+
+        if (serviceReply) return serviceReply;
+      }
+    }
+  } catch (e: any) {
+    console.warn("[AI][ROUTER][ERR]", e?.message || e);
+  }
+
+  // ------------------------------------------------------
+  // ✅ 2) LEARN if this message is a correction (compare with PREVIOUS event)
+  // Since routeIntent already logged CURRENT, previous = offset 1
+  // ------------------------------------------------------
+  try {
+    if (routed && isCorrectionMessage(idleIntentText)) {
+      const prev = await getLastIntentEvent(org_id, phoneKey, 1); // ✅ previous
+
+      const correctedLane = routed.intent as IntentLane;
+
+      // ✅ Block auto-learning for parameter intents (prevents bad org overrides)
+      const BLOCK_LEARN: IntentLane[] = [
+        "delivery_time_specific",
+        "delivery_area",
+      ];
+
+      if (BLOCK_LEARN.includes(correctedLane)) {
+        console.log("[AI][LEARN][SKIP_PARAM_INTENT]", {
+          correctedLane,
+          idleIntentText,
+        });
+        // just skip learning
+      } else if (
+        prev?.normalized_text &&
+        prev?.decided_intent &&
+        correctedLane &&
+        prev.decided_intent !== correctedLane
+      ) {
+        // ✅ GUARD: don't learn "delivery_time_specific" unless the correction contains a time
+        const needsTime = correctedLane === "delivery_time_specific";
+        const hasTime =
+          /\b\d{1,2}(:\d{2})?\s?(am|pm)\b/i.test(idleIntentText) || // 12am, 12:30 pm
+          (/\b\d{1,2}\b/.test(idleIntentText) &&
+            (idleIntentText.includes("night") ||
+              idleIntentText.includes("tonight"))) ||
+          idleIntentText.includes("midnight");
+
+        if (needsTime && !hasTime) {
+          console.log("[AI][LEARN][SKIP_NO_TIME]", {
+            correctedLane,
+            idleIntentText,
+          });
+        } else {
+          await learnOverride({
+            orgId: org_id,
+            normalizedText: prev.normalized_text,
+            correctedIntent: correctedLane,
+            createdBy: "system",
+          });
+
+          console.log("[AI][LEARN][OVERRIDE_CREATED]", {
+            org_id,
+            phoneKey,
+            from_intent: prev.decided_intent,
+            to_intent: correctedLane,
+            pattern: prev.normalized_text,
+          });
+        }
+      }
+    }
+  } catch (e: any) {
+    console.warn("[AI][LEARN][ERR]", e?.message || e);
+  }
+
+  // ------------------------------------------------------
+  // 🔥 CRITICAL FIX: reset state after correction
+  // Without this, learned overrides NEVER apply
+  // ------------------------------------------------------
+  if (routed && isCorrectionMessage(idleIntentText)) {
+    console.log("[AI][STATE][RESET_AFTER_CORRECTION]", {
+      org_id,
+      from_phone,
+      prevState: state,
+    });
+
+    await clearState(org_id, from_phone);
+  }
+
+  // ------------------------------------------------------
+  // FALL BACK TO NORMAL ORDER / PRODUCT FLOW
+  // ------------------------------------------------------
   let intent = await parseIntent(idleIntentText, { vertical, state });
 
-  // 🛡 Guard: don't treat messages with NO digits as multi-item "add_items"
+  // Guard: don't treat messages with NO digits as multi-item "add_items"
   if (intent.intent === "add_items" && !/\d/.test(idleIntentText)) {
-    console.log(
-      "[AI][INGEST][INTENT][IDLE][DOWNGRADE_ADD_ITEMS_NO_DIGITS]",
-      {
-        idleIntentText,
-        intentBefore: intent,
-      }
-    );
+    console.log("[AI][INGEST][INTENT][IDLE][DOWNGRADE_ADD_ITEMS_NO_DIGITS]", {
+      idleIntentText,
+      intentBefore: intent,
+    });
 
     intent = {
       ...intent,

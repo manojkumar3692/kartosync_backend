@@ -336,7 +336,7 @@ export async function handleCatalogFallbackFlow(
       item: null,
       list: null,
     });
-
+    
     // 🆕 MULTI-ITEM QUEUE HANDLER
     const tmpRow = await getTemp(org_id, from_phone);
 

@@ -20,7 +20,8 @@ export type ConversationState =
   | "building_order"
   |  "multi_pending: ParsedOrderLine[] | null"
   |  "multi_active: boolean"   
-  | "agent"                 
+  | "agent"            
+  | "ordering_upsell"     
 
 
   // make sure address is in Intent union
@@ -69,6 +70,19 @@ export interface IngestContext {
   intent?:any
 }
 
+type IntentLane =
+  | "order"
+  | "menu"
+  | "opening_hours"
+  | "delivery_now"
+  | "delivery_area"
+  | "delivery_time_specific"
+  | "pricing_generic"
+  | "store_location"
+  | "contact"
+  | "human_help"
+  | "unknown";
+
 export interface IngestResult {
   used: boolean; // did AI actually handle it
   kind: "greeting" | "smalltalk" | "order" | "unknown" | "payment" | "status" | "cancel" | "manual_mode" | "service_inquiry" | "agent" | "inquiry";
@@ -76,6 +90,8 @@ export interface IngestResult {
   order_id?: string | null;  
   reason?: string | null;
   image?: any
+  meta?: any
+  intentLane?: IntentLane; 
 }
 
 export interface IngestInput {

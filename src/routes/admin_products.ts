@@ -5,6 +5,7 @@ import { supa } from "../db";
 
 export const adminProducts = express.Router();
 
+
 // ─────────────────────────────────────────────────────────
 // Auth: normal org user (store owner) – not super admin
 // Requires JWT with { org_id }

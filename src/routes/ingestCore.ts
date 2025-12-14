@@ -8,6 +8,7 @@ import type { IngestContext, IngestResult as AiIngestResult } from "../ai/ingest
 
 import { supa } from "../db";
 
+console.log("🔥🔥 INGEST INDEX.TS RUNNING routes/ingestCore.ts");
 // Computes totals for order.items
 export async function computeOrderTotals(items: any[]) {
   const outLines: string[] = [];

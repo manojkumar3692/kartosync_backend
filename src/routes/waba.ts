@@ -8,7 +8,7 @@ import axios from "axios";
 import { logFlowEvent } from "./waba/wabaimports";
 
 export const waba = express.Router();
-
+console.log("🔥🔥 INGEST INDEX.TS RUNNING waba999");
 const seenMsgIds = new Set<string>();
 const MAX_SEEN_MSG_IDS = 10_000;
 

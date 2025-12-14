@@ -13,6 +13,8 @@ import {
   isNotOrderMessage,
 } from "../util/notOrder";
 
+console.log("🔥🔥 INGEST INDEX.TS RUNNING routes/ingest.ts");
+
 // Optional AI parser (safe even if not used)
 let aiParseOrder:
   | undefined

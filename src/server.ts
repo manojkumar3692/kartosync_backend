@@ -25,6 +25,7 @@ import adminBusiness from './routes/admin_business';
 import testing from './routes/testing';
 import { customerInsight } from "./routes/customerInsight";
 import { adminAiFaq } from "./routes/adminAiFaq";
+import adminProductUpsells from './routes/admin_product_upsells';
 
 // ─────────────────────────────
 // Boot diagnostics
@@ -122,6 +123,7 @@ app.use("/customer-insight", customerInsight);
 app.use("/admin/business", adminBusiness);
 app.use("/api/testing", testing);
 app.use("/admin/ai", adminAiFaq);
+app.use("/api/admin/product-upsells", adminProductUpsells);
 // ─────────────────────────────
 // Server start
 // ─────────────────────────────

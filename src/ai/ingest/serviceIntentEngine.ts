@@ -10,6 +10,16 @@ type ServiceIntent =
   | "store_location"
   | "none";
 
+
+  export type ServiceLane =
+  | "opening_hours"
+  | "delivery_now"
+  | "delivery_area"
+  | "delivery_time_specific"
+  | "store_location"
+  | "pricing_generic"
+  | "contact";
+
 type OrgServiceConfig = {
   name?: string | null;
   business_type?: string | null;
@@ -31,10 +41,40 @@ type OrgServiceConfig = {
   store_lng?: number | null; 
 };
 
-// Simple helper: lower + trimmed
-function norm(text: string): string {
-  return (text || "").toLowerCase().trim();
+
+function buildDeliveryTimeSpecificReply(cfg: OrgServiceConfig, text: string): string {
+  const name = cfg.name || "we";
+  const tz = cfg.store_timezone || "Asia/Kolkata";
+  const openT = cfg.delivery_open_time ?? null;
+  const closeT = cfg.delivery_close_time ?? null;
+
+  const hoursLine = fmtHours(openT, closeT);
+  const st = isOpenNowInTz(tz, openT, closeT);
+
+  // simple “best effort” messaging (no hard schedule promises)
+  // we just explain hours + ask confirmation
+  const lines: string[] = [];
+
+  lines.push(`🕒 About delivery timing:`);
+
+  if (hoursLine) lines.push(hoursLine);
+
+  if (st.hasHours) {
+    lines.push(
+      st.isOpen
+        ? `✅ ${name} is open now.`
+        : `❌ ${name} is closed right now.`
+    );
+  }
+
+  lines.push(
+    "",
+    `Please confirm your area + exact time (e.g. *today 12:00 AM*). I’ll tell you if delivery is possible.`
+  );
+
+  return lines.join("\n");
 }
+
 
 function parseHHMM(s?: string | null) {
   if (!s) return null;
@@ -81,81 +121,7 @@ function fmtHours(openHHMM: string | null, closeHHMM: string | null) {
   return `Today’s hours: *${o} – ${c}*`;
 }
 
-function detectServiceIntent(text: string): ServiceIntent {
-  const t = norm(text);
 
-  if (!t) return "none";
-
-  // Delivery now / availability
-  if (
-    (t.includes("deliver") || t.includes("delivery")) &&
-    (t.includes("now") ||
-      t.includes("today") ||
-      t.includes("available") ||
-      t.includes("are you") ||
-      t.includes("do you"))
-  ) {
-    return "delivery_now";
-  }
-
-  // Delivery area: "do you deliver in xxxx / to xxxx?"
-  if (
-    (t.includes("deliver to") ||
-      t.includes("deliver in") ||
-      t.includes("delivery in") ||
-      t.includes("delivery to") ||
-      t.includes("deliver at")) &&
-    !t.includes("price") &&
-    !t.includes("how much")
-  ) {
-    return "delivery_area";
-  }
-
-  // Opening hours
-  if (
-    t.includes("open now") ||
-    t.includes("are you open") ||
-    t.includes("opening time") ||
-    t.includes("closing time") ||
-    t.includes("what time do you open") ||
-    t.includes("what time do you close") ||
-    t.includes("timings") ||
-    t.includes("working hours") ||
-    t.includes("business hours")
-  ) {
-    return "opening_hours";
-  }
-
-  // Store location / address
-if (
-  t.includes("where is your store") ||
-  t.includes("where is the store") ||
-  t.includes("store address") ||
-  t.includes("address") ||
-  t.includes("location") ||
-  t.includes("google map") ||
-  t.includes("map") ||
-  t.includes("how to reach") ||
-  t.includes("route")
-) {
-  return "store_location";
-}
-
-  // Generic price / pricing questions (not tied to a specific item)
-  if (
-    t.includes("price") ||
-    t.includes("how much") ||
-    t.includes("rate card") ||
-    t.includes("ratecard") ||
-    t.includes("rate?")
-  ) {
-    // If they also mention a clear item, it might be better to keep it in
-    // normal order flow later; keep this simple for now:
-    return "pricing_generic";
-  }
-
-  return "none";
-}
 
 function buildStoreLocationReply(cfg: OrgServiceConfig): string {
   const name = cfg.name || "We";
@@ -329,21 +295,17 @@ function buildDeliveryAreaReply(cfg: OrgServiceConfig): string {
  * Main entry: returns an IngestResult if this looks like a service inquiry,
  * or null if we should continue with normal order flow.
  */
-export async function detectServiceIntentAndReply(
+
+
+export async function handleServiceLaneAndReply(
   org_id: string,
-  normalizedText: string,
-  opts?: { raw?: string; vertical?: string }
+  lane: ServiceLane,
+  opts?: { raw?: string; normalizedText?: string }
 ): Promise<IngestResult | null> {
-  const text = normalizedText || opts?.raw || "";
-  const intent = detectServiceIntent(text);
-
-  if (intent === "none") return null;
-
   try {
     const { data, error } = await supa
       .from("orgs")
-      .select(
-        `
+      .select(`
         name,
         phone,
         business_type,
@@ -362,20 +324,18 @@ export async function detectServiceIntentAndReply(
         faq_opening_hours_answer,
         faq_pricing_answer,
         faq_delivery_area_answer
-      `
-      )
+      `)
       .eq("id", org_id)
       .maybeSingle();
 
-    if (error) {
-      console.warn("[SERVICE_INTENT][ORG_FETCH_ERR]", error.message);
-    }
+    if (error) console.warn("[SERVICE][ORG_FETCH_ERR]", error.message);
 
     const cfg: OrgServiceConfig = (data as any) || {};
+    const text = opts?.normalizedText || opts?.raw || "";
 
-    let reply: string;
+    let reply: string | null = null;
 
-    switch (intent) {
+    switch (lane) {
       case "delivery_now":
         reply = buildDeliveryNowReply(cfg, text);
         break;
@@ -391,20 +351,33 @@ export async function detectServiceIntentAndReply(
       case "store_location":
         reply = buildStoreLocationReply(cfg);
         break;
+      case "delivery_time_specific":
+        reply =
+          "⏰ Delivery depends on our working hours.\n" +
+            buildOpeningHoursReply(cfg) +
+          "\n\nTell me the exact time (ex: *12:00 AM*) and your area, I’ll confirm if delivery is possible.";
+          break;
+      case "contact": {
+        const name = cfg.name || "We";
+        const phone = (cfg.phone || "").trim();
+        reply = phone
+          ? `📞 *${name}* contact: *${phone}*`
+          : `📞 Please ask the staff here for the contact number.`;
+        break;
+      }
       default:
         return null;
     }
 
-    const res: IngestResult = {
+    return {
       used: true,
       kind: "service_inquiry",
       reply,
       order_id: null,
+      meta: { lane },
     };
-
-    return res;
   } catch (e: any) {
-    console.warn("[SERVICE_INTENT][ERR]", e?.message || e);
+    console.warn("[SERVICE][ERR]", e?.message || e);
     return null;
   }
 }
