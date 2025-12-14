@@ -22,6 +22,7 @@ export type ConversationState =
   |  "multi_active: boolean"   
   | "agent"            
   | "ordering_upsell"     
+  | "cart_edit_menu"
 
 
   // make sure address is in Intent union

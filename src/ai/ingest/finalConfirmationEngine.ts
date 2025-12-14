@@ -5,7 +5,6 @@ import type { IngestContext, IngestResult, ConversationState } from "./types";
 import { setState, clearState } from "./stateManager";
 import { resetAttempts } from "./attempts";
 
-
 type CartLine = {
   product_id: string | number;
   name: string;
@@ -17,7 +16,7 @@ type CartLine = {
 type TempRow = {
   org_id: string;
   customer_phone: string;
-  item: any | null;       // reused for editing metadata
+  item: any | null; // reused for editing metadata
   list: any[] | null;
   cart?: CartLine[] | null;
   updated_at?: string;
@@ -27,6 +26,37 @@ type TempRow = {
 // DB helpers (local copy, same table as orderEngine)
 // ─────────────────────────────────────────────
 
+function buildConfirmMenu(cart: CartLine[]): string {
+  const { text: cartText } = formatCart(cart);
+  return (
+    "🧺 Your cart:\n" +
+    cartText +
+    "\n\n" +
+    "1) Confirm order\n" +
+    "2) Edit your order\n\n" +
+    "Please reply with the number."
+  );
+}
+
+function buildEditMenu(cart: CartLine[]): string {
+  const { text: cartText } = formatCart(cart);
+  return (
+    "🧺 Your cart:\n" +
+    cartText +
+    "\n\n" +
+    "🛠 Edit your order:\n" +
+    "1) Add another item\n" +
+    "2) Change quantity\n" +
+    "3) Remove an item\n" +
+    "4) Cancel order\n\n" +
+    "5) Back\n\n" +
+    "Please reply with the number."
+  );
+}
+
+export function buildConfirmMenuForReply(cart: any[]): string {
+  return buildConfirmMenu(cart as CartLine[]);
+}
 
 async function getTemp(
   org_id: string,
@@ -43,32 +73,27 @@ async function getTemp(
 }
 
 async function saveTemp(
-    org_id: string,
-    from_phone: string,
-    payload: Partial<TempRow>
-  ): Promise<void> {
-    const { error } = await supa
-      .from("temp_selected_items")
-      .upsert({
-        org_id,
-        customer_phone: from_phone,
-        updated_at: new Date().toISOString(),
-        ...payload,
-      } as any);
-  
-    if (error) {
-      console.error("[TEMP][UPSERT][ERROR]", {
-        org_id,
-        from_phone,
-        error,
-      });
-    }
-  }
-
-async function clearCart(
   org_id: string,
-  from_phone: string
+  from_phone: string,
+  payload: Partial<TempRow>
 ): Promise<void> {
+  const { error } = await supa.from("temp_selected_items").upsert({
+    org_id,
+    customer_phone: from_phone,
+    updated_at: new Date().toISOString(),
+    ...payload,
+  } as any);
+
+  if (error) {
+    console.error("[TEMP][UPSERT][ERROR]", {
+      org_id,
+      from_phone,
+      error,
+    });
+  }
+}
+
+async function clearCart(org_id: string, from_phone: string): Promise<void> {
   await saveTemp(org_id, from_phone, {
     cart: [],
     item: null,
@@ -149,35 +174,30 @@ export async function handleFinalConfirmation(
   if (state === "confirming_order") {
     // NUMBER FIRST
     let choice: number | null = null;
-    if (/^[1-5]$/.test(lower)) {
+    if (/^[1-2]$/.test(lower)) {
       choice = parseInt(lower, 10);
     }
 
     // TEXT SECOND
     if (choice === null) {
       if (["confirm", "yes", "y", "ok", "done"].includes(lower)) choice = 1;
-      else if (["add", "another", "more"].includes(lower)) choice = 2;
-      else if (["edit", "change", "qty", "quantity"].includes(lower)) choice = 3;
+      else if (
+        ["edit", "change", "qty", "quantity", "remove", "cancel"].includes(
+          lower
+        )
+      )
+        choice = 2;
+      // else if (["edit", "change", "qty", "quantity"].includes(lower)) choice = 3;
       else if (["remove", "delete", "rm"].includes(lower)) choice = 4;
       else if (["cancel", "stop", "clear"].includes(lower)) choice = 5;
     }
 
     // FALLBACK → repeat menu with cart
     if (choice === null) {
-      const { text: cartText } = formatCart(cart);
       return {
         used: true,
         kind: "order",
-        reply:
-          "🧺 Your cart:\n" +
-          cartText +
-          "\n\n" +
-          "1) Confirm order\n" +
-          "2) Add another item\n" +
-          "3) Change quantity\n" +
-          "4) Remove an item\n" +
-          "5) Cancel\n\n" +
-          "Please reply with the number.",
+        reply: buildConfirmMenu(cart),
         order_id: null,
       };
     }
@@ -202,7 +222,7 @@ export async function handleFinalConfirmation(
         .insert(orderPayload as any)
         .select("id")
         .single();
-        
+
       console.log("[FINAL_CONFIRM][INSERT]", { error, saved, orderPayload });
 
       if (error || !saved) {
@@ -217,7 +237,7 @@ export async function handleFinalConfirmation(
 
       // Reset cart + reset attempts for address step, then move to address
       await clearCart(org_id, from_phone);
-      await resetAttempts(org_id, from_phone);                 // 🔴 ADD THIS LINE
+      await resetAttempts(org_id, from_phone); // 🔴 ADD THIS LINE
       await setState(org_id, from_phone, "awaiting_address");
 
       return {
@@ -231,10 +251,9 @@ export async function handleFinalConfirmation(
       };
     }
 
-    // 2) ADD ANOTHER ITEM → go back to idle, keep cart
+    // 2) EDIT YOUR ORDER → show edit menu
     if (choice === 2) {
-      await setState(org_id, from_phone, "idle");
-
+      await setState(org_id, from_phone, "cart_edit_menu");
       const { text: cartText } = formatCart(cart);
 
       return {
@@ -242,10 +261,15 @@ export async function handleFinalConfirmation(
         kind: "order",
         order_id: null,
         reply:
-          "Got it 👍\n" +
-          "You can add another item now. Just type the item name (e.g. *Chicken Biryani*).\n\n" +
-          "Current cart:\n" +
-          cartText,
+          "🧺 Your cart:\n" +
+          cartText +
+          "\n\n" +
+          "🛠 Edit your order:\n" +
+          "1) Add another item\n" +
+          "2) Change quantity\n" +
+          "3) Remove an item\n" +
+          "4) Cancel order\n\n" +
+          "Please reply with the number.",
       };
     }
 
@@ -298,6 +322,100 @@ export async function handleFinalConfirmation(
     }
   }
 
+  if (state === "cart_edit_menu") {
+    let choice: number | null = null;
+  
+    if (/^[1-5]$/.test(lower)) choice = parseInt(lower, 10);
+
+    if (choice === null) {
+      // basic text support
+      if (["add", "another", "more"].includes(lower)) choice = 1;
+      else if (["edit", "change", "qty", "quantity"].includes(lower)) choice = 2;
+      else if (["remove", "delete", "rm"].includes(lower)) choice = 3;
+      else if (["cancel", "stop", "clear"].includes(lower)) choice = 4;
+      else if (["back", "go back", "previous"].includes(lower)) choice = 5;
+    }
+  
+    const { text: cartText } = formatCart(cart);
+  
+    if (choice === null) {
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply: buildEditMenu(cart),
+      };
+    }
+  
+    // 1) Add another item
+    if (choice === 1) {
+      await setState(org_id, from_phone, "idle");
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply:
+          "Got it 👍\n" +
+          "Type the item name to add (e.g. *Chicken Biryani*).\n\n" +
+          "Current cart:\n" +
+          cartText,
+      };
+    }
+  
+    // 2) Change qty → reuse existing flow
+    if (choice === 2) {
+      await setState(org_id, from_phone, "cart_edit_item");
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply:
+          "🧺 Your cart:\n" +
+          cartText +
+          "\n\nWhich item number do you want to change the quantity for?",
+      };
+    }
+  
+    // 3) Remove item → reuse existing flow
+    if (choice === 3) {
+      await setState(org_id, from_phone, "cart_remove_item");
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply:
+          "🧺 Your cart:\n" +
+          cartText +
+          "\n\nWhich item number do you want to remove?",
+      };
+    }
+  
+    // 4) Cancel order
+    if (choice === 4) {
+      await clearState(org_id, from_phone);
+      await clearCart(org_id, from_phone);
+  
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply:
+          "🛑 Your order has been cancelled.\nIf you want to order again, just type the item name.",
+      };
+    }
+
+    // 5) Back to confirm menu
+if (choice === 5) {
+  await setState(org_id, from_phone, "confirming_order");
+  return {
+    used: true,
+    kind: "order",
+    order_id: null,
+    reply: buildConfirmMenu(cart),
+  };
+}
+  }
+
   // ─────────────────────────────────────────────
   // 2) CART EDIT: choose item to CHANGE QTY
   // ─────────────────────────────────────────────
@@ -309,9 +427,7 @@ export async function handleFinalConfirmation(
       return {
         used: true,
         kind: "order",
-        reply:
-          "Please send a valid item number from the cart.\n\n" +
-          cartText,
+        reply: "Please send a valid item number from the cart.\n\n" + cartText,
         order_id: null,
       };
     }
@@ -328,10 +444,9 @@ export async function handleFinalConfirmation(
     return {
       used: true,
       kind: "order",
-      reply:
-        `Enter new quantity for *${item.name}${
-          item.variant ? ` (${item.variant})` : ""
-        }* (current: ${item.qty}).`,
+      reply: `Enter new quantity for *${item.name}${
+        item.variant ? ` (${item.variant})` : ""
+      }* (current: ${item.qty}).`,
       order_id: null,
     };
   }
@@ -368,10 +483,9 @@ export async function handleFinalConfirmation(
       return {
         used: true,
         kind: "order",
-        reply:
-          `Please enter a valid quantity (e.g. 1 or 2) for *${item.name}${
-            item.variant ? ` (${item.variant})` : ""
-          }*.`,
+        reply: `Please enter a valid quantity (e.g. 1 or 2) for *${item.name}${
+          item.variant ? ` (${item.variant})` : ""
+        }*.`,
         order_id: null,
       };
     }
@@ -417,9 +531,7 @@ export async function handleFinalConfirmation(
       return {
         used: true,
         kind: "order",
-        reply:
-          "Please send a valid item number to remove.\n\n" +
-          cartText,
+        reply: "Please send a valid item number to remove.\n\n" + cartText,
         order_id: null,
       };
     }
@@ -439,10 +551,9 @@ export async function handleFinalConfirmation(
       return {
         used: true,
         kind: "order",
-        reply:
-          `🗑️ Removed *${removed.name}${
-            removed.variant ? ` (${removed.variant})` : ""
-          }* from your cart.\n\nYour cart is now empty. Type an item name to start again.`,
+        reply: `🗑️ Removed *${removed.name}${
+          removed.variant ? ` (${removed.variant})` : ""
+        }* from your cart.\n\nYour cart is now empty. Type an item name to start again.`,
         order_id: null,
       };
     }

@@ -191,6 +191,7 @@ export async function ingestCoreFromMessage(
   // FINAL CONFIRM
   if (
     state === "confirming_order" ||
+    state === "cart_edit_menu" || 
     state === "cart_edit_item" ||
     state === "cart_edit_qty" ||
     state === "cart_remove_item"

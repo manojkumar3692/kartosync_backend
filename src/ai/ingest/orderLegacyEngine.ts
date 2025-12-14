@@ -10,6 +10,10 @@ import { detectMetaIntent } from "./metaIntent";
 import { getAttempts, incAttempts, resetAttempts } from "./attempts";
 import { fuzzyChooseOption } from "./fuzzyOption";
 import { normalizeCustomerText } from "../lang/normalize";
+import { buildConfirmMenuForReply } from "./finalConfirmationEngine";
+
+
+
 // temp_selected_items row
 type TempRow = {
   org_id: string;
@@ -644,17 +648,7 @@ export async function handleCatalogFallbackFlow(
       used: true,
       kind: "order",
       order_id: null,
-      reply:
-        "🧺 Your cart:\n" +
-        lines.join("\n") +
-        totalLine +
-        "\n\n" +
-        "1) Confirm order\n" +
-        "2) Add another item\n" +
-        "3) Change quantity\n" +
-        "4) Remove an item\n" +
-        "5) Cancel\n\n" +
-        "Please reply with the number.",
+      reply: buildConfirmMenuForReply(newCart),
     };
   }
 
@@ -851,17 +845,7 @@ export async function handleCatalogFallbackFlow(
       used: true,
       kind: "order",
       order_id: null,
-      reply:
-        "🧺 Your cart:\n" +
-        lines.join("\n") +
-        totalLine +
-        "\n\n" +
-        "1) Confirm order\n" +
-        "2) Add another item\n" +
-        "3) Change quantity\n" +
-        "4) Remove an item\n" +
-        "5) Cancel\n\n" +
-        "Please reply with the number.",
+  reply: buildConfirmMenuForReply(newCart),
     };
   }
 
