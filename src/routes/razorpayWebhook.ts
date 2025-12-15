@@ -223,7 +223,7 @@ razorpayWebhookRouter.post(
       const phone = digitsOnly(paidOrder?.source_phone);
 
       // 4) Load org pickup details + WA config
-      const { data: orgRow } = await supa
+      const { data: orgRow, error: orgRowErr } = await supa
         .from("orgs")
         .select([
           "wa_phone_number_id",
@@ -237,15 +237,21 @@ razorpayWebhookRouter.post(
         .eq("id", org_id)
         .maybeSingle();
 
+
+        console.log("[RZP_WEBHOOK][ORG_ROW_RAW]", {
+            org_id,
+            orgRowErr: orgRowErr?.message || null,
+            has_orgRow: !!orgRow,
+            orgRow_keys: orgRow ? Object.keys(orgRow) : [],
+            wa_phone_number_id: (orgRow as any)?.wa_phone_number_id || null,
+            wa_access_token_len: ((orgRow as any)?.wa_access_token || "").length,
+          });
+        
+
       const wa_phone_number_id = (orgRow as any)?.wa_phone_number_id || null;
       const wa_access_token = (orgRow as any)?.wa_access_token || null;
 
-      console.log("[RZP_WEBHOOK][ORG_ROW_CHECK]", {
-        org_id,
-        has_orgRow: !!orgRow,
-        wa_phone_number_id: (orgRow as any)?.wa_phone_number_id || null,
-        wa_access_token_len: ((orgRow as any)?.wa_access_token || "").length,
-      });
+      
 
       const pickup_address =
         (orgRow as any)?.pickup_address ||

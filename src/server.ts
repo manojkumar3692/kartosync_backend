@@ -42,6 +42,7 @@ console.log("[BOOT] SUPABASE_SERVICE_ROLE present?", !!process.env.SUPABASE_SERV
 console.log("[BOOT] SUPABASE_SERVICE_ROLE_KEY present?", !!process.env.SUPABASE_SERVICE_ROLE_KEY, "len=", (process.env.SUPABASE_SERVICE_ROLE_KEY || "").length);
 console.log("[BOOT] SUPABASE_URL =", process.env.SUPABASE_URL);
 console.log("[BOOT] APP_PUBLIC_URL =", process.env.APP_PUBLIC_URL);
+
 const app = express();
 
 // 🔹 Serve /static from <project-root>/static
