@@ -240,6 +240,13 @@ razorpayWebhookRouter.post(
       const wa_phone_number_id = (orgRow as any)?.wa_phone_number_id || null;
       const wa_access_token = (orgRow as any)?.wa_access_token || null;
 
+      console.log("[RZP_WEBHOOK][ORG_ROW_CHECK]", {
+        org_id,
+        has_orgRow: !!orgRow,
+        wa_phone_number_id: (orgRow as any)?.wa_phone_number_id || null,
+        wa_access_token_len: ((orgRow as any)?.wa_access_token || "").length,
+      });
+
       const pickup_address =
         (orgRow as any)?.pickup_address ||
         (orgRow as any)?.store_address_text ||
