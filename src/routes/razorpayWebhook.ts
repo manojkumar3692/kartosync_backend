@@ -54,6 +54,24 @@ razorpayWebhookRouter.get("/webhook", (_req, res) => {
   return res.status(405).json({ ok: false, message: "Use POST (Razorpay webhook)." });
 });
 
+razorpayWebhookRouter.get("/debug-org/:orgId", async (req, res) => {
+    const orgId = String(req.params.orgId);
+  
+    const { data, error } = await supa
+      .from("orgs")
+      .select("id, wa_phone_number_id, wa_access_token")
+      .eq("id", orgId)
+      .maybeSingle();
+  
+    return res.json({
+      ok: !error,
+      error: error?.message || null,
+      id: data?.id || null,
+      wa_phone_number_id: data?.wa_phone_number_id || null,
+      wa_access_token_len: (data?.wa_access_token || "").length,
+    });
+  });
+
 // ─────────────────────────────
 // Webhook (RAW body required for signature verification)
 // ─────────────────────────────

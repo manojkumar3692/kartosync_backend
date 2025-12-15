@@ -37,6 +37,11 @@ console.log('[AI] OPENAI_API_KEY present?', !!process.env.OPENAI_API_KEY);
 console.log('[AI] AI_MODEL =', process.env.AI_MODEL || 'gpt-4o-mini');
 console.log('[AI] AI_DAILY_USD =', process.env.AI_DAILY_USD || '(default 5.00)');
 
+console.log("[BOOT] SUPABASE_URL present?", !!process.env.SUPABASE_URL);
+console.log("[BOOT] SUPABASE_SERVICE_ROLE present?", !!process.env.SUPABASE_SERVICE_ROLE, "len=", (process.env.SUPABASE_SERVICE_ROLE || "").length);
+console.log("[BOOT] SUPABASE_SERVICE_ROLE_KEY present?", !!process.env.SUPABASE_SERVICE_ROLE_KEY, "len=", (process.env.SUPABASE_SERVICE_ROLE_KEY || "").length);
+console.log("[BOOT] SUPABASE_URL =", process.env.SUPABASE_URL);
+console.log("[BOOT] APP_PUBLIC_URL =", process.env.APP_PUBLIC_URL);
 const app = express();
 
 // 🔹 Serve /static from <project-root>/static
