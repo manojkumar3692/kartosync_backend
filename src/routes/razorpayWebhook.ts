@@ -1,4 +1,3 @@
-// src/routes/razorpayWebhook.ts
 import express from "express";
 import axios from "axios";
 import { supa } from "../db";
@@ -6,6 +5,9 @@ import { getOrgRazorpay, verifyRazorpayWebhookSignature } from "../payments/razo
 
 export const razorpayWebhookRouter = express.Router();
 
+// ─────────────────────────────
+// Helpers
+// ─────────────────────────────
 function digitsOnly(s: string) {
   return String(s || "").replace(/[^\d]/g, "");
 }
@@ -36,13 +38,25 @@ async function sendWhatsAppText(opts: {
   return res.data;
 }
 
+// ─────────────────────────────
+// Debug routes (to confirm Render deployment & mount)
+// ─────────────────────────────
+razorpayWebhookRouter.get("/", (_req, res) => {
+  return res.json({ ok: true, router: "razorpayWebhookRouter" });
+});
 
-  razorpayWebhookRouter.get("/ping", (_req, res) => {
-    console.log("[RZP_PING] hit");
-    res.json({ ok: true, route: "/api/razorpay/ping" });
-  });
+razorpayWebhookRouter.get("/ping", (_req, res) => {
+  console.log("[RZP_PING] hit");
+  return res.json({ ok: true, ts: new Date().toISOString() });
+});
 
-// RAW body route (required for Razorpay signature verification)
+razorpayWebhookRouter.get("/webhook", (_req, res) => {
+  return res.status(405).json({ ok: false, message: "Use POST (Razorpay webhook)." });
+});
+
+// ─────────────────────────────
+// Webhook (RAW body required for signature verification)
+// ─────────────────────────────
 razorpayWebhookRouter.post(
   "/webhook",
   express.raw({ type: "application/json" }),
@@ -52,6 +66,8 @@ razorpayWebhookRouter.post(
       console.log("[RZP_WEBHOOK][HIT]", new Date().toISOString(), "url=", req.originalUrl);
 
       const rawBody = req.body as any;
+
+      // If bodyParser.json ran before this route -> rawBody won't be Buffer -> signature fails
       if (!Buffer.isBuffer(rawBody)) {
         console.error("[RZP_WEBHOOK][FATAL] req.body is not Buffer.");
         console.error("[RZP_WEBHOOK][FIX] Mount /api/razorpay BEFORE bodyParser.json() in server.ts");
@@ -63,9 +79,9 @@ razorpayWebhookRouter.post(
 
       console.log("[RZP_WEBHOOK][INCOMING]", { event: event?.event, hasSig: !!sig });
 
-      // We support BOTH patterns:
-      // A) reference_id = "<order_uuid>"   ✅ (your current)
-      // B) reference_id = "org:<org_id>:order:<order_id>" (old pattern)
+      // reference_id can be either:
+      // A) "<order_uuid>" (your current implementation)
+      // B) "org:<org_id>:order:<order_id>" (older pattern)
       const ref =
         payload?.payment_link?.entity?.reference_id ||
         payload?.payment?.entity?.notes?.reference_id ||
@@ -78,9 +94,10 @@ razorpayWebhookRouter.post(
 
       console.log("[RZP_WEBHOOK][REF]", { ref, plinkId });
 
-      // Only act on "paid" events
+      // Only act on paid events
       const isPaidEvent =
-        event?.event === "payment_link.paid" || event?.event === "payment.captured";
+        event?.event === "payment_link.paid" ||
+        event?.event === "payment.captured";
 
       if (!isPaidEvent) {
         console.log("[RZP_WEBHOOK][SKIP] Not a paid event:", event?.event);
@@ -101,7 +118,7 @@ razorpayWebhookRouter.post(
         order_id = String(ref);
       }
 
-      // If we only have order_id, load org_id from DB
+      // If only order_id, load org_id from DB
       if (order_id && !org_id) {
         const { data: ordRow, error: ordErr } = await supa
           .from("orders")
@@ -110,15 +127,17 @@ razorpayWebhookRouter.post(
           .maybeSingle();
 
         if (ordErr || !ordRow) {
-          console.warn("[RZP_WEBHOOK][ORDER_NOT_FOUND_BY_REF]", { order_id, ordErr: ordErr?.message });
-          // fallback: try by payment_link_id
-          order_id = null;
+          console.warn("[RZP_WEBHOOK][ORDER_NOT_FOUND_BY_REF]", {
+            order_id,
+            ordErr: ordErr?.message,
+          });
+          order_id = null; // fallback to plink
         } else {
           org_id = (ordRow as any).org_id;
         }
       }
 
-      // Fallback: find by payment_link_id (plink_...)
+      // Fallback: find by payment_link_id
       if (!order_id && plinkId) {
         const { data: ordRow, error: ordErr } = await supa
           .from("orders")
@@ -129,7 +148,10 @@ razorpayWebhookRouter.post(
           .maybeSingle();
 
         if (ordErr || !ordRow) {
-          console.warn("[RZP_WEBHOOK][ORDER_NOT_FOUND_BY_PLINK]", { plinkId, ordErr: ordErr?.message });
+          console.warn("[RZP_WEBHOOK][ORDER_NOT_FOUND_BY_PLINK]", {
+            plinkId,
+            ordErr: ordErr?.message,
+          });
           return res.status(200).send("ignored");
         }
 
@@ -156,7 +178,7 @@ razorpayWebhookRouter.post(
 
       if (!ok) return res.status(400).send("bad signature");
 
-      // 3) Mark paid idempotently (avoid double-send)
+      // 3) Mark paid (idempotent)
       const { data: updatedOrders, error: updErr } = await supa
         .from("orders")
         .update({
@@ -167,7 +189,7 @@ razorpayWebhookRouter.post(
         .eq("id", order_id)
         .eq("org_id", org_id)
         .neq("payment_status", "paid")
-        .select("id, source_phone, items, total_amount, delivery_type");
+        .select("id, source_phone, items, total_amount");
 
       if (updErr) {
         console.error("[RZP_WEBHOOK][ORDER_UPDATE_ERR]", updErr);
@@ -185,17 +207,15 @@ razorpayWebhookRouter.post(
       // 4) Load org pickup details + WA config
       const { data: orgRow } = await supa
         .from("orgs")
-        .select(
-          [
-            "wa_phone_number_id",
-            "wa_access_token",
-            "pickup_address",
-            "pickup_maps_url",
-            "pickup_phone",
-            "pickup_hours",
-            "store_address_text",
-          ].join(",")
-        )
+        .select([
+          "wa_phone_number_id",
+          "wa_access_token",
+          "pickup_address",
+          "pickup_maps_url",
+          "pickup_phone",
+          "pickup_hours",
+          "store_address_text",
+        ].join(","))
         .eq("id", org_id)
         .maybeSingle();
 
@@ -211,7 +231,7 @@ razorpayWebhookRouter.post(
       const pickup_phone = (orgRow as any)?.pickup_phone || null;
       const pickup_hours = (orgRow as any)?.pickup_hours || null;
 
-      // Optional: include summary
+      // Optional order summary
       let summary = "";
       if (Array.isArray(paidOrder?.items) && paidOrder.items.length > 0) {
         const lines: string[] = [];
@@ -222,7 +242,10 @@ razorpayWebhookRouter.post(
           const price = Number(it?.price) || 0;
           if (qty > 0) lines.push(`• ${name}${variant} x ${qty}${price ? ` — ₹${qty * price}` : ""}`);
         }
-        const total = paidOrder?.total_amount != null ? `\n💰 Total: ₹${Number(paidOrder.total_amount).toFixed(0)}\n` : "";
+        const total =
+          paidOrder?.total_amount != null
+            ? `\n💰 Total: ₹${Number(paidOrder.total_amount).toFixed(0)}\n`
+            : "";
         summary = lines.length ? `🧾 *Order Summary*\n${lines.join("\n")}${total}\n` : "";
       }
 
@@ -264,7 +287,7 @@ razorpayWebhookRouter.post(
         }
       }
 
-      // 6) Clear conversation state so new order can start
+      // 6) Clear conversation state
       if (phone) {
         await supa.from("ai_conversation_state").delete().eq("org_id", org_id).eq("customer_phone", phone);
         console.log("[RZP_WEBHOOK][STATE_CLEARED]", { org_id, phone });
