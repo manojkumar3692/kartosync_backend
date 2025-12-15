@@ -406,13 +406,21 @@ export async function ingestCoreFromMessage(
   }
 
   // PICKUP PAYMENT (Razorpay – restaurant only)
-  // PICKUP PAYMENT WAIT (Razorpay link)
   if (state === "awaiting_pickup_payment") {
-    const lower = (raw || "").trim().toLowerCase();
+    const lowerRaw = (raw || "").trim().toLowerCase();
+
+    // ✅ map menu numbers to actions
+    const lower =
+      lowerRaw === "1"
+        ? "resend"
+        : lowerRaw === "2"
+        ? "paid"
+        : lowerRaw === "3"
+        ? "cancel"
+        : lowerRaw;
 
     // 1) Allow cancel
-    if (lower === "cancel" || lower === "cancel order") {
-      // cancel latest pending order
+    if (lower === "cancel" || lower.includes("cancel")) {
       const { data: ord } = await supa
         .from("orders")
         .select("id")
@@ -458,7 +466,7 @@ export async function ingestCoreFromMessage(
     const { data: order } = await supa
       .from("orders")
       .select(
-        "id, razorpay_payment_link_url, razorpay_payment_link_id, total_amount, payment_status"
+        "id, razorpay_payment_link_url, razorpay_payment_link_id, total_amount, payment_status, created_at"
       )
       .eq("org_id", org_id)
       .eq("source_phone", from_phone)
@@ -466,6 +474,28 @@ export async function ingestCoreFromMessage(
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
+
+    // ✅ OPTIONAL TIMEOUT (put it HERE)
+    const createdAt = order?.created_at
+      ? new Date(order.created_at).getTime()
+      : null;
+    const isStale = createdAt ? Date.now() - createdAt > 10 * 60 * 1000 : false;
+
+    if (isStale && order?.payment_status !== "paid") {
+      await supa
+        .from("orders")
+        .update({ status: "cancelled" })
+        .eq("id", order.id);
+      await clearState(org_id, from_phone);
+
+      return {
+        used: true,
+        kind: "order",
+        order_id: order.id,
+        reply:
+          "⏳ Payment time expired, so this order was cancelled. Please place a new order.",
+      };
+    }
 
     // Already paid?
     if (order?.payment_status === "paid") {
