@@ -295,6 +295,13 @@ razorpayWebhookRouter.post(
         });
       } else {
         try {
+            console.log("[RZP_WEBHOOK][WA_SEND_ATTEMPT]", {
+                org_id,
+                order_id,
+                to: phone,
+                wa_phone_number_id,
+                token_len: (wa_access_token || "").length,
+              });
           const waRes = await sendWhatsAppText({
             wa_phone_number_id,
             wa_access_token,
@@ -309,6 +316,11 @@ razorpayWebhookRouter.post(
           });
         } catch (e: any) {
           console.error("[RZP_WEBHOOK][WA_SEND_ERR]", e?.response?.data || e?.message || e);
+          console.error("[RZP_WEBHOOK][WA_SEND_ERR]", {
+            status: e?.response?.status,
+            data: e?.response?.data,
+            message: e?.message,
+          });
         }
       }
 
