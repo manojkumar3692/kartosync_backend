@@ -15,18 +15,30 @@ const VALID_STATES: ConversationState[] = [
   "ordering_item",
   "ordering_variant",
   "ordering_qty",
-  "awaiting_address",
-  "address_confirm_confirm", 
-  "awaiting_payment",
+  "ordering_upsell",
+
   "confirming_order",
-  "cart_remove_item",
+  "cart_edit_menu",
   "cart_edit_item",
   "cart_edit_qty",
-  "order_finalised",
+  "cart_remove_item",
+
+  "awaiting_fulfillment",
+  "awaiting_address",
+  "awaiting_location_pin",
+  "address_confirm_confirm",
+
+  "awaiting_payment",
   "awaiting_payment_proof",
+
+  "building_order",
+  "agent",
+
+  "order_finalised",
   "status",
   "cancel",
-  "awaiting_location_pin",
+  "awaiting_pickup_payment",
+  "awaiting_fulfillment",
 ];
 
 function asState(s: string | null | undefined): ConversationState {
@@ -57,7 +69,7 @@ export async function setState(
   from_phone: string,
   state: ConversationState
 ): Promise<void> {
-  await supa
+  const { error } = await supa
     .from("ai_conversation_state")
     .upsert(
       {
@@ -68,6 +80,10 @@ export async function setState(
       },
       { onConflict: "org_id,customer_phone" }
     );
+
+  if (error) {
+    console.error("[STATE][SET][ERROR]", { org_id, from_phone, state, error });
+  }
 }
 
 export async function clearState(

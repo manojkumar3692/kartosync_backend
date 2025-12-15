@@ -18,11 +18,11 @@ export type ConversationState =
   | "cancel"
   | "awaiting_location_pin"
   | "building_order"
-  |  "multi_pending: ParsedOrderLine[] | null"
-  |  "multi_active: boolean"   
   | "agent"            
   | "ordering_upsell"     
   | "cart_edit_menu"
+  | "awaiting_fulfillment"
+  | "awaiting_pickup_payment";
 
 
   // make sure address is in Intent union

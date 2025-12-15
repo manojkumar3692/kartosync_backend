@@ -6,6 +6,7 @@ export type MetaIntent =
   | "menu"
   | "agent"
   | "greeting"
+  | "back"
   | null;
 
 // Basic phrase map (later can come from DB)

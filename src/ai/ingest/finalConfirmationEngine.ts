@@ -203,7 +203,6 @@ export async function handleFinalConfirmation(
     }
 
     // 1) CONFIRM ORDER → create order in DB
-    // 1) CONFIRM ORDER → create order in DB
     if (choice === 1) {
       const { text: cartText, total } = formatCart(cart);
 
@@ -235,20 +234,43 @@ export async function handleFinalConfirmation(
         };
       }
 
-      // Reset cart + reset attempts for address step, then move to address
-      await clearCart(org_id, from_phone);
-      await resetAttempts(org_id, from_phone); // 🔴 ADD THIS LINE
-      await setState(org_id, from_phone, "awaiting_address");
+     // Reset cart + reset attempts for next step
+await clearCart(org_id, from_phone);
+await resetAttempts(org_id, from_phone);
 
-      return {
-        used: true,
-        kind: "order",
-        order_id: saved.id,
-        reply:
-          "✅ *Order confirmed!*\n\n" +
-          cartText +
-          "\n\n📍 Please send your delivery address.",
-      };
+// ✅ Restaurant-only: go to fulfillment choice
+// ✅ Others: keep old address flow
+let nextState: ConversationState = "awaiting_address";
+try {
+  const { data: orgRow } = await supa
+    .from("orgs")
+    .select("business_type")
+    .eq("id", org_id)
+    .maybeSingle();
+
+  const t = (orgRow?.business_type || "").toLowerCase();
+  if (t.includes("restaurant")) nextState = "awaiting_fulfillment";
+} catch (e) {
+  console.warn("[FINAL_CONFIRM][VERTICAL_CHECK_ERR]", e);
+}
+
+await setState(org_id, from_phone, nextState);
+
+return {
+  used: true,
+  kind: "order",
+  order_id: saved.id,
+  reply:
+    "✅ *Order confirmed!*\n\n" +
+    cartText +
+    "\n\n" +
+    (nextState === "awaiting_fulfillment"
+      ? "How would you like to receive your order?\n" +
+        "1) Store Pickup\n" +
+        "2) Home Delivery\n\n" +
+        "Please type *1* or *2*."
+      : "📍 Please send your delivery address."),
+};
     }
 
     // 2) EDIT YOUR ORDER → show edit menu
@@ -324,20 +346,21 @@ export async function handleFinalConfirmation(
 
   if (state === "cart_edit_menu") {
     let choice: number | null = null;
-  
+
     if (/^[1-5]$/.test(lower)) choice = parseInt(lower, 10);
 
     if (choice === null) {
       // basic text support
       if (["add", "another", "more"].includes(lower)) choice = 1;
-      else if (["edit", "change", "qty", "quantity"].includes(lower)) choice = 2;
+      else if (["edit", "change", "qty", "quantity"].includes(lower))
+        choice = 2;
       else if (["remove", "delete", "rm"].includes(lower)) choice = 3;
       else if (["cancel", "stop", "clear"].includes(lower)) choice = 4;
       else if (["back", "go back", "previous"].includes(lower)) choice = 5;
     }
-  
+
     const { text: cartText } = formatCart(cart);
-  
+
     if (choice === null) {
       return {
         used: true,
@@ -346,7 +369,7 @@ export async function handleFinalConfirmation(
         reply: buildEditMenu(cart),
       };
     }
-  
+
     // 1) Add another item
     if (choice === 1) {
       await setState(org_id, from_phone, "idle");
@@ -361,7 +384,7 @@ export async function handleFinalConfirmation(
           cartText,
       };
     }
-  
+
     // 2) Change qty → reuse existing flow
     if (choice === 2) {
       await setState(org_id, from_phone, "cart_edit_item");
@@ -375,7 +398,7 @@ export async function handleFinalConfirmation(
           "\n\nWhich item number do you want to change the quantity for?",
       };
     }
-  
+
     // 3) Remove item → reuse existing flow
     if (choice === 3) {
       await setState(org_id, from_phone, "cart_remove_item");
@@ -389,12 +412,12 @@ export async function handleFinalConfirmation(
           "\n\nWhich item number do you want to remove?",
       };
     }
-  
+
     // 4) Cancel order
     if (choice === 4) {
       await clearState(org_id, from_phone);
       await clearCart(org_id, from_phone);
-  
+
       return {
         used: true,
         kind: "order",
@@ -405,15 +428,15 @@ export async function handleFinalConfirmation(
     }
 
     // 5) Back to confirm menu
-if (choice === 5) {
-  await setState(org_id, from_phone, "confirming_order");
-  return {
-    used: true,
-    kind: "order",
-    order_id: null,
-    reply: buildConfirmMenu(cart),
-  };
-}
+    if (choice === 5) {
+      await setState(org_id, from_phone, "confirming_order");
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply: buildConfirmMenu(cart),
+      };
+    }
   }
 
   // ─────────────────────────────────────────────

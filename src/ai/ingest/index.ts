@@ -1,8 +1,9 @@
 // src/ai/ingest/index.ts
-import { getState, clearState } from "./stateManager";
+import { getState, clearState, setState } from "./stateManager";
 import { handleAddress } from "./addressEngine";
 import type { IngestContext, IngestResult, ConversationState } from "./types";
 import { handlePayment } from "./paymentEngine";
+import { handleFulfillment } from "./fulfillmentEngine";
 import { handleStatus } from "./statusEngine";
 import { handleCancel } from "./cancelEngine";
 import { handleFinalConfirmation } from "./finalConfirmationEngine";
@@ -17,10 +18,11 @@ import {
 import { normalizeCustomerText } from "../lang/normalize";
 import { detectAndTranslate } from "../lang/detectTranslate";
 import { getAliasHints } from "../aliases";
+import { createRazorpayPaymentLink } from "../../payments/razorpay";
 
 console.log("🔥🔥 INGEST INDEX.TS RUNNING v999");
 
-function isCorrectionMessage(t: string) { 
+function isCorrectionMessage(t: string) {
   const s = (t || "").toLowerCase();
 
   // English
@@ -180,6 +182,176 @@ export async function ingestCoreFromMessage(
     };
   }
 
+  // FULFILLMENT (restaurant)
+  if (state === "awaiting_fulfillment") {
+    console.log("[FULFILLMENT][INCOMING]", {
+      org_id,
+      from_phone,
+      text: raw,
+      state,
+    });
+
+    // Grab latest pending order (so we can show summary consistently)
+    const { data: order, error: ordErr } = await supa
+      .from("orders")
+      .select("id, items, total_amount, delivery_fee")
+      .eq("org_id", org_id)
+      .eq("source_phone", from_phone)
+      .eq("status", "pending")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    console.log("[FULFILLMENT][ORDER_LOOKUP]", { ordErr, orderId: order?.id });
+
+    // Helper: build a clean summary (don’t crash if items missing)
+    const summaryLines: string[] = [];
+    if (order?.items && Array.isArray(order.items)) {
+      for (const it of order.items) {
+        const name = it?.name || "Item";
+        const variant = it?.variant ? ` (${it.variant})` : "";
+        const qty = Number(it?.qty) || 0;
+        const price = Number(it?.price) || 0;
+        const lineTotal = qty && price ? qty * price : null;
+
+        if (qty > 0) {
+          summaryLines.push(
+            `• ${name}${variant} x ${qty}${
+              lineTotal != null ? ` — ₹${lineTotal}` : ""
+            }`
+          );
+        }
+      }
+    }
+
+    const total =
+      order?.total_amount != null ? Number(order.total_amount) : null;
+
+    const summaryText =
+      summaryLines.length > 0
+        ? summaryLines.join("\n") +
+          (total != null ? `\n\n💰 Total: *₹${total.toFixed(0)}*` : "")
+        : null;
+
+    const menuText =
+      (order?.id
+        ? `✅ *Order confirmed!* (#${order.id})\n\n`
+        : `✅ *Order confirmed!*\n\n`) +
+      (summaryText ? `${summaryText}\n\n` : "") +
+      "How would you like to receive your order?\n" +
+      "1) Store Pickup\n" +
+      "2) Home Delivery\n\n" +
+      "Please type *1* or *2*.";
+
+    // Accept 1/2 only
+    if (lowerRaw === "1") {
+      // ✅ Pickup selected
+      if (order?.id) {
+        await supa
+          .from("orders")
+          .update({ delivery_type: "pickup" })
+          .eq("id", order.id);
+      }
+
+      // ✅ online-only for pickup
+      // Create Razorpay payment link using org-wise credentials
+      let payUrl: string | null = null;
+      let payLinkId: string | null = null;
+
+      try {
+        const amount = total != null ? Number(total) : 0;
+
+        if (!order?.id) {
+          throw new Error("No pending order found for pickup payment link.");
+        }
+        if (!amount || Number.isNaN(amount) || amount <= 0) {
+          throw new Error("Invalid order total; cannot create payment link.");
+        }
+
+        const pl = await createRazorpayPaymentLink({
+          org_id,
+          order_id: order.id,
+          amount_inr: amount,
+          customer_phone: from_phone,
+        });
+
+        payLinkId = pl.id;
+        payUrl = pl.short_url;
+
+        // OPTIONAL: store link on order (will work only after you add columns)
+        // If columns don’t exist yet, supabase will return error; we ignore it safely.
+        const { error: updErr } = await supa
+          .from("orders")
+          .update({
+            payment_provider: "razorpay",
+            payment_status: "unpaid",
+            razorpay_payment_link_id: payLinkId,
+            razorpay_payment_link_url: payUrl,
+          } as any)
+          .eq("id", order.id);
+
+        if (updErr) {
+          console.warn("[PICKUP][ORDER_UPDATE_WARN]", updErr.message);
+        }
+      } catch (e: any) {
+        console.error("[PICKUP][RAZORPAY_LINK_ERR]", e?.message || e);
+      }
+
+      // ✅ New state so pickup payment doesn't mix with delivery/COD logic
+      await setState(org_id, from_phone, "awaiting_pickup_payment" as any);
+
+      const linkLine = payUrl
+        ? `*${payUrl}*`
+        : "*Payment link is not available right now.*\nPlease wait / contact the store.";
+
+      return {
+        used: true,
+        kind: "order",
+        order_id: order?.id || null,
+        reply:
+          "✅ *Store Pickup selected!*\n\n" +
+          (summaryText ? `🧾 *Order Summary*\n${summaryText}\n\n` : "") +
+          "💳 *Online payment only* for pickup.\n" +
+          "Please pay using this link:\n" +
+          linkLine +
+          "\n\n" +
+          "After payment, send the screenshot / transaction id here (or type *paid*).",
+      };
+    }
+
+    if (lowerRaw === "2") {
+      // ✅ Delivery selected
+      if (order?.id) {
+        await supa
+          .from("orders")
+          .update({ delivery_type: "delivery" })
+          .eq("id", order.id);
+      }
+
+      await setState(org_id, from_phone, "awaiting_address");
+
+      return {
+        used: true,
+        kind: "order",
+        order_id: order?.id || null,
+        reply:
+          (order?.id
+            ? `✅ *Order confirmed!* (#${order.id})\n\n`
+            : `✅ *Order confirmed!*\n\n`) +
+          (summaryText ? `${summaryText}\n\n` : "") +
+          "📍 Please send your delivery address.",
+      };
+    }
+
+    // Any other text → re-prompt with summary
+    return {
+      used: true,
+      kind: "order",
+      order_id: order?.id || null,
+      reply: menuText,
+    };
+  }
+
   // ADDRESS
   if (state === "awaiting_address" || state === "awaiting_location_pin") {
     return handleAddress(ctx, state);
@@ -188,15 +360,246 @@ export async function ingestCoreFromMessage(
   // PAYMENT
   if (state === "awaiting_payment") return handlePayment(ctx);
 
+  if (state === "awaiting_payment_proof") {
+    const lower = (raw || "").trim().toLowerCase();
+
+    // simple UX: let user say "paid" but real truth comes from webhook
+    if (["paid", "done", "payment done", "completed"].includes(lower)) {
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply:
+          "✅ Got it. We are verifying your payment now. You’ll receive confirmation shortly.",
+      };
+    }
+
+    // otherwise: remind payment link
+    const { data: order } = await supa
+      .from("orders")
+      .select("id, razorpay_payment_link_url, payment_status")
+      .eq("org_id", org_id)
+      .eq("source_phone", from_phone)
+      .eq("status", "pending")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (order?.payment_status === "paid") {
+      await clearState(org_id, from_phone);
+      return {
+        used: true,
+        kind: "order",
+        order_id: order.id,
+        reply: "✅ Payment already received.",
+      };
+    }
+
+    return {
+      used: true,
+      kind: "order",
+      order_id: order?.id || null,
+      reply:
+        "💳 Your payment is pending.\nPlease pay using this link:\n" +
+        `*${order?.razorpay_payment_link_url || "Payment link not found"}*`,
+    };
+  }
+
+  // PICKUP PAYMENT (Razorpay – restaurant only)
+  // PICKUP PAYMENT WAIT (Razorpay link)
+  if (state === "awaiting_pickup_payment") {
+    const lower = (raw || "").trim().toLowerCase();
+
+    // 1) Allow cancel
+    if (lower === "cancel" || lower === "cancel order") {
+      // cancel latest pending order
+      const { data: ord } = await supa
+        .from("orders")
+        .select("id")
+        .eq("org_id", org_id)
+        .eq("source_phone", from_phone)
+        .eq("status", "pending")
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (ord?.id) {
+        await supa
+          .from("orders")
+          .update({ status: "cancelled" })
+          .eq("id", ord.id);
+      }
+
+      await clearState(org_id, from_phone);
+
+      return {
+        used: true,
+        kind: "order",
+        order_id: ord?.id || null,
+        reply:
+          "❌ Okay, your order is cancelled. You can start a new order now.",
+      };
+    }
+
+    // 2) If user says paid (we still depend on webhook for truth)
+    if (["paid", "done", "payment done", "completed"].includes(lower)) {
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply:
+          "✅ Got it. We are verifying your payment now.\n" +
+          "You’ll receive confirmation shortly.\n\n" +
+          "If you haven’t paid yet, type *resend* to get the link again.",
+      };
+    }
+
+    // 3) Load latest pending order + stored link
+    const { data: order } = await supa
+      .from("orders")
+      .select(
+        "id, razorpay_payment_link_url, razorpay_payment_link_id, total_amount, payment_status"
+      )
+      .eq("org_id", org_id)
+      .eq("source_phone", from_phone)
+      .eq("status", "pending")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    // Already paid?
+    if (order?.payment_status === "paid") {
+      await clearState(org_id, from_phone);
+      return {
+        used: true,
+        kind: "order",
+        order_id: order.id,
+        reply:
+          "✅ Payment already received. Please wait for pickup confirmation message.",
+      };
+    }
+
+    // 4) Resend existing link if available
+    if (lower === "resend" || lower === "pay link" || lower === "link") {
+      if (order?.razorpay_payment_link_url) {
+        return {
+          used: true,
+          kind: "order",
+          order_id: order.id,
+          reply:
+            "💳 Please pay using this link:\n" +
+            `*${order.razorpay_payment_link_url}*\n\n` +
+            "After payment, you’ll automatically receive pickup confirmation.",
+        };
+      }
+    }
+
+    // 5) Regenerate link if missing OR user asks explicitly
+    const wantsNewLink = ["new link", "regenerate", "create link"].includes(
+      lower
+    );
+    const missingLink = !order?.razorpay_payment_link_url;
+
+    if ((wantsNewLink || missingLink) && order?.id) {
+      try {
+        const amount = Number(order.total_amount || 0);
+        if (!amount || amount <= 0)
+          throw new Error("Invalid amount for payment link");
+
+        const pl = await createRazorpayPaymentLink({
+          org_id,
+          order_id: order.id,
+          amount_inr: amount,
+          customer_phone: from_phone,
+        });
+
+        await supa
+          .from("orders")
+          .update({
+            payment_provider: "razorpay",
+            payment_status: "unpaid",
+            razorpay_payment_link_id: pl.id,
+            razorpay_payment_link_url: pl.short_url,
+          } as any)
+          .eq("id", order.id);
+
+        return {
+          used: true,
+          kind: "order",
+          order_id: order.id,
+          reply:
+            "💳 Please pay using this link:\n" +
+            `*${pl.short_url}*\n\n` +
+            "After payment, you’ll automatically receive pickup confirmation.\n" +
+            "Type *cancel* to cancel the order.",
+        };
+      } catch (e: any) {
+        console.error("[PICKUP_PAYMENT][REGEN_ERR]", e?.message || e);
+        return {
+          used: true,
+          kind: "order",
+          order_id: order.id,
+          reply:
+            "⚠️ I couldn’t generate the payment link right now.\n" +
+            "Please type *resend* later, or type *cancel* to cancel the order.",
+        };
+      }
+    }
+
+    // 6) Default menu (prevents infinite loop confusion)
+    return {
+      used: true,
+      kind: "order",
+      order_id: order?.id || null,
+      reply:
+        "💳 Your pickup order is awaiting payment.\n\n" +
+        "Reply with one option:\n" +
+        "1) *resend* (get payment link)\n" +
+        "2) *paid* (if you already paid)\n" +
+        "3) *cancel* (cancel this order)",
+    };
+  }
+
   // FINAL CONFIRM
   if (
     state === "confirming_order" ||
-    state === "cart_edit_menu" || 
+    state === "cart_edit_menu" ||
     state === "cart_edit_item" ||
     state === "cart_edit_qty" ||
     state === "cart_remove_item"
   ) {
-    return handleFinalConfirmation(ctx, state);
+    const res = await handleFinalConfirmation(ctx, state);
+
+    // ✅ Restaurant: after order is confirmed, go to fulfillment step
+    // We detect "confirmed" by presence of order_id + reply containing "Order confirmed"
+    // (keeps flow unchanged for edit screens and non-confirm actions)
+    const vertical = await getOrgVertical(org_id);
+
+    if (
+      vertical === "restaurant" &&
+      res?.order_id &&
+      typeof res.reply === "string" &&
+      res.reply.includes("✅ *Order confirmed!*")
+    ) {
+      // move next step to fulfillment UI
+      await clearState(org_id, from_phone);
+      // IMPORTANT: setState is needed here (you already import clearState, not setState)
+      // so you must import setState from stateManager OR do it inside finalConfirmationEngine.
+      await setState(org_id, from_phone, "awaiting_fulfillment");
+
+      return {
+        used: true,
+        kind: "order",
+        order_id: res.order_id,
+        reply:
+          "How would you like to receive your order?\n" +
+          "1) Store Pickup\n" +
+          "2) Home Delivery\n\n" +
+          "Please type *1* or *2*.",
+      };
+    }
+
+    return res;
   }
 
   // STATUS
@@ -404,13 +807,13 @@ export async function ingestCoreFromMessage(
         text: idleIntentText,
         intent: routed.intent,
       });
-    
+
       const serviceReply = await handleServiceLaneAndReply(
         org_id,
         routed.intent as ServiceLane,
         { raw, normalizedText: idleIntentText }
       );
-    
+
       // If service engine didn't return anything, still stop parsing
       return (
         serviceReply ?? {

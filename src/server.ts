@@ -26,6 +26,7 @@ import testing from './routes/testing';
 import { customerInsight } from "./routes/customerInsight";
 import { adminAiFaq } from "./routes/adminAiFaq";
 import adminProductUpsells from './routes/admin_product_upsells';
+import { razorpayWebhookRouter } from './routes/razorpayWebhook';
 
 // ─────────────────────────────
 // Boot diagnostics
@@ -88,6 +89,7 @@ app.all('/webhook', (req, res) => {
 // ─────────────────────────────
 app.use('/webhook/whatsapp', express.json(), waba);
 app.use('/api/waba/webhook', express.json(), waba);
+app.use("/api/razorpay", razorpayWebhookRouter);
 
 // ─────────────────────────────
 // Standard JSON body parser for remaining routes
