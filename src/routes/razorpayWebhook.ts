@@ -241,12 +241,7 @@ razorpayWebhookRouter.post(
         razorpay_payment_id: paymentId,
       } as any)
       .eq("id", order_id)
-      .eq("org_id", org_id)
-    
-      // ✅ THIS IS THE KEY GUARD
-      .eq("status", "awaiting_customer_action")
-    
-      // keep idempotent
+      .eq("org_id", org_id) 
       .neq("payment_status", "paid")
       .select("id, source_phone, items, total_amount, delivery_type, created_at, currency_code");
 
