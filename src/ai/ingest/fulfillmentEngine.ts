@@ -241,14 +241,39 @@ export async function handleFulfillment(ctx: IngestContext): Promise<IngestResul
     (storePhone ? `📞 ${storePhone}\n` : "") +
     (storeHours ? `⏰ Open till: ${storeHours}\n` : "");
 
-  return {
-    used: true,
-    kind: "order",
-    order_id: order.id,
-    reply:
-      "✅ *Store Pickup selected!*\n\n" +
-      linkLine +
-      "Once payment is successful, we’ll confirm your pickup order with details.\n\n" +
-      storeBlock,
-  };
+    // ✅ Build order summary (MISSING PART)
+const summaryLines: string[] = [];
+if (order.items && Array.isArray(order.items)) {
+  for (const it of order.items) {
+    const name = it?.name || "Item";
+    const variant = it?.variant ? ` (${it.variant})` : "";
+    const qty = Number(it?.qty) || 0;
+    const price = Number(it?.price) || 0;
+
+    if (qty > 0) {
+      summaryLines.push(
+        `• ${name}${variant} x ${qty} — ₹${qty * price}`
+      );
+    }
+  }
+}
+
+const summaryText =
+  summaryLines.length > 0
+    ? summaryLines.join("\n") + `\n\n💰 Total: *₹${amount}*`
+    : "";
+
+    return {
+      used: true,
+      kind: "order",
+      order_id: order.id,
+      reply:
+        "✅ *Store Pickup selected!*\n\n" +
+        "🧾 *Order Summary*\n" +
+        summaryText +
+        "\n\n💳 *Online payment only for pickup.*\n" +
+        "Please pay using this link:\n" +
+        `*${payUrl}*\n\n` +
+        "After payment, send the screenshot / transaction id here (or type *paid*).",
+    };
 }

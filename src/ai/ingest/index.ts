@@ -206,13 +206,14 @@ export async function ingestCoreFromMessage(
       text: raw,
       state,
     });
-  
+
+    // Grab latest pending order (so we can show summary consistently)
     const phoneKey = normalizePhone(from_phone);
-  
+
     const { data: order, error: ordErr } = await supa
       .from("orders")
       .select(
-        "id, items, total_amount, delivery_fee, created_at, payment_status"
+        "id, items, total_amount, delivery_fee, created_at, payment_status, razorpay_payment_link_url"
       )
       .eq("org_id", org_id)
       .eq("source_phone", phoneKey)
@@ -220,10 +221,10 @@ export async function ingestCoreFromMessage(
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
-  
+
     console.log("[FULFILLMENT][ORDER_LOOKUP]", { ordErr, orderId: order?.id });
-  
-    // Build summary
+
+    // Helper: build a clean summary (don’t crash if items missing)
     const summaryLines: string[] = [];
     if (order?.items && Array.isArray(order.items)) {
       for (const it of order.items) {
@@ -232,7 +233,7 @@ export async function ingestCoreFromMessage(
         const qty = Number(it?.qty) || 0;
         const price = Number(it?.price) || 0;
         const lineTotal = qty && price ? qty * price : null;
-  
+
         if (qty > 0) {
           summaryLines.push(
             `• ${name}${variant} x ${qty}${
@@ -242,16 +243,16 @@ export async function ingestCoreFromMessage(
         }
       }
     }
-  
+
     const total =
       order?.total_amount != null ? Number(order.total_amount) : null;
-  
+
     const summaryText =
       summaryLines.length > 0
         ? summaryLines.join("\n") +
           (total != null ? `\n\n💰 Total: *₹${total.toFixed(0)}*` : "")
         : null;
-  
+
     const menuText =
       (order?.id
         ? `✅ *Order confirmed!* (#${order.id})\n\n`
@@ -261,10 +262,8 @@ export async function ingestCoreFromMessage(
       "1) Store Pickup\n" +
       "2) Home Delivery\n\n" +
       "Please type *1* or *2*.";
-  
-    // ─────────────────────────────
-    // PICKUP
-    // ─────────────────────────────
+
+    // Accept 1/2 only
     if (lowerRaw === "1") {
       if (order?.id) {
         await supa
@@ -272,37 +271,29 @@ export async function ingestCoreFromMessage(
           .update({ delivery_type: "pickup" })
           .eq("id", order.id);
       }
-  
-      // 🔥 DO NOT CREATE PAYMENT LINK HERE
-      // Just move to pickup payment state
-      await setState(org_id, from_phone, "awaiting_pickup_payment" as any);
-  
+    
+      // ⛔ DO NOT create Razorpay link here
+      // ⛔ DO NOT send payment message here
+    
       return {
-        used: true,
+        used: false,           // 🔥 allows pipeline to continue
         kind: "order",
+        reply: null,
         order_id: order?.id || null,
-        reply:
-          "✅ *Store Pickup selected!*\n\n" +
-          (summaryText ? `🧾 *Order Summary*\n${summaryText}\n\n` : "") +
-          "💳 *Online payment only* for pickup.\n" +
-          "You’ll receive a payment link shortly.\n\n" +
-          "After payment, we’ll confirm your pickup.",
       };
     }
-  
-    // ─────────────────────────────
-    // DELIVERY
-    // ─────────────────────────────
+
     if (lowerRaw === "2") {
+      // ✅ Delivery selected
       if (order?.id) {
         await supa
           .from("orders")
           .update({ delivery_type: "delivery" })
           .eq("id", order.id);
       }
-  
+
       await setState(org_id, from_phone, "awaiting_address");
-  
+
       return {
         used: true,
         kind: "order",
@@ -315,10 +306,8 @@ export async function ingestCoreFromMessage(
           "📍 Please send your delivery address.",
       };
     }
-  
-    // ─────────────────────────────
-    // FALLBACK
-    // ─────────────────────────────
+
+    // Any other text → re-prompt with summary
     return {
       used: true,
       kind: "order",
