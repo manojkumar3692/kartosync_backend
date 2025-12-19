@@ -45,6 +45,7 @@ console.log("[BOOT] SUPABASE_URL =", process.env.SUPABASE_URL);
 console.log("[BOOT] APP_PUBLIC_URL =", process.env.APP_PUBLIC_URL);
 
 const app = express();
+app.disable("etag");
 
 // 🔹 Serve /static from <project-root>/static
 const STATIC_ROOT = path.join(process.cwd(), "static");
@@ -61,6 +62,17 @@ app.use(cors({
   credentials: false,
 }));
 app.options('*', cors());
+
+// ✅ Prevent browser/proxy caching for all API routes (stops 304 issues)
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/")) {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.setHeader("Surrogate-Control", "no-store");
+  }
+  next();
+});
 
 // ─────────────────────────────
 // Global request logger (top of chain)
