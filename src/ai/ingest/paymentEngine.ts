@@ -2,7 +2,8 @@
 
 import { supa } from "../../db";
 import { IngestContext, IngestResult } from "./types";
-import { clearState } from "./stateManager";
+import { clearState, setState } from "./stateManager";
+import { emitNewOrder } from "../../routes/realtimeOrders";
 
 const PAY_CASH = ["cash", "cod", "cash on delivery"];
 const PAY_CARD = ["card", "credit", "debit", "card on delivery"];
@@ -129,24 +130,67 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
   //    and fetch items for summary
   // ─────────────────────────────────────────────
   const { data: order } = await supa
-    .from("orders")
-    .select(
-      "id, status, items, total_amount, delivery_fee, delivery_distance_km, delivery_type"
-    )
-    .eq("org_id", org_id)
-    .eq("source_phone", from_phone)
-    .eq("status", "pending")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  .from("orders")
+  .select("id, status, items, total_amount, delivery_fee, delivery_type, created_at, currency_code")
+  .eq("org_id", org_id)
+  .eq("source_phone", from_phone)
+  .in("status", ["awaiting_customer_action"] as any)
+  .order("created_at", { ascending: false })
+  .limit(1)
+  .maybeSingle();
 
   if (order?.id) {
-    await supa
-      .from("orders")
-      .update({
-        payment_mode: mode,
-      })
-      .eq("id", order.id);
+    // always save chosen mode
+    await supa.from("orders").update({ payment_mode: mode }).eq("id", order.id);
+  
+    const isCashLike = mode === "cash" || mode === "card";
+    const isOnlineLike = !isCashLike; // online / upi
+  
+    // ✅ COD/Card: send to store immediately
+    if (isCashLike) {
+      const { error: accErr } = await supa
+        .from("orders")
+        .update({
+          status: "awaiting_store_action",
+          payment_status: "unpaid",
+        })
+        .eq("id", order.id)
+        .eq("org_id", org_id);
+  
+      if (!accErr) {
+        try {
+          emitNewOrder(org_id, {
+            id: order.id,
+            org_id,
+            source_phone: from_phone,
+            status: "awaiting_store_action",
+            created_at: order.created_at,
+            total_amount: order.total_amount ?? null,
+            items: order.items ?? [],
+          });
+        } catch (e) {
+          console.warn("[PAYMENT][SSE_EMIT_ERR]", e);
+        }
+      }
+  
+      // ✅ done with payment step
+      await clearState(org_id, from_phone);
+    }
+  
+    // ✅ Online/UPI: DO NOT send to store yet (wait for webhook)
+    if (isOnlineLike) {
+      await supa
+        .from("orders")
+        .update({
+          status: "awaiting_customer_action",
+          payment_status: "unpaid",
+        } as any)
+        .eq("id", order.id)
+        .eq("org_id", org_id);
+  
+      // ✅ keep conversation in a waiting state
+      await setState(org_id, from_phone, "awaiting_payment_proof" as any);
+    }
   }
 
   // ─────────────────────────────────────────────
@@ -181,7 +225,7 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
   });
 
   // clear state after payment chosen
-  await clearState(org_id, from_phone);
+  // await clearState(org_id, from_phone);
 
   const modeLabel =
     mode === "cash"

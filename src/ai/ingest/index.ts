@@ -54,6 +54,23 @@ function isCorrectionMessage(t: string) {
   return false;
 }
 
+const OPEN_ORDER_STATUSES = [
+  "pending",
+  "awaiting_payment_or_method",
+  "awaiting_fulfillment",
+  "awaiting_payment",
+  "awaiting_payment_proof",
+] as const;
+
+
+const PENDING_FULFILLMENT_STATUSES = [
+  "awaiting_customer_action",
+  "awaiting_store_action",
+] as const;
+
+
+const normalizePhone = (p: string) => (p || "").replace(/[^\d]/g, "");
+
 async function getLastIntentEvent(
   orgId: string,
   customerPhone: string,
@@ -135,7 +152,6 @@ export async function ingestCoreFromMessage(
   const { org_id, from_phone, text } = ctx;
   const raw = (text || "").trim();
   const lowerRaw = raw.toLowerCase();
-
   const state = await getState(org_id, from_phone);
   console.log("[AI][INGEST][PRE]", { org_id, from_phone, text, state });
 
@@ -143,7 +159,7 @@ export async function ingestCoreFromMessage(
   // MANUAL MODE CHECK
   // ------------------------------------------------------
   try {
-    const phoneKey = from_phone.replace(/[^\d]/g, "");
+    const phoneKey = normalizePhone(from_phone);
 
     const { data: cust, error: custErr } = await supa
       .from("org_customer_settings")
@@ -192,12 +208,16 @@ export async function ingestCoreFromMessage(
     });
 
     // Grab latest pending order (so we can show summary consistently)
+    const phoneKey = normalizePhone(from_phone);
+
     const { data: order, error: ordErr } = await supa
       .from("orders")
-      .select("id, items, total_amount, delivery_fee")
+      .select(
+        "id, items, total_amount, delivery_fee, created_at, payment_status, razorpay_payment_link_url"
+      )
       .eq("org_id", org_id)
-      .eq("source_phone", from_phone)
-      .eq("status", "pending")
+      .eq("source_phone", phoneKey)
+      .in("status", PENDING_FULFILLMENT_STATUSES as any)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -272,7 +292,7 @@ export async function ingestCoreFromMessage(
           org_id,
           order_id: order.id,
           amount_inr: amount,
-          customer_phone: from_phone,
+          customer_phone: normalizePhone(from_phone),
         });
 
         payLinkId = pl.id;
@@ -373,14 +393,15 @@ export async function ingestCoreFromMessage(
           "✅ Got it. We are verifying your payment now. You’ll receive confirmation shortly.",
       };
     }
+    const phoneKey = normalizePhone(from_phone);
 
     // otherwise: remind payment link
     const { data: order } = await supa
       .from("orders")
       .select("id, razorpay_payment_link_url, payment_status")
       .eq("org_id", org_id)
-      .eq("source_phone", from_phone)
-      .eq("status", "pending")
+      .eq("source_phone", phoneKey)
+      .in("status", OPEN_ORDER_STATUSES as any)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -421,12 +442,14 @@ export async function ingestCoreFromMessage(
 
     // 1) Allow cancel
     if (lower === "cancel" || lower.includes("cancel")) {
+      const phoneKey = normalizePhone(from_phone);
+
       const { data: ord } = await supa
         .from("orders")
         .select("id")
         .eq("org_id", org_id)
-        .eq("source_phone", from_phone)
-        .eq("status", "pending")
+        .eq("source_phone", phoneKey)
+        .in("status", OPEN_ORDER_STATUSES as any)
         .order("created_at", { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -451,12 +474,14 @@ export async function ingestCoreFromMessage(
 
     // 2) If user says paid (we still depend on webhook for truth)
     if (["paid", "done", "payment done", "completed"].includes(lower)) {
+      const phoneKey = normalizePhone(from_phone);
+
       const { data: o } = await supa
         .from("orders")
         .select("id, payment_status, razorpay_payment_link_url, created_at")
         .eq("org_id", org_id)
-        .eq("source_phone", from_phone)
-        .eq("status", "pending")
+        .eq("source_phone", phoneKey)
+        .in("status", OPEN_ORDER_STATUSES as any)
         .order("created_at", { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -490,6 +515,7 @@ export async function ingestCoreFromMessage(
           "3) *cancel*",
       };
     }
+    const phoneKey = normalizePhone(from_phone);
 
     // 3) Load latest pending order + stored link
     const { data: order } = await supa
@@ -498,8 +524,8 @@ export async function ingestCoreFromMessage(
         "id, razorpay_payment_link_url, razorpay_payment_link_id, total_amount, payment_status, created_at"
       )
       .eq("org_id", org_id)
-      .eq("source_phone", from_phone)
-      .eq("status", "pending")
+      .eq("source_phone", phoneKey)
+      .in("status", OPEN_ORDER_STATUSES as any)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -569,8 +595,8 @@ export async function ingestCoreFromMessage(
           org_id,
           order_id: order.id,
           amount_inr: amount,
-          customer_phone: from_phone,
-        });
+          customer_phone: normalizePhone(from_phone),
+         });
 
         await supa
           .from("orders")

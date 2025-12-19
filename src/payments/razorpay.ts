@@ -66,7 +66,11 @@ export async function createRazorpayPaymentLink(opts: {
     throw new Error("Razorpay not configured for this business.");
   }
 
-  const amount_paise = Math.round(Number(opts.amount_inr) * 100);
+  const amount_inr = Math.round(Number(opts.amount_inr));
+  if (!Number.isFinite(amount_inr) || amount_inr <= 0) {
+    throw new Error("Invalid amount_inr for payment link.");
+  }
+  const amount_paise = amount_inr * 100;
 
   // ✅ Razorpay constraint: reference_id length <= 40
   // UUID is 36 chars, so safest is to use order_id directly.
@@ -76,13 +80,16 @@ export async function createRazorpayPaymentLink(opts: {
     ? `${process.env.APP_PUBLIC_URL.replace(/\/$/, "")}/payment/razorpay/return`
     : null;
 
+
+  const contact = String(opts.customer_phone || "").replace(/[^\d]/g, "");
+
   const payload: any = {
     amount: amount_paise,
     currency: "INR",
     description: `KartoOrder payment for order #${opts.order_id}`,
     reference_id,
     customer: {
-      contact: opts.customer_phone,
+      contact,
       name: opts.customer_name || "Customer",
       email: opts.customer_email || undefined,
     },
@@ -104,7 +111,7 @@ export async function createRazorpayPaymentLink(opts: {
   console.log("[RZP][CREATE_LINK][REQ]", {
     org_id: opts.org_id,
     order_id: opts.order_id,
-    amount_inr: opts.amount_inr,
+    amount_inr: amount_inr,
     amount_paise,
     reference_id,
     callback_url,

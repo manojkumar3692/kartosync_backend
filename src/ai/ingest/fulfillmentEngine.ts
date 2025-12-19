@@ -3,7 +3,7 @@ import { supa } from "../../db";
 import { IngestContext, IngestResult } from "./types";
 import { setState, clearState } from "./stateManager";
 import { detectMetaIntent } from "./metaIntent";
-
+import { createRazorpayPaymentLink } from "../../payments/razorpay";
 /**
  * We store the user's choice in orders.delivery_type:
  * - "pickup" | "delivery"
@@ -52,18 +52,18 @@ function detectFulfillmentChoice(raw: string): FulfillmentChoice | null {
   return null;
 }
 
-async function getLatestPendingOrder(org_id: string, from_phone: string) {
+async function getLatestActiveOrder(org_id: string, from_phone: string) {
   const { data, error } = await supa
     .from("orders")
-    .select("id, total_amount, items, delivery_fee, delivery_type, status, created_at")
+    .select("id, total_amount, items, delivery_fee, delivery_type, status, created_at, payment_status")
     .eq("org_id", org_id)
     .eq("source_phone", from_phone)
-    .eq("status", "pending")
+    .in("status", ["awaiting_customer_action", "awaiting_store_action", "accepted"])
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 
-  console.log("[FULFILL][FIND_PENDING]", { data, error });
+  console.log("[FULFILL][FIND_ACTIVE]", { data, error });
   return data || null;
 }
 
@@ -78,24 +78,6 @@ async function getOrgStoreInfo(org_id: string) {
 
   console.log("[FULFILL][ORG_STORE_INFO]", { data, error });
   return data || null;
-}
-
-/**
- * Razorpay integration placeholder.
- * Long-term: put this in src/payments/razorpay.ts (or service layer),
- * and call Razorpay API to create a payment_link.
- */
-async function createRazorpayPaymentLink(args: {
-  org_id: string;
-  order_id: string;
-  amount_inr: number;
-  customer_phone: string;
-}): Promise<{ url: string; provider_ref: string } | null> {
-  // ✅ TODO: Implement Razorpay API call.
-  // For now, return null or a dummy URL only in development.
-  // return { url: `https://rzp.io/i/${args.order_id}`, provider_ref: `plink_${args.order_id}` };
-
-  return null;
 }
 
 function safeInr(amount: any): number {
@@ -170,8 +152,8 @@ export async function handleFulfillment(ctx: IngestContext): Promise<IngestResul
     };
   }
 
-  const order = await getLatestPendingOrder(org_id, from_phone);
-  if (!order?.id) {
+  const order = await getLatestActiveOrder(org_id, from_phone);
+    if (!order?.id) {
     await clearState(org_id, from_phone);
     return {
       used: true,
@@ -207,26 +189,26 @@ export async function handleFulfillment(ctx: IngestContext): Promise<IngestResul
   const store = await getOrgStoreInfo(org_id);
 
   const amount = safeInr(order.total_amount ?? 0);
-  const link = await createRazorpayPaymentLink({
+  const pl = await createRazorpayPaymentLink({
     org_id,
     order_id: order.id,
     amount_inr: amount,
     customer_phone: from_phone,
   });
+  
+  const payUrl = pl?.short_url || null;
+  const payLinkId = pl?.id || null;
 
   // Save link details (create these columns when ready)
   // orders.payment_link_url, orders.payment_provider, orders.payment_provider_ref, orders.payment_status
-  if (link?.url) {
-    await supa
-      .from("orders")
-      .update({
-        payment_mode: "online",
-        payment_status: "pending",
-        payment_provider: "razorpay",
-        payment_provider_ref: link.provider_ref,
-        payment_link_url: link.url,
-      } as any)
-      .eq("id", order.id);
+  if (payUrl) {
+    await supa.from("orders").update({
+      payment_mode: "online",
+      payment_status: "unpaid",
+      payment_provider: "razorpay",
+      razorpay_payment_link_id: payLinkId,
+      razorpay_payment_link_url: payUrl,
+    } as any).eq("id", order.id);
   } else {
     // If link creation fails, still don’t break flow
     await supa
@@ -240,17 +222,17 @@ export async function handleFulfillment(ctx: IngestContext): Promise<IngestResul
 
   // After sending link, we stay in a state waiting for webhook to mark paid.
   // You can add this state later if you want: "awaiting_pickup_payment"
-  await clearState(org_id, from_phone);
-
+  await setState(org_id, from_phone, "awaiting_pickup_payment" as any);
+  
   const storeName = store?.name ? `*${store.name}*` : "our store";
   const storeAddr = store?.store_address ? store.store_address : "Store address will be shared after payment.";
   const storePhone = store?.store_phone ? store.store_phone : "";
   const storeHours = store?.store_hours ? store.store_hours : "";
   const maps = store?.store_maps_url ? store.store_maps_url : "";
 
-  const linkLine = link?.url
-    ? `🔗 *Pay here to confirm pickup:* ${link.url}\n\n`
-    : "🔗 Payment link is being generated. You’ll receive it shortly.\n\n";
+  const linkLine = payUrl
+  ? `🔗 *Pay here to confirm pickup:* ${payUrl}\n\n`
+  : "🔗 Payment link is being generated. You’ll receive it shortly.\n\n";
 
   const storeBlock =
     `🏪 Pickup from: ${storeName}\n` +

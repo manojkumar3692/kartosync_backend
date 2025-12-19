@@ -13,7 +13,31 @@ export const orders = express.Router();
 // ─────────────────────────────────────────────────────────────────────────────
 // Status constants (store lowercase in DB; accept any case from client)
 // ─────────────────────────────────────────────────────────────────────────────
-const STATUS_LIST = ["pending", "accepted", "shipped", "paid", "cancelled"] as const;
+const STATUS_LIST = [
+  "draft",
+  "awaiting_confirmation",
+  "awaiting_payment_or_method",
+  "accepted",
+  "shipped",
+  "delivered",
+  "paid",
+  "cancelled",
+] as const;
+const OPEN_STATUSES = new Set<OrderStatus>([
+  "draft",
+  "awaiting_confirmation",
+  "awaiting_payment_or_method",
+  "accepted",
+]);
+
+const CLOSED_STATUSES = new Set<OrderStatus>([
+  "shipped",
+  "paid",
+  "cancelled",
+  "delivered",
+]);
+
+
 type OrderStatus = (typeof STATUS_LIST)[number];
 const STATUS_SET = new Set<string>(STATUS_LIST);
 
@@ -452,7 +476,7 @@ orders.post("/", ensureAuth, async (req: any, res) => {
       customer_name: customer_name || null,
       raw_text: raw_text || null,
       items: finalItems,
-      status: "pending" as OrderStatus,
+      status: "awaiting_confirmation" as OrderStatus,
       parse_confidence,
       parse_reason,
       order_link_reason: "new", // default for manual creations
@@ -893,8 +917,6 @@ orders.post("/:id/edit", ensureAuth, async (req: any, res) => {
   }
 });
 
-const OPEN_STATUSES = new Set(["pending", "accepted", "confirmed", "packing"]);
-const CLOSED_STATUSES = new Set(["shipped", "paid", "cancelled", "delivered"]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers for UI overrides
@@ -1014,9 +1036,10 @@ orders.post(
       const cur = await getOrder(org_id, order_id);
 
       // Guard: current must be OPEN; if already closed we shouldn't be merging it
-      if (CLOSED_STATUSES.has(String(cur.status))) {
-        return res.status(400).json({ ok: false, error: "current_not_open" });
-      }
+      const curStatus = normStatus(cur.status);
+if (curStatus && CLOSED_STATUSES.has(curStatus)) {
+  return res.status(400).json({ ok: false, error: "current_not_open" });
+}
 
       const phone = normalizePhone(cur.source_phone || "") || "";
       if (!phone) {
@@ -1041,7 +1064,7 @@ orders.post(
       }
 
       // Guard: previous must be OPEN
-      if (CLOSED_STATUSES.has(String(prev.status))) {
+      if (curStatus && CLOSED_STATUSES.has(curStatus)) {
         return res.status(400).json({ ok: false, error: "previous_not_open" });
       }
 

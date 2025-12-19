@@ -211,9 +211,13 @@ export async function handleFinalConfirmation(
         source_phone: from_phone,
         raw_text: ctx.text || "",
         items: cart,
-        status: "pending",
+        // ✅ Customer must still choose payment / complete payment
+        status: "awaiting_customer_action",      
         created_at: new Date().toISOString(),
         total_amount: total || null,
+        // optional but nice (since you already have these columns)
+        payment_status: "unpaid",
+        payment_mode: null, // or omit if you want
       };
 
       const { data: saved, error } = await supa
@@ -222,20 +226,7 @@ export async function handleFinalConfirmation(
         .select("id")
         .single();
 
-      // ✅ SSE: notify dashboard immediately (for sound + live list)
-      try {
-        emitNewOrder(org_id, {
-          id: saved.id,
-          org_id,
-          source_phone: from_phone,
-          status: "pending",
-          created_at: orderPayload.created_at,
-          total_amount: orderPayload.total_amount ?? null,
-          items: cart, // optional; include if your UI wants it without refetch
-        });
-      } catch (e) {
-        console.warn("[FINAL_CONFIRM][SSE_EMIT_ERR]", e);
-      }
+
 
       console.log("[FINAL_CONFIRM][INSERT]", { error, saved, orderPayload });
 
