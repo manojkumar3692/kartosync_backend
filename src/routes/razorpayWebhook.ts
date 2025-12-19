@@ -226,24 +226,27 @@ razorpayWebhookRouter.post(
       payload?.payment_link?.entity?.payments?.[0]?.payment_id ||
       null;
     
-    const { data: updatedOrders, error: updErr } = await supa
+      const { data: updatedOrders, error: updErr } = await supa
       .from("orders")
       .update({
         payment_provider: "razorpay",
         payment_mode: "online",
         payment_status: "paid",
         paid_at: new Date().toISOString(),
-    
-        // ✅ only after paid
         status: "awaiting_store_action",
-    
-        // optional if you have this column already
         razorpay_payment_id: paymentId,
       } as any)
       .eq("id", order_id)
-      .eq("org_id", org_id) 
-      .neq("payment_status", "paid")
-      .select("id, source_phone, items, total_amount, delivery_type, created_at, currency_code");
+      .eq("org_id", org_id)
+      // ✅ allow webhook retry but only emit once
+      .in("status", [
+        "awaiting_customer_action",
+        "awaiting_payment",
+        "awaiting_pickup_payment",
+      ] as any)
+      .select(
+        "id, source_phone, items, total_amount, delivery_type, created_at, currency_code"
+      );
 
       if (updErr) {
         console.error("[RZP_WEBHOOK][ORDER_UPDATE_ERR]", updErr);
