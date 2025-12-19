@@ -27,6 +27,7 @@ import { customerInsight } from "./routes/customerInsight";
 import { adminAiFaq } from "./routes/adminAiFaq";
 import adminProductUpsells from './routes/admin_product_upsells';
 import { razorpayWebhookRouter } from './routes/razorpayWebhook';
+import { sseOrders } from './routes/realtimeOrders';
 
 // ─────────────────────────────
 // Boot diagnostics
@@ -126,6 +127,7 @@ app.use('/api/payments', payments);
 app.use("/api/ai-corrections", aiCorrections);
 app.use("/api/analytics", analytics);
 app.use("/customer-insight", customerInsight);
+app.get("/api/realtime/orders", sseOrders);
 
 // new changes
 app.use("/admin/business", adminBusiness);

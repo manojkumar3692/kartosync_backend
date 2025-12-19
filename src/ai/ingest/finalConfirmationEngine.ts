@@ -4,7 +4,7 @@ import { supa } from "../../db";
 import type { IngestContext, IngestResult, ConversationState } from "./types";
 import { setState, clearState } from "./stateManager";
 import { resetAttempts } from "./attempts";
-
+import { emitNewOrder } from "../../routes/realtimeOrders";
 type CartLine = {
   product_id: string | number;
   name: string;
@@ -222,6 +222,21 @@ export async function handleFinalConfirmation(
         .select("id")
         .single();
 
+      // ✅ SSE: notify dashboard immediately (for sound + live list)
+      try {
+        emitNewOrder(org_id, {
+          id: saved.id,
+          org_id,
+          source_phone: from_phone,
+          status: "pending",
+          created_at: orderPayload.created_at,
+          total_amount: orderPayload.total_amount ?? null,
+          items: cart, // optional; include if your UI wants it without refetch
+        });
+      } catch (e) {
+        console.warn("[FINAL_CONFIRM][SSE_EMIT_ERR]", e);
+      }
+
       console.log("[FINAL_CONFIRM][INSERT]", { error, saved, orderPayload });
 
       if (error || !saved) {
@@ -234,43 +249,43 @@ export async function handleFinalConfirmation(
         };
       }
 
-     // Reset cart + reset attempts for next step
-await clearCart(org_id, from_phone);
-await resetAttempts(org_id, from_phone);
+      // Reset cart + reset attempts for next step
+      await clearCart(org_id, from_phone);
+      await resetAttempts(org_id, from_phone);
 
-// ✅ Restaurant-only: go to fulfillment choice
-// ✅ Others: keep old address flow
-let nextState: ConversationState = "awaiting_address";
-try {
-  const { data: orgRow } = await supa
-    .from("orgs")
-    .select("business_type")
-    .eq("id", org_id)
-    .maybeSingle();
+      // ✅ Restaurant-only: go to fulfillment choice
+      // ✅ Others: keep old address flow
+      let nextState: ConversationState = "awaiting_address";
+      try {
+        const { data: orgRow } = await supa
+          .from("orgs")
+          .select("business_type")
+          .eq("id", org_id)
+          .maybeSingle();
 
-  const t = (orgRow?.business_type || "").toLowerCase();
-  if (t.includes("restaurant")) nextState = "awaiting_fulfillment";
-} catch (e) {
-  console.warn("[FINAL_CONFIRM][VERTICAL_CHECK_ERR]", e);
-}
+        const t = (orgRow?.business_type || "").toLowerCase();
+        if (t.includes("restaurant")) nextState = "awaiting_fulfillment";
+      } catch (e) {
+        console.warn("[FINAL_CONFIRM][VERTICAL_CHECK_ERR]", e);
+      }
 
-await setState(org_id, from_phone, nextState);
+      await setState(org_id, from_phone, nextState);
 
-return {
-  used: true,
-  kind: "order",
-  order_id: saved.id,
-  reply:
-    "✅ *Order confirmed!*\n\n" +
-    cartText +
-    "\n\n" +
-    (nextState === "awaiting_fulfillment"
-      ? "How would you like to receive your order?\n" +
-        "1) Store Pickup\n" +
-        "2) Home Delivery\n\n" +
-        "Please type *1* or *2*."
-      : "📍 Please send your delivery address."),
-};
+      return {
+        used: true,
+        kind: "order",
+        order_id: saved.id,
+        reply:
+          "✅ *Order confirmed!*\n\n" +
+          cartText +
+          "\n\n" +
+          (nextState === "awaiting_fulfillment"
+            ? "How would you like to receive your order?\n" +
+              "1) Store Pickup\n" +
+              "2) Home Delivery\n\n" +
+              "Please type *1* or *2*."
+            : "📍 Please send your delivery address."),
+      };
     }
 
     // 2) EDIT YOUR ORDER → show edit menu

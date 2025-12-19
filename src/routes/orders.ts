@@ -5,22 +5,27 @@ import { supa } from "../db";
 import { parseOrder as ruleParse } from "../parser";
 import resolvePhoneForOrder, { normalizePhone } from "../util/normalizePhone";
 import { markSessionOnOrderStatusChange } from "../session/sessionEngine";
+import { emitNewOrder } from "./realtimeOrders";
+// adjust path if realtimeOrders.ts is elsewhere
 
 export const orders = express.Router();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Status constants (store lowercase in DB; accept any case from client)
 // ─────────────────────────────────────────────────────────────────────────────
-const STATUS_LIST = ["pending", "shipped", "paid", "cancelled"] as const;
+const STATUS_LIST = ["pending", "accepted", "shipped", "paid", "cancelled"] as const;
 type OrderStatus = (typeof STATUS_LIST)[number];
 const STATUS_SET = new Set<string>(STATUS_LIST);
 
 function normStatus(s?: string | null): OrderStatus | null {
-  const v = String(s ?? "").trim().toLowerCase();
+  const v = String(s ?? "")
+    .trim()
+    .toLowerCase();
   return STATUS_SET.has(v) ? (v as OrderStatus) : null;
 }
 
-const asStr = (v: any) => (typeof v === "string" ? v : v == null ? "" : String(v));
+const asStr = (v: any) =>
+  typeof v === "string" ? v : v == null ? "" : String(v);
 const trim = (v: any) => asStr(v).trim();
 const nz = (v: any) => (v == null ? "" : String(v)); // not-null string ('' allowed for generic)
 
@@ -46,7 +51,6 @@ try {
   aiParseOrder = undefined;
 }
 const ENABLE_AI = !!process.env.OPENAI_API_KEY && !!aiParseOrder;
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth middleware: extracts org_id from JWT
@@ -119,8 +123,7 @@ orders.get("/past", ensureAuth, async (req: any, res) => {
       const needsFreeze = items.some(
         (it: any) =>
           it &&
-          (it.price_per_unit === null ||
-            it.price_per_unit === undefined) &&
+          (it.price_per_unit === null || it.price_per_unit === undefined) &&
           (it.line_total === null || it.line_total === undefined)
       );
 
@@ -169,15 +172,25 @@ async function parsePipeline(
   reason?: string | null;
 }> {
   const raw = String(text || "").trim();
-  if (!raw) return { items: [], used: "rules", confidence: null, reason: "empty" };
+  if (!raw)
+    return { items: [], used: "rules", confidence: null, reason: "empty" };
 
   if (ENABLE_AI) {
     try {
-      const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(raw, undefined, {
-        org_id,
-        customer_phone, // ← enables per-customer learning at parse time
-      });
-      if (ai && ai.is_order_like !== false && Array.isArray(ai.items) && ai.items.length > 0) {
+      const ai = await (aiParseOrder as NonNullable<typeof aiParseOrder>)(
+        raw,
+        undefined,
+        {
+          org_id,
+          customer_phone, // ← enables per-customer learning at parse time
+        }
+      );
+      if (
+        ai &&
+        ai.is_order_like !== false &&
+        Array.isArray(ai.items) &&
+        ai.items.length > 0
+      ) {
         const r =
           typeof ai.reason === "string" && ai.reason.trim().length > 0
             ? ai.reason
@@ -189,16 +202,20 @@ async function parsePipeline(
           reason: r,
         };
       }
-      console.log("[orders][parsePipeline] AI returned no items/not order-like; using rules.");
+      console.log(
+        "[orders][parsePipeline] AI returned no items/not order-like; using rules."
+      );
     } catch (e: any) {
-      console.warn("[orders] AI parse failed, fallback to rules:", e?.message || e);
+      console.warn(
+        "[orders] AI parse failed, fallback to rules:",
+        e?.message || e
+      );
     }
   }
 
   const items = ruleParse(raw) || [];
   return { items, used: "rules", confidence: null, reason: "rule_fallback" };
 }
-
 
 // Compute order_total from items using line_total or price_per_unit * qty
 function computeOrderTotalFromItems(items: any[]): number {
@@ -217,8 +234,7 @@ function computeOrderTotalFromItems(items: any[]): number {
         : null;
 
     const pricePerUnit =
-      typeof it.price_per_unit === "number" &&
-      !Number.isNaN(it.price_per_unit)
+      typeof it.price_per_unit === "number" && !Number.isNaN(it.price_per_unit)
         ? it.price_per_unit
         : null;
 
@@ -251,7 +267,10 @@ async function snapshotPricesFromCatalog(
 
     if (orderErr || !order || !Array.isArray(order.items)) {
       if (orderErr) {
-        console.warn("[orders][snapshotPrices] load order err:", orderErr.message);
+        console.warn(
+          "[orders][snapshotPrices] load order err:",
+          orderErr.message
+        );
       }
       return null;
     }
@@ -261,9 +280,9 @@ async function snapshotPricesFromCatalog(
 
     // 2) Load catalog for this org (same shape as /products admin API)
     const { data: catalog, error: catErr } = await supa
-    .from("products")
-    .select("canonical, variant, price_per_unit, dynamic_price")
-    .eq("org_id", org_id);
+      .from("products")
+      .select("canonical, variant, price_per_unit, dynamic_price")
+      .eq("org_id", org_id);
 
     if (catErr || !Array.isArray(catalog) || !catalog.length) {
       if (catErr) {
@@ -272,8 +291,7 @@ async function snapshotPricesFromCatalog(
       return null;
     }
 
-    const normKey = (s?: string | null) =>
-      (s || "").trim().toLowerCase();
+    const normKey = (s?: string | null) => (s || "").trim().toLowerCase();
 
     const getBaseName = (p: any) => normKey(p.canonical);
 
@@ -300,9 +318,7 @@ async function snapshotPricesFromCatalog(
 
       // 3) if variant known, try to match
       if (varKey) {
-        const byVar = candidates.find(
-          (p) => normKey(p.variant) === varKey
-        );
+        const byVar = candidates.find((p) => normKey(p.variant) === varKey);
         if (byVar) return byVar;
       }
 
@@ -336,9 +352,7 @@ async function snapshotPricesFromCatalog(
 
       const price = Number(product.price_per_unit);
       const qty =
-        typeof it?.qty === "number" && !Number.isNaN(it.qty)
-          ? it.qty
-          : 1;
+        typeof it?.qty === "number" && !Number.isNaN(it.qty) ? it.qty : 1;
 
       const line_total =
         typeof it?.line_total === "number" && !Number.isNaN(it.line_total)
@@ -364,7 +378,8 @@ async function snapshotPricesFromCatalog(
 // ─────────────────────────────────────────────────────────────────────────────
 orders.post("/", ensureAuth, async (req: any, res) => {
   try {
-    const { raw_text, items, source_phone, customer_name, created_at } = req.body || {};
+    const { raw_text, items, source_phone, customer_name, created_at } =
+      req.body || {};
 
     let finalItems: any[] = [];
     let parse_confidence: number | null = null;
@@ -373,7 +388,11 @@ orders.post("/", ensureAuth, async (req: any, res) => {
     const phoneNorm = normalizePhone(source_phone || "") || "";
 
     if (raw_text && String(raw_text).trim()) {
-      const parsed = await parsePipeline(String(raw_text), req.org_id, phoneNorm);
+      const parsed = await parsePipeline(
+        String(raw_text),
+        req.org_id,
+        phoneNorm
+      );
       finalItems = parsed.items;
       parse_confidence = parsed.confidence ?? null;
       parse_reason = parsed.reason ?? null;
@@ -384,13 +403,9 @@ orders.post("/", ensureAuth, async (req: any, res) => {
       finalItems = incoming.map((it: any) => ({
         name: typeof it.name === "string" ? it.name : "",
         qty:
-          typeof it.qty === "number" && !Number.isNaN(it.qty)
-            ? it.qty
-            : null,
+          typeof it.qty === "number" && !Number.isNaN(it.qty) ? it.qty : null,
         unit:
-          typeof it.unit === "string" && it.unit.trim()
-            ? it.unit.trim()
-            : null,
+          typeof it.unit === "string" && it.unit.trim() ? it.unit.trim() : null,
         notes:
           typeof it.notes === "string" && it.notes.trim()
             ? it.notes.trim()
@@ -414,7 +429,8 @@ orders.post("/", ensureAuth, async (req: any, res) => {
 
         // ✅ persist pricing fields
         price_per_unit:
-          typeof it.price_per_unit === "number" && !Number.isNaN(it.price_per_unit)
+          typeof it.price_per_unit === "number" &&
+          !Number.isNaN(it.price_per_unit)
             ? it.price_per_unit
             : null,
         line_total:
@@ -442,14 +458,25 @@ orders.post("/", ensureAuth, async (req: any, res) => {
       order_link_reason: "new", // default for manual creations
 
       // 🔹 NEW: pricing fields
-      order_total,          // 0 if no prices, a number otherwise
+      order_total, // 0 if no prices, a number otherwise
       pricing_locked: false,
 
       ...(created_at ? { created_at: new Date(created_at).toISOString() } : {}),
     };
 
-    const { data, error } = await supa.from("orders").insert(insert).select("*").single();
+    const { data, error } = await supa
+      .from("orders")
+      .insert(insert)
+      .select("*")
+      .single();
     if (error) throw error;
+
+    // ✅ SSE notify dashboard
+    emitNewOrder(req.org_id, {
+      order_id: data.id,
+      created_at: data.created_at,
+      status: data.status,
+    });
 
     res.json(data);
   } catch (err: any) {
@@ -457,8 +484,6 @@ orders.post("/", ensureAuth, async (req: any, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/orders/:id/status  → update status for an order in this org
@@ -578,7 +603,9 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
   let human_fixed = req.body?.human_fixed;
   if (!human_fixed) {
     const items = req.body?.items;
-    const reason = (req.body?.reason || req.body?.note || "human_fix") as string;
+    const reason = (req.body?.reason ||
+      req.body?.note ||
+      "human_fix") as string;
     if (Array.isArray(items)) {
       human_fixed = { items, reason };
     }
@@ -588,7 +615,9 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
     ? human_fixed.items
         .map((it: any) => ({
           qty:
-            it?.qty === null || it?.qty === undefined || Number.isNaN(Number(it?.qty))
+            it?.qty === null ||
+            it?.qty === undefined ||
+            Number.isNaN(Number(it?.qty))
               ? null
               : Number(it.qty),
           unit: trim(it?.unit) || null,
@@ -637,7 +666,9 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
     // 1) Log correction event
     const message_text =
       (order.raw_text && String(order.raw_text)) ||
-      ((order.items || []).map((i: any) => i?.name || i?.canonical || "").join(", ")) ||
+      (order.items || [])
+        .map((i: any) => i?.name || i?.canonical || "")
+        .join(", ") ||
       "";
     const model_output = order.items || [];
 
@@ -660,24 +691,27 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
           (it.name ? it.name.charAt(0).toUpperCase() + it.name.slice(1) : null);
         if (!canonical) continue;
 
-        const parts = [it.brand || undefined, it.variant || undefined, it.unit || undefined, it.name || undefined].filter(Boolean) as string[];
+        const parts = [
+          it.brand || undefined,
+          it.variant || undefined,
+          it.unit || undefined,
+          it.name || undefined,
+        ].filter(Boolean) as string[];
         const term = parts.join(" ").trim();
         const safeTerm = term || it.name;
         if (!safeTerm) continue;
 
         try {
-          await supa
-            .from("product_aliases")
-            .upsert(
-              {
-                org_id: req.org_id,
-                term: safeTerm.toLowerCase(),
-                canonical,
-                brand: it.brand || null,
-                variant: it.variant || null,
-              },
-              { onConflict: "org_id,term" }
-            );
+          await supa.from("product_aliases").upsert(
+            {
+              org_id: req.org_id,
+              term: safeTerm.toLowerCase(),
+              canonical,
+              brand: it.brand || null,
+              variant: it.variant || null,
+            },
+            { onConflict: "org_id,term" }
+          );
         } catch (aliasErr: any) {
           console.warn("alias upsert warn:", aliasErr?.message || aliasErr);
         }
@@ -736,7 +770,10 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
         }
       }
     } catch (e) {
-      console.warn("[ai-fix][learn-write] non-fatal:", (e as any)?.message || e);
+      console.warn(
+        "[ai-fix][learn-write] non-fatal:",
+        (e as any)?.message || e
+      );
     }
 
     res.json({ ok: true, order: upd });
@@ -745,7 +782,6 @@ orders.post("/:id/ai-fix", ensureAuth, async (req: any, res) => {
     res.status(500).json({ error: err.message || "ai_fix_failed" });
   }
 });
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/orders/:id/edit  → dashboard manual edit of items
@@ -779,7 +815,11 @@ orders.post("/:id/edit", ensureAuth, async (req: any, res) => {
     if (closedStatuses.has(status) || cur.pricing_locked) {
       return res
         .status(400)
-        .json({ error: "order_not_editable", status, pricing_locked: cur.pricing_locked });
+        .json({
+          error: "order_not_editable",
+          status,
+          pricing_locked: cur.pricing_locked,
+        });
     }
 
     const incoming = Array.isArray(req.body?.items) ? req.body.items : [];
@@ -827,8 +867,7 @@ orders.post("/:id/edit", ensureAuth, async (req: any, res) => {
     // 3) Recompute order_total from items
     const new_order_total = computeOrderTotalFromItems(normalizedItems);
 
-    const parse_reason =
-      trim(req.body?.reason) || "dashboard_edit"; // mark as operator edit
+    const parse_reason = trim(req.body?.reason) || "dashboard_edit"; // mark as operator edit
 
     // 4) Save
     const { data: upd, error: updErr } = await supa
@@ -850,18 +889,12 @@ orders.post("/:id/edit", ensureAuth, async (req: any, res) => {
     return res.json({ ok: true, order: upd });
   } catch (e: any) {
     console.error("[ORDERS][edit] ERR", e?.message || e);
-    return res
-      .status(500)
-      .json({ error: e?.message || "order_edit_failed" });
+    return res.status(500).json({ error: e?.message || "order_edit_failed" });
   }
 });
 
-
-const OPEN_STATUSES = new Set(["pending", "confirmed", "packing"]);
+const OPEN_STATUSES = new Set(["pending", "accepted", "confirmed", "packing"]);
 const CLOSED_STATUSES = new Set(["shipped", "paid", "cancelled", "delivered"]);
-
-
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers for UI overrides
@@ -869,9 +902,7 @@ const CLOSED_STATUSES = new Set(["shipped", "paid", "cancelled", "delivered"]);
 async function getOrder(org_id: string, order_id: string) {
   const { data, error } = await supa
     .from("orders")
-    .select(
-      "id, org_id, source_phone, status, items, created_at, parse_reason"
-    )
+    .select("id, org_id, source_phone, status, items, created_at, parse_reason")
     .eq("org_id", org_id)
     .eq("id", order_id)
     .single(); // `.single()` already limits to 1 row
@@ -899,23 +930,30 @@ orders.post("/:id/split", ensureAuth, express.json(), async (req: any, res) => {
     const order_id = String(req.params.id || "");
     const org_id = req.org_id;
     const indices: number[] = Array.isArray(req.body?.item_indices)
-      ? req.body.item_indices.map((n: any) => Number(n)).filter((n: any) => Number.isFinite(n))
+      ? req.body.item_indices
+          .map((n: any) => Number(n))
+          .filter((n: any) => Number.isFinite(n))
       : [];
 
-    if (!order_id || !org_id) return res.status(400).json({ ok: false, error: "missing_fields" });
+    if (!order_id || !org_id)
+      return res.status(400).json({ ok: false, error: "missing_fields" });
 
     const cur = await getOrder(org_id, order_id);
     const items = Array.isArray(cur.items) ? cur.items : [];
 
-    if (!items.length) return res.json({ ok: false, error: "no_items_to_split" });
+    if (!items.length)
+      return res.json({ ok: false, error: "no_items_to_split" });
 
     // Default: last item if nothing selected
     const indicesSet = new Set(indices.length ? indices : [items.length - 1]);
     const move: any[] = [];
     const keep: any[] = [];
-    items.forEach((it, idx) => (indicesSet.has(idx) ? move.push(it) : keep.push(it)));
+    items.forEach((it, idx) =>
+      indicesSet.has(idx) ? move.push(it) : keep.push(it)
+    );
 
-    if (!move.length) return res.json({ ok: false, error: "no_selected_items" });
+    if (!move.length)
+      return res.json({ ok: false, error: "no_selected_items" });
 
     // 1) Update original
     const { error: upErr } = await supa
@@ -950,7 +988,9 @@ orders.post("/:id/split", ensureAuth, express.json(), async (req: any, res) => {
     return res.json({ ok: true, new_order_id: created?.id });
   } catch (e: any) {
     console.error("[ORDERS][split] ERR", e?.message || e);
-    return res.status(500).json({ ok: false, error: e?.message || "split_failed" });
+    return res
+      .status(500)
+      .json({ ok: false, error: e?.message || "split_failed" });
   }
 });
 
@@ -975,9 +1015,7 @@ orders.post(
 
       // Guard: current must be OPEN; if already closed we shouldn't be merging it
       if (CLOSED_STATUSES.has(String(cur.status))) {
-        return res
-          .status(400)
-          .json({ ok: false, error: "current_not_open" });
+        return res.status(400).json({ ok: false, error: "current_not_open" });
       }
 
       const phone = normalizePhone(cur.source_phone || "") || "";
@@ -1004,9 +1042,7 @@ orders.post(
 
       // Guard: previous must be OPEN
       if (CLOSED_STATUSES.has(String(prev.status))) {
-        return res
-          .status(400)
-          .json({ ok: false, error: "previous_not_open" });
+        return res.status(400).json({ ok: false, error: "previous_not_open" });
       }
 
       // Merge items (append)
@@ -1050,12 +1086,17 @@ orders.post(
 // ─────────────────────────────────────────────────────────────────────────────
 // DELETE /api/orders/:id
 // ─────────────────────────────────────────────────────────────────────────────
-orders.delete("/:id", ensureAuth, async (req:any, res) => {
+orders.delete("/:id", ensureAuth, async (req: any, res) => {
   try {
     const orderId = req.params.id;
-    if (!orderId) return res.status(400).json({ ok: false, error: "order_id_required" });
+    if (!orderId)
+      return res.status(400).json({ ok: false, error: "order_id_required" });
 
-    const { error } = await supa.from("orders").delete().eq("id", orderId).eq("org_id", req.org_id);
+    const { error } = await supa
+      .from("orders")
+      .delete()
+      .eq("id", orderId)
+      .eq("org_id", req.org_id);
     if (error) {
       console.error("[DELETE ORDER]", error.message);
       return res.status(500).json({ ok: false, error: error.message });
@@ -1063,7 +1104,9 @@ orders.delete("/:id", ensureAuth, async (req:any, res) => {
     return res.json({ ok: true, deleted: orderId });
   } catch (e: any) {
     console.error("[DELETE ORDER]", e?.message || e);
-    return res.status(500).json({ ok: false, error: e?.message || "delete_failed" });
+    return res
+      .status(500)
+      .json({ ok: false, error: e?.message || "delete_failed" });
   }
 });
 

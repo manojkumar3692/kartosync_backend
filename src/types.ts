@@ -12,9 +12,12 @@ export type Org = {
 
 export type OrderStatus =
   | "pending"
-  | "delivered"
-  | "paid"
+  | "accepted"
   | "shipped"
+  | "paid"
+  | "cancelled"
+  // legacy/optional:
+  | "delivered"
   | "cancelled_by_customer"
   | "archived_for_new";
 

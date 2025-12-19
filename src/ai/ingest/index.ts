@@ -451,14 +451,43 @@ export async function ingestCoreFromMessage(
 
     // 2) If user says paid (we still depend on webhook for truth)
     if (["paid", "done", "payment done", "completed"].includes(lower)) {
+      const { data: o } = await supa
+        .from("orders")
+        .select("id, payment_status, razorpay_payment_link_url, created_at")
+        .eq("org_id", org_id)
+        .eq("source_phone", from_phone)
+        .eq("status", "pending")
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (o?.payment_status === "paid") {
+        await clearState(org_id, from_phone);
+        return {
+          used: true,
+          kind: "order",
+          order_id: o.id,
+          reply:
+            "✅ Payment confirmed!\n" +
+            "You’ll receive pickup confirmation details shortly.",
+        };
+      }
+
+      // Not paid yet -> honest response + quick actions
       return {
         used: true,
         kind: "order",
-        order_id: null,
+        order_id: o?.id || null,
         reply:
-          "✅ Got it. We are verifying your payment now.\n" +
-          "You’ll receive confirmation shortly.\n\n" +
-          "If you haven’t paid yet, type *resend* to get the link again.",
+          "⏳ I haven’t received the payment confirmation yet.\n" +
+          "Usually it takes 10–60 seconds.\n\n" +
+          (o?.razorpay_payment_link_url
+            ? "If you haven’t paid, use this link:\n" +
+              `*${o.razorpay_payment_link_url}*\n\n`
+            : "") +
+          "Reply with one option:\n" +
+          "1) *resend*\n" +
+          "3) *cancel*",
       };
     }
 
