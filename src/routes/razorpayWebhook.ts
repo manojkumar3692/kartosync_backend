@@ -243,6 +243,7 @@ razorpayWebhookRouter.post(
         "awaiting_customer_action",
         "awaiting_payment",
         "awaiting_pickup_payment",
+        "awaiting_payment_proof"
       ] as any)
       .select(
         "id, source_phone, items, total_amount, delivery_type, created_at, currency_code"
@@ -254,7 +255,7 @@ razorpayWebhookRouter.post(
       }
 
       if (!updatedOrders || updatedOrders.length === 0) {
-        console.log("[RZP_WEBHOOK][ALREADY_PAID] skipping send");
+        console.log("[RZP_WEBHOOK][NO_STATUS_MATCH] skipping send");
         return res.status(200).send("ok");
       }
 

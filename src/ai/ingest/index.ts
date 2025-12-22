@@ -60,14 +60,13 @@ const OPEN_ORDER_STATUSES = [
   "awaiting_fulfillment",
   "awaiting_payment",
   "awaiting_payment_proof",
+  "awaiting_customer_action",
 ] as const;
-
 
 const PENDING_FULFILLMENT_STATUSES = [
   "awaiting_customer_action",
   "awaiting_store_action",
 ] as const;
-
 
 const normalizePhone = (p: string) => (p || "").replace(/[^\d]/g, "");
 
@@ -200,7 +199,10 @@ export async function ingestCoreFromMessage(
 
   // FULFILLMENT (restaurant)
   if (state === "awaiting_fulfillment") {
-    return handleFulfillment({ ...ctx, vertical: await getOrgVertical(org_id) });
+    return handleFulfillment({
+      ...ctx,
+      vertical: await getOrgVertical(org_id),
+    });
   }
 
   // ADDRESS
@@ -209,27 +211,66 @@ export async function ingestCoreFromMessage(
   }
 
   // PAYMENT
-  if (state === "awaiting_payment") return handlePayment(ctx);
+  if (state === "awaiting_payment") {
+    // ✅ allow cancelling the order (not just changing payment method)
+    if (CANCEL_WORDS.some((k) => lowerRaw.includes(k))) {
+      return handleCancel(ctx);
+    }
+    // optional: allow reset too
+    if (RESET_WORDS.includes(lowerRaw)) {
+      await clearState(org_id, from_phone);
+      return {
+        used: true,
+        kind: "smalltalk",
+        reply: "🔄 Order reset. Please type your item name again.",
+        order_id: null,
+      };
+    }
+
+    return handlePayment(ctx);
+  }
 
   if (state === "awaiting_payment_proof") {
     const lower = (raw || "").trim().toLowerCase();
 
-    // simple UX: let user say "paid" but real truth comes from webhook
+    // cancel my order -> real cancel
+    if (CANCEL_WORDS.some((k) => lower.includes(k))) {
+      return handleCancel(ctx);
+    }
+
+    // ✅ Allow cancel/reset to escape this stuck state
+    if (["cancel", "reset", "back", "start again"].includes(lower)) {
+      await setState(org_id, from_phone, "awaiting_payment"); // go back to Cash/Online menu
+      return {
+        used: true,
+        kind: "payment",
+        order_id: null,
+        reply:
+          "✅ Okay — payment step cancelled.\n\n" +
+          "How would you like to pay?\n" +
+          "1) Cash\n" +
+          "2) Online Payment\n\n" +
+          "Please type *1* or *2*.",
+      };
+    }
+
+    // simple UX: let user say "paid" but real truth comes from webhook / store verification
     if (["paid", "done", "payment done", "completed"].includes(lower)) {
       return {
         used: true,
-        kind: "order",
+        kind: "payment",
         order_id: null,
         reply:
-          "✅ Got it. We are verifying your payment now. You’ll receive confirmation shortly.",
+          "✅ Got it. We’re verifying your payment now. You’ll receive confirmation shortly.",
       };
     }
+
     const phoneKey = normalizePhone(from_phone);
 
-    // otherwise: remind payment link
+    // Load latest open order
     const { data: order } = await supa
       .from("orders")
-      .select("id, razorpay_payment_link_url, payment_status")
+      .select("id, razorpay_payment_link_url, payment_status, payment_provider")
       .eq("org_id", org_id)
       .eq("source_phone", phoneKey)
       .in("status", OPEN_ORDER_STATUSES as any)
@@ -241,19 +282,61 @@ export async function ingestCoreFromMessage(
       await clearState(org_id, from_phone);
       return {
         used: true,
-        kind: "order",
+        kind: "payment",
         order_id: order.id,
         reply: "✅ Payment already received.",
       };
     }
 
+    // ✅ If no Razorpay link, fall back to QR (your current online mode)
+    const { data: orgRow } = await supa
+      .from("orgs")
+      .select("payment_qr_url, payment_instructions")
+      .eq("id", org_id)
+      .maybeSingle();
+
+    const qrUrl = orgRow?.payment_qr_url || null;
+    const note = (orgRow?.payment_instructions || "").trim();
+
+    // 1) Razorpay link exists → show it
+    if (order?.razorpay_payment_link_url) {
+      return {
+        used: true,
+        kind: "payment",
+        order_id: order.id,
+        reply:
+          "💳 Your payment is pending.\n" +
+          "Please pay using this link:\n" +
+          `*${order.razorpay_payment_link_url}*\n\n` +
+          "After payment, send screenshot here or type *paid*.\n" +
+          "Type *cancel* to change payment method.",
+      };
+    }
+
+    // 2) QR exists → show QR instead of “Payment link not found”
+    if (qrUrl) {
+      return {
+        used: true,
+        kind: "payment",
+        order_id: order?.id || null,
+        reply:
+          "💳 Your payment is pending.\n" +
+          "📷 Please scan the QR code to complete payment.\n" +
+          (note ? `\n${note}\n` : "\n") +
+          "After payment, send screenshot here or type *paid*.\n" +
+          "Type *cancel* to change payment method.",
+        image: qrUrl,
+      };
+    }
+
+    // 3) Nothing configured → honest fallback
     return {
       used: true,
-      kind: "order",
+      kind: "payment",
       order_id: order?.id || null,
       reply:
-        "💳 Your payment is pending.\nPlease pay using this link:\n" +
-        `*${order?.razorpay_payment_link_url || "Payment link not found"}*`,
+        "💳 Your payment is pending, but payment details are not configured.\n" +
+        "Type *cancel* to switch to Cash, or contact the store.",
     };
   }
 
@@ -427,7 +510,7 @@ export async function ingestCoreFromMessage(
           order_id: order.id,
           amount_inr: amount,
           customer_phone: normalizePhone(from_phone),
-         });
+        });
 
         await supa
           .from("orders")
