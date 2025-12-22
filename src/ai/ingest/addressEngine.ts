@@ -74,7 +74,11 @@ async function getLatestPendingOrder(
     )
     .eq("org_id", org_id)
     .eq("source_phone", from_phone)
-    .eq("status", "pending")
+    .in("status", [
+      "awaiting_customer_action",
+      "awaiting_store_action",
+      "accepted",
+    ] as any)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -597,47 +601,47 @@ export async function handleAddress(
           ? `\n💰 Order total (items): *₹${totalNum.toFixed(0)}*`
           : "";
 
-          if (isRestaurant) {
-            await setState(org_id, from_phone, "awaiting_fulfillment");
-          
-            return {
-              used: true,
-              kind: "order",
-              reply:
-                "✅ *Delivery details saved!*\n\n" +
-                "📍 Delivery address:\n" +
-                addr +
-                "\n\n" +
-                feeLine +
-                totalLine +
-                "\n\n" +
-                "How would you like to receive your order?\n" +
-                "1) Store Pickup\n" +
-                "2) Home Delivery\n\n" +
-                "Please type *1* or *2*.",
-              order_id: order.id,
-            };
-          }
-          
-          await setState(org_id, from_phone, "awaiting_payment");
-          
-          return {
-            used: true,
-            kind: "order",
-            reply:
-              "✅ *Delivery details saved!*\n\n" +
-              "📍 Delivery address:\n" +
-              addr +
-              "\n\n" +
-              feeLine +
-              totalLine +
-              "\n\n" +
-              "How would you like to pay?\n" +
-              "1) Cash\n" +
-              "2) Online Payment\n\n" +
-              "Please type *1* or *2*.",
-            order_id: order.id,
-          };
+      // ✅ Restaurant: go to payment
+      if (isRestaurant) {
+        await setState(org_id, from_phone, "awaiting_payment");
+        return {
+          used: true,
+          kind: "order",
+          reply:
+            "✅ *Delivery details saved!*\n\n" +
+            "📍 Delivery address:\n" +
+            addr +
+            "\n\n" +
+            feeLine +
+            totalLine +
+            "\n\n" +
+            "How would you like to pay?\n" +
+            "1) Cash\n" +
+            "2) Online Payment\n\n" +
+            "Please type *1* or *2*.",
+          order_id: order.id,
+        };
+      }
+
+      // ✅ Non-restaurant: still must RETURN (or you’ll hit re-prompt)
+      await setState(org_id, from_phone, "awaiting_payment");
+      return {
+        used: true,
+        kind: "order",
+        reply:
+          "✅ *Delivery details saved!*\n\n" +
+          "📍 Delivery address:\n" +
+          addr +
+          "\n\n" +
+          feeLine +
+          totalLine +
+          "\n\n" +
+          "How would you like to pay?\n" +
+          "1) Cash\n" +
+          "2) Online Payment\n\n" +
+          "Please type *1* or *2*.",
+        order_id: order.id,
+      };
     }
 
     // 2.b) User sends location pin (lat/lng present)
@@ -707,49 +711,48 @@ export async function handleAddress(
           ? `\n📏 Distance from store: ~${distanceKm.toFixed(1)} km`
           : "";
 
-          if (isRestaurant) {
-            await setState(org_id, from_phone, "awaiting_fulfillment");
-          
-            return {
-              used: true,
-              kind: "order",
-              reply:
-                "✅ *Delivery details saved!*\n\n" +
-                "📍 Delivery address:\n" +
-                addr +
-                distanceLine +
-                "\n\n" +
-                feeLine +
-                totalLine +
-                "\n\n" +
-                "How would you like to receive your order?\n" +
-                "1) Store Pickup\n" +
-                "2) Home Delivery\n\n" +
-                "Please type *1* or *2*.",
-              order_id: order.id,
-            };
-          }
-          
-          await setState(org_id, from_phone, "awaiting_payment");
-          
-          return {
-            used: true,
-            kind: "order",
-            reply:
-              "✅ *Delivery details saved!*\n\n" +
-              "📍 Delivery address:\n" +
-              addr +
-              distanceLine +
-              "\n\n" +
-              feeLine +
-              totalLine +
-              "\n\n" +
-              "How would you like to pay?\n" +
-              "1) Cash\n" +
-              "2) Online Payment\n\n" +
-              "Please type *1* or *2*.",
-            order_id: order.id,
-          };
+      if (isRestaurant) {
+        await setState(org_id, from_phone, "awaiting_payment");
+        return {
+          used: true,
+          kind: "order",
+          reply:
+            "✅ *Delivery details saved!*\n\n" +
+            "📍 Delivery address:\n" +
+            addr +
+            distanceLine +
+            "\n\n" +
+            feeLine +
+            totalLine +
+            "\n\n" +
+            "How would you like to pay?\n" +
+            "1) Cash\n" +
+            "2) Online Payment\n\n" +
+            "Please type *1* or *2*.",
+          order_id: order.id,
+        };
+      }
+
+      // ✅ Non-restaurant: also return
+      await setState(org_id, from_phone, "awaiting_payment");
+      return {
+        used: true,
+        kind: "order",
+        reply:
+          "✅ *Delivery details saved!*\n\n" +
+          "📍 Delivery address:\n" +
+          addr +
+          distanceLine +
+          "\n\n" +
+          feeLine +
+          totalLine +
+          "\n\n" +
+          "How would you like to pay?\n" +
+          "1) Cash\n" +
+          "2) Online Payment\n\n" +
+          "Please type *1* or *2*.",
+        order_id: order.id,
+      };
     }
 
     // 2.c) Neither skip nor location → re-prompt

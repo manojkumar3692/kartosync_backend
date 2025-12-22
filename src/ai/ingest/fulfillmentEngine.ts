@@ -168,17 +168,14 @@ export async function handleFulfillment(ctx: IngestContext): Promise<IngestResul
 
   // If Home Delivery → continue existing flow to payment selection
   if (choice === "delivery") {
-    await setState(org_id, from_phone, "awaiting_payment");
+    await setState(org_id, from_phone, "awaiting_address");
     return {
       used: true,
       kind: "order",
       order_id: order.id,
       reply:
         "✅ *Delivery selected!*\n\n" +
-        "How would you like to pay?\n" +
-        "1) Cash\n" +
-        "2) Online Payment\n\n" +
-        "Please type *1* or *2*.",
+        "📍 Please send your delivery address.",
     };
   }
 
