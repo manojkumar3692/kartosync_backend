@@ -6,6 +6,7 @@ import { parseOrder as ruleParse } from "../parser";
 import resolvePhoneForOrder, { normalizePhone } from "../util/normalizePhone";
 import { markSessionOnOrderStatusChange } from "../session/sessionEngine";
 import { emitNewOrder } from "./realtimeOrders";
+import Razorpay from "razorpay";
 // adjust path if realtimeOrders.ts is elsewhere
 
 export const orders = express.Router();
@@ -37,9 +38,59 @@ const CLOSED_STATUSES = new Set<OrderStatus>([
   "delivered",
 ]);
 
+type PaymentStatus =
+  | "unpaid"
+  | "pending"
+  | "paid"
+  | "failed"
+  | "refunded";
+
+
+type OrgRzpRow = {
+  razorpay_enabled: boolean;
+  razorpay_key_id: string | null;
+  razorpay_key_secret: string | null;
+};
+
 
 type OrderStatus = (typeof STATUS_LIST)[number];
 const STATUS_SET = new Set<string>(STATUS_LIST);
+
+
+export async function getRazorpayClientForOrg(org_id: string) {
+  const { data, error } = await supa
+    .from("orgs")
+    .select("razorpay_enabled, razorpay_key_id, razorpay_key_secret")
+    .eq("id", org_id)
+    .single();
+
+  if (error || !data) {
+    throw new Error("Org not found (cannot load Razorpay config)");
+  }
+
+  const org = data as OrgRzpRow;
+
+  if (!org.razorpay_enabled) {
+    throw new Error("Razorpay disabled for this org");
+  }
+
+  const key_id = (org.razorpay_key_id || "").trim();
+  const key_secret = (org.razorpay_key_secret || "").trim();
+
+  // Extra safety (even though DB constraint exists)
+  if (key_id.length <= 5 || key_secret.length <= 5) {
+    throw new Error("Invalid Razorpay keys for this org");
+  }
+
+  return new Razorpay({ key_id, key_secret });
+}
+
+function toPaise(amount: any): number {
+  const n = typeof amount === "number" ? amount : Number(amount);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 100);
+}
+
 
 function normStatus(s?: string | null): OrderStatus | null {
   const v = String(s ?? "")
@@ -509,12 +560,14 @@ orders.post("/", ensureAuth, async (req: any, res) => {
   }
 });
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/orders/:id/status  → update status for an order in this org
 // ─────────────────────────────────────────────────────────────────────────────
 orders.post("/:id/status", ensureAuth, async (req: any, res) => {
   const { id } = req.params;
   const next = normStatus(req.body?.status);
+
   if (!next) {
     return res
       .status(400)
@@ -533,7 +586,7 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
       if (!ordErr && ord?.source_phone) {
         await markSessionOnOrderStatusChange({
           org_id: req.org_id,
-          phone_key: ord.source_phone, // already normalized in create
+          phone_key: ord.source_phone,
           order_id: id,
           status: nextStatus,
         });
@@ -546,8 +599,132 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
     }
   }
 
+  function sleep(ms: number) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  function toPaise(v: any) {
+    // accepts number | string "330.00"
+    const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : NaN;
+    if (!Number.isFinite(n)) return null;
+    return Math.round(n * 100);
+  }
+
+  function isRzpServerError(err: any) {
+    const code = err?.error?.code || err?.code;
+    const desc = err?.error?.description || err?.description || "";
+    return code === "SERVER_ERROR" || String(desc).toLowerCase().includes("trouble completing");
+  }
+
+  // --- helper: do refund if eligible ---
+  async function tryRefundIfEligible(order: any) {
+    const provider = String(order.payment_provider || "").toLowerCase();
+    const payStatus = (order.payment_status || "") as PaymentStatus;
+    
+    if (provider !== "razorpay") {
+      return { attempted: false, reason: "not_razorpay" };
+    }
+
+   
+
+    // idempotency guard
+    if (order.razorpay_payment_ref) {
+      return { attempted: false, reason: "already_has_refund_ref" };
+    }
+    if (payStatus === "refunded") {
+      return { attempted: false, reason: "already_refunded" };
+    }
+
+     // only refund if we believe paid
+     if (payStatus !== "paid") {
+      return { attempted: false, reason: `payment_status_${payStatus}` };
+    }
+
+    const paymentId = order.razorpay_payment_id;
+    if (!paymentId) {
+      return { attempted: false, reason: "missing_razorpay_payment_id" };
+    }
+
+    const amountPaise = toPaise(order.total_amount);
+    if (!amountPaise || amountPaise <= 0) {
+      return { attempted: false, reason: "invalid_total_amount" };
+    }
+
+    const rzp = await getRazorpayClientForOrg(order.org_id);
+
+    // ✅ 1) Confirm capture state from Razorpay before refund
+    let pay: any = null;
+    try {
+      pay = await rzp.payments.fetch(paymentId);
+    } catch (e: any) {
+      console.error("[refund] payments.fetch failed", e?.message || e);
+      // Don't treat as refunded. Let store retry cancel later.
+      return { attempted: true, error: "payments_fetch_failed" };
+    }
+
+    const captured =
+      pay && (pay.captured === true || pay.status === "captured");
+
+    if (!captured) {
+      return {
+        attempted: false,
+        reason: "not_captured_yet",
+        payment_status: pay?.status || null,
+      };
+    }
+
+    // ✅ 2) Retry refund on Razorpay SERVER_ERROR (common transient)
+    let refund: any = null;
+    let lastErr: any = null;
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        refund = await rzp.payments.refund(paymentId, {
+          amount: amountPaise,
+          notes: {
+            order_id: order.id,
+            org_id: order.org_id,
+            reason: "store_cancelled",
+          },
+        });
+        lastErr = null;
+        break;
+      } catch (e: any) {
+        lastErr = e;
+        console.error(`[refund] attempt ${attempt} failed`, e?.error || e);
+
+        if (!isRzpServerError(e)) {
+          break; // non-transient, don't spam retries
+        }
+        await sleep(700 * attempt); // small backoff
+      }
+    }
+
+    if (!refund) {
+      return {
+        attempted: true,
+        error: lastErr?.error?.description || lastErr?.message || "refund_failed",
+        code: lastErr?.error?.code || lastErr?.code || null,
+      };
+    }
+
+    // ✅ 3) Persist refund id + mark refunded (only after success)
+    const { error: upErr } = await supa
+      .from("orders")
+      .update({
+        payment_status: "refunded",
+        razorpay_payment_ref: refund?.id || "rfnd_unknown",
+      })
+      .eq("id", order.id)
+      .eq("org_id", order.org_id);
+
+    if (upErr) throw upErr;
+
+    return { attempted: true, refund_id: refund?.id || null };
+  }
+
   try {
-    // When closing the order, snapshot prices so catalog changes don't affect it
+    // ✅ When closing the order, snapshot prices so catalog changes don't affect it
     if (next === "shipped" || next === "paid") {
       const frozenItems = await snapshotPricesFromCatalog(req.org_id, id);
 
@@ -571,7 +748,6 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
         return res.json({ ok: true, status: next });
       }
 
-      // Snapshot failed → still close order, compute total from existing items if possible
       const { data: curOrder, error: loadErr } = await supa
         .from("orders")
         .select("items")
@@ -581,9 +757,7 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
 
       if (loadErr) throw loadErr;
 
-      const existingItems = Array.isArray(curOrder?.items)
-        ? curOrder.items
-        : [];
+      const existingItems = Array.isArray(curOrder?.items) ? curOrder.items : [];
       const order_total = computeOrderTotalFromItems(existingItems);
 
       const { error } = await supa
@@ -602,22 +776,58 @@ orders.post("/:id/status", ensureAuth, async (req: any, res) => {
       return res.json({ ok: true, status: next });
     }
 
-    // Original behaviour for other statuses (pending/cancelled, etc.)
+    // ✅ Cancel flow: update status, then refund if eligible
+    if (next === "cancelled") {
+      const { data: order, error: ordErr } = await supa
+        .from("orders")
+        .select(
+          "id, org_id, status, payment_provider, payment_status, total_amount, razorpay_payment_id, razorpay_payment_ref"
+        )
+        .eq("id", id)
+        .eq("org_id", req.org_id)
+        .single();
+
+      if (ordErr || !order) {
+        return res.status(404).json({ error: "order_not_found" });
+      }
+
+      // Always cancel first (business decision)
+      const { error: upErr } = await supa
+        .from("orders")
+        .update({ status: "cancelled" })
+        .eq("id", id)
+        .eq("org_id", req.org_id);
+
+      if (upErr) throw upErr;
+
+      let refundResult: any = null;
+      try {
+        refundResult = await tryRefundIfEligible(order);
+      } catch (e: any) {
+        console.error("[refund] failed", e?.message || e);
+        refundResult = { attempted: true, error: e?.message || "refund_failed" };
+      }
+
+      await syncSession("cancelled");
+      return res.json({ ok: true, status: "cancelled", refund: refundResult });
+    }
+
+    // ✅ Default update
     const { error } = await supa
       .from("orders")
       .update({ status: next })
       .eq("id", id)
       .eq("org_id", req.org_id);
+
     if (error) throw error;
 
     await syncSession(next);
-    res.json({ ok: true, status: next });
+    return res.json({ ok: true, status: next });
   } catch (err: any) {
     console.error("Order update error:", err);
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
-
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/orders/:id/ai-fix
 // ─────────────────────────────────────────────────────────────────────────────

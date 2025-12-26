@@ -55,11 +55,14 @@ function isCorrectionMessage(t: string) {
 }
 
 const OPEN_ORDER_STATUSES = [
+  "draft",
   "pending",
+  "pending_payment",
   "awaiting_payment_or_method",
   "awaiting_fulfillment",
   "awaiting_payment",
   "awaiting_payment_proof",
+  "awaiting_pickup_payment",
   "awaiting_customer_action",
 ] as const;
 
@@ -187,15 +190,14 @@ export async function ingestCoreFromMessage(
   }
 
   // RESET
-  if (RESET_WORDS.includes(lowerRaw)) {
-    await clearState(org_id, from_phone);
-    return {
-      used: true,
-      kind: "smalltalk",
-      reply: "🔄 Order reset. Please type your item name again.",
-      order_id: null,
-    };
-  }
+// ✅ GLOBAL ESCAPE HATCH (cancel/reset works in ANY state)
+if (
+  RESET_WORDS.some((k) => lowerRaw.includes(k)) ||
+  CANCEL_WORDS.some((k) => lowerRaw.includes(k))
+) {
+  // cancelEngine should: cancel active unpaid/unaccepted order + clear conversation/session state
+  return handleCancel({ ...ctx, text: raw });
+}
 
   // FULFILLMENT (restaurant)
   if (state === "awaiting_fulfillment") {
@@ -216,16 +218,15 @@ export async function ingestCoreFromMessage(
     if (CANCEL_WORDS.some((k) => lowerRaw.includes(k))) {
       return handleCancel(ctx);
     }
-    // optional: allow reset too
-    if (RESET_WORDS.includes(lowerRaw)) {
-      await clearState(org_id, from_phone);
-      return {
-        used: true,
-        kind: "smalltalk",
-        reply: "🔄 Order reset. Please type your item name again.",
-        order_id: null,
-      };
-    }
+    
+// ✅ GLOBAL ESCAPE HATCH (cancel/reset works in ANY state)
+if (
+  RESET_WORDS.some((k) => lowerRaw.includes(k)) ||
+  CANCEL_WORDS.some((k) => lowerRaw.includes(k))
+) {
+  // cancelEngine should: cancel active unpaid/unaccepted order + clear conversation/session state
+  return handleCancel({ ...ctx, text: raw });
+}
 
     return handlePayment(ctx);
   }

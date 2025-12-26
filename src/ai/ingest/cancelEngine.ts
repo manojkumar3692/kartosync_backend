@@ -3,7 +3,15 @@
 import { supa } from "../../db";
 import { IngestContext, IngestResult } from "./types";
 
-const CANCELLABLE = ["pending", "accepted", "preparing"];
+const CANCELLABLE = [
+  "awaiting_customer_action",
+  "awaiting_payment",
+  "awaiting_payment_proof",
+  "awaiting_pickup_payment",
+  "pending_payment",
+  "draft",
+  "pending",
+];
 
 export async function handleCancel(
   ctx: IngestContext
@@ -13,11 +21,14 @@ export async function handleCancel(
   // ─────────────────────────────────────────────
   // Get most recent order
   // ─────────────────────────────────────────────
+  const phoneKey = String(from_phone || "").replace(/[^\d]/g, "");
+
   const { data: order } = await supa
     .from("orders")
     .select("id, status, created_at")
     .eq("org_id", org_id)
-    .eq("source_phone", from_phone)
+    .eq("source_phone", phoneKey)
+    .in("status", CANCELLABLE as any)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -26,7 +37,7 @@ export async function handleCancel(
     return {
       used: true,
       kind: "cancel",
-      reply: "You have no active orders to cancel.",
+      reply: "✅ No pending order to cancel. You can start a new order by typing an item name.",
       order_id: null,
     };
   }
@@ -53,6 +64,7 @@ export async function handleCancel(
     .update({
       status: "cancelled",
       cancelled_at: new Date().toISOString(),
+      payment_status: "unpaid",
     })
     .eq("id", order.id);
 
