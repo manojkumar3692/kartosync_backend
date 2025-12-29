@@ -11,6 +11,31 @@ const FILLER_WORDS = [
   "ji", "ga", "ra"
 ];
 
+function stripLeadingFillers(text: string): string {
+  const fillers = [
+    "hi", "hello", "hey", "hai", "hi,", "hello,", "hey,",
+    "anna", "bro", "brother", "machan", "machaa",
+    "sir", "sirji", "madam",
+    "please", "pls", "plz",
+    "good morning", "good evening", "good afternoon"
+  ];
+
+  let t = text.trim().toLowerCase();
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const f of fillers) {
+      if (t.startsWith(f + " ")) {
+        t = t.slice(f.length).trim();
+        changed = true;
+      }
+    }
+  }
+
+  return t;
+}
+
 // Hard-coded slang / spelling maps – we can expand later
 const CANONICAL_MAP: Record<string, string> = {
   // biryani variants
@@ -67,6 +92,8 @@ function applyCanonicalMap(text: string): string {
 export function normalizeCustomerText(raw: string): string {
   if (!raw) return "";
   let t = String(raw);
+
+  t = stripLeadingFillers(t);
 
   t = normalizeCaseAndPunctuation(t);
   t = removeFillerWords(t);

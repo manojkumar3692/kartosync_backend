@@ -12,7 +12,7 @@ export type Vertical =
   | "pharmacy"
   | "generic";
 
-  export type IntentType =
+export type IntentType =
   | "add_item"
   | "add_items" // multi-line / multi-item add
   | "remove_item"
@@ -22,23 +22,22 @@ export type Vertical =
   | "checkout"
   | "new_order"
   | "cancel_order"
-  | "service_delivery_now_check"   // 🔹 NEW
+  | "service_delivery_now_check" // 🔹 NEW
   | "unknown";
 
-  const DELIVERY_NOW_KEYWORDS = [
-    "do you deliver now",
-    "do u deliver now",
-    "are you delivering now",
-    "are u delivering now",
-    "are you open now",
-    "are u open now",
-    "is delivery available now",
-    "delivery now",
-    "do you deliver",
-    "do u deliver",
-    "delivery available",
-  ];
-
+const DELIVERY_NOW_KEYWORDS = [
+  "do you deliver now",
+  "do u deliver now",
+  "are you delivering now",
+  "are u delivering now",
+  "are you open now",
+  "are u open now",
+  "is delivery available now",
+  "delivery now",
+  "do you deliver",
+  "do u deliver",
+  "delivery available",
+];
 
 export type ParsedOrderLine = {
   /** Parsed quantity for that segment (null if unknown) */
@@ -50,7 +49,6 @@ export type ParsedOrderLine = {
   nameText?: any;
   qty?: any;
 };
-
 
 export type MultiItemLine = ParsedOrderLine;
 
@@ -161,6 +159,19 @@ const MODIFIER_HINTS = [
   "no masala",
 ];
 
+const NUMBER_WORDS: Record<string, number> = {
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+};
+
 // ─────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────
@@ -212,16 +223,49 @@ function tryParseMultiItemOrder(
 
   const lines: ParsedOrderLine[] = [];
 
-  for (const seg of segments) {
+  for (const seg0 of segments) {
+    if (!seg0) continue;
+
+    let seg = seg0.trim();
+
+    // ✅ (A) Drop greeting-only segment ("hi", "hello") that got split by comma
+    const segClean = seg
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]/gu, "")
+      .trim();
+    if (
+      segClean === "hi" ||
+      segClean === "hello" ||
+      segClean === "hey" ||
+      segClean === "hai"
+    ) {
+      continue;
+    }
+
+    // ✅ (B) Convert leading number-words to digits: "five chicken" -> "5 chicken"
+    // Only if the FIRST token is a number word
+    const firstToken = segClean.split(/\s+/)[0];
+    if (NUMBER_WORDS[firstToken]) {
+      seg = seg
+        .replace(
+          new RegExp(`^\\s*${firstToken}\\b`, "i"),
+          String(NUMBER_WORDS[firstToken])
+        )
+        .trim();
+    }
+
+    // ✅ (C) If a segment contains a digit somewhere, cut noise before the first digit
+    // "hi 1 chicken" -> "1 chicken"
+    const firstNum = seg.search(/\d/);
+    if (firstNum > 0) seg = seg.slice(firstNum).trim();
+
     if (!seg) continue;
 
     let qty: number | null = null;
     let itemPart: string | null = null;
 
     // Pattern A: "2 chicken biriyani" / "2x chicken biriyani"
-    let m =
-      seg.match(/^(\d+)\s*(x|×)?\s+(.+)$/) ??
-      seg.match(/^(\d+)\s+(.+)$/);
+    let m = seg.match(/^(\d+)\s*(x|×)?\s+(.+)$/) ?? seg.match(/^(\d+)\s+(.+)$/);
 
     if (m) {
       const [, qtyStr, _x, itemRaw] =
@@ -393,7 +437,12 @@ function quickRuleDetect(
     const [, qtyStr, _x, itemPartRaw] =
       qtyLeadingMatch.length === 4
         ? qtyLeadingMatch
-        : [qtyLeadingMatch[0], qtyLeadingMatch[1], undefined, qtyLeadingMatch[2]];
+        : [
+            qtyLeadingMatch[0],
+            qtyLeadingMatch[1],
+            undefined,
+            qtyLeadingMatch[2],
+          ];
     const qty = Number(qtyStr);
     const itemPart = itemPartRaw || "";
 
