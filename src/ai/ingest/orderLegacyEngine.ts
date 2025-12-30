@@ -1289,18 +1289,7 @@ export async function handleCatalogFallbackFlow(
           used: true,
           kind: "order",
           order_id: null,
-          reply:
-            unavailableMsg +
-            "🧺 Your cart:\n" +
-            lines.join("\n") +
-            totalLine +
-            "\n\n" +
-            "1) Confirm order\n" +
-            "2) Add another item\n" +
-            "3) Change quantity\n" +
-            "4) Remove an item\n" +
-            "5) Cancel\n\n" +
-            "Please reply with the number.",
+          reply: unavailableMsg + buildConfirmMenuForReply(cart),
         };
       }
       // Even if no cart, clear any stale multi-item context to avoid leaking into next order

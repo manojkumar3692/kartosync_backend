@@ -10,6 +10,9 @@ type StateRow = {
   updated_at?: string;
 };
 
+const STATE_TTL_MIN = Number(process.env.STATE_TTL_MIN || 1);
+const STATE_TTL_MS = STATE_TTL_MIN * 60 * 1000;
+
 const VALID_STATES: ConversationState[] = [
   "idle",
   "ordering_item",
@@ -52,16 +55,44 @@ function asState(s: string | null | undefined): ConversationState {
 export async function getState(
   org_id: string,
   from_phone: string
-): Promise<ConversationState> {
+): Promise<{ state: ConversationState; expired: boolean }> {
   const { data, error } = await supa
-    .from("ai_conversation_state")        // ❌ no generic here
-    .select("state")
+    .from("ai_conversation_state")
+    .select("state, updated_at")
     .eq("org_id", org_id)
     .eq("customer_phone", from_phone)
     .maybeSingle();
 
-  if (error || !data) return "idle";
-  return asState((data as StateRow).state);
+  if (!data || error) return { state: "idle", expired: false };
+
+  const lastUpdated = new Date(data.updated_at).getTime();
+  const now = Date.now();
+
+  const SESSION_TTL_MS = STATE_TTL_MS; 
+  
+
+  // 🔥 AUTO RESET IF IDLE TOO LONG
+  if (now - lastUpdated > SESSION_TTL_MS) {
+    console.log("[STATE] Expired session → auto reset");
+
+    // Clear state
+    await supa
+      .from("ai_conversation_state")
+      .delete()
+      .eq("org_id", org_id)
+      .eq("customer_phone", from_phone);
+
+    // Clear temp cart & flow memory
+    await supa
+      .from("temp_selected_items")
+      .delete()
+      .eq("org_id", org_id)
+      .eq("customer_phone", from_phone);
+
+      return { state: "idle", expired: true };
+  }
+
+  return { state: asState((data as any).state), expired: false };
 }
 
 export async function setState(

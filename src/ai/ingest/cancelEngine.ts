@@ -2,6 +2,8 @@
 
 import { supa } from "../../db";
 import { IngestContext, IngestResult } from "./types";
+import { clearState } from "./stateManager";
+import { resetAttempts } from "./attempts";
 
 const CANCELLABLE = [
   "awaiting_customer_action",
@@ -12,6 +14,19 @@ const CANCELLABLE = [
   "draft",
   "pending",
 ];
+
+async function clearTempCart(org_id: string, from_phone: string) {
+  const phoneKey = String(from_phone || "").replace(/[^\d]/g, "");
+
+  await supa.from("temp_selected_items").upsert({
+    org_id,
+    customer_phone: phoneKey,
+    updated_at: new Date().toISOString(),
+    cart: [],
+    item: null,
+    list: null,
+  } as any);
+}
 
 export async function handleCancel(
   ctx: IngestContext
@@ -33,14 +48,20 @@ export async function handleCancel(
     .limit(1)
     .maybeSingle();
 
-  if (!order) {
-    return {
-      used: true,
-      kind: "cancel",
-      reply: "✅ No pending order to cancel. You can start a new order by typing an item name.",
-      order_id: null,
-    };
-  }
+    if (!order) {
+      await clearState(org_id, from_phone);
+      await clearTempCart(org_id, from_phone);
+      await resetAttempts(org_id, from_phone);
+  
+      return {
+        used: true,
+        kind: "cancel",
+        reply:
+          "✅ Done — I cleared the current flow.\n" +
+          "You can start a new order by typing an item name.",
+        order_id: null,
+      };
+    }
 
   // ─────────────────────────────────────────────
   // Check if order is cancellable
@@ -67,6 +88,11 @@ export async function handleCancel(
       payment_status: "unpaid",
     })
     .eq("id", order.id);
+
+     // ✅ clear ALL flow state + temp cart so user can restart cleanly
+  await clearState(org_id, from_phone);
+  await clearTempCart(org_id, from_phone);
+  await resetAttempts(org_id, from_phone);
 
   return {
     used: true,

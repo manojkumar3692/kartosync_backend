@@ -534,17 +534,7 @@ export async function handleFinalConfirmation(
     return {
       used: true,
       kind: "order",
-      reply:
-        "✅ Quantity updated.\n\n" +
-        "🧺 Your cart now:\n" +
-        cartText +
-        "\n\n" +
-        "1) Confirm order\n" +
-        "2) Add another item\n" +
-        "3) Change quantity\n" +
-        "4) Remove an item\n" +
-        "5) Cancel\n\n" +
-        "Please reply with the number.",
+      reply: "✅ Quantity updated.\n\n" + buildConfirmMenu(newCart as any),
       order_id: null,
     };
   }
@@ -598,15 +588,7 @@ export async function handleFinalConfirmation(
         `🗑️ Removed *${removed.name}${
           removed.variant ? ` (${removed.variant})` : ""
         }* from your cart.\n\n` +
-        "🧺 Your cart now:\n" +
-        cartText +
-        "\n\n" +
-        "1) Confirm order\n" +
-        "2) Add another item\n" +
-        "3) Change quantity\n" +
-        "4) Remove an item\n" +
-        "5) Cancel\n\n" +
-        "Please reply with the number.",
+        buildConfirmMenu(newCart as any),
       order_id: null,
     };
   }
@@ -618,16 +600,7 @@ export async function handleFinalConfirmation(
   return {
     used: true,
     kind: "order",
-    reply:
-      "🧺 Your cart:\n" +
-      cartText +
-      "\n\n" +
-      "1) Confirm order\n" +
-      "2) Add another item\n" +
-      "3) Change quantity\n" +
-      "4) Remove an item\n" +
-      "5) Cancel\n\n" +
-      "Please reply with the number.",
+    reply: buildConfirmMenu(cart as any),
     order_id: null,
   };
 }

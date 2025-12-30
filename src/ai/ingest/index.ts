@@ -99,7 +99,18 @@ function isOrderingState(state: ConversationState): boolean {
   );
 }
 
-const RESET_WORDS = ["reset", "start again", "new order", "clear"];
+const RESET_WORDS = [
+  "reset",
+  "restart",
+  "start over",
+  "start again",
+  "new order",
+  "clear",
+  "clear all",
+  "fresh start",
+];
+
+const BACK_WORDS = ["back", "go back", "menu", "main menu", "exit"];
 
 const STATUS_WORDS = [
   "status",
@@ -154,8 +165,22 @@ export async function ingestCoreFromMessage(
   const { org_id, from_phone, text } = ctx;
   const raw = (text || "").trim();
   const lowerRaw = raw.toLowerCase();
-  const state = await getState(org_id, from_phone);
+  const { state, expired } = await getState(org_id, from_phone);
   console.log("[AI][INGEST][PRE]", { org_id, from_phone, text, state });
+
+  // ✅ SESSION EXPIRED MESSAGE
+if (expired) {
+  const ttl = Number(process.env.STATE_TTL_MIN || 15);
+
+  return {
+    used: true,
+    kind: "smalltalk",
+    order_id: null,
+    reply:
+      `⏱️ No activity for ${ttl} minutes, so I restarted your session.\n` +
+      `Please type the product name again to start fresh 😊`,
+  };
+}
 
   // ------------------------------------------------------
   // MANUAL MODE CHECK
@@ -189,13 +214,12 @@ export async function ingestCoreFromMessage(
     console.warn("[AI][MANUAL_MODE_CHECK][ERR]", e);
   }
 
-  // RESET
-// ✅ GLOBAL ESCAPE HATCH (cancel/reset works in ANY state)
+// ✅ GLOBAL ESCAPE HATCH (works in ANY state)
 if (
   RESET_WORDS.some((k) => lowerRaw.includes(k)) ||
-  CANCEL_WORDS.some((k) => lowerRaw.includes(k))
+  CANCEL_WORDS.some((k) => lowerRaw.includes(k)) ||
+  BACK_WORDS.some((k) => lowerRaw === k || lowerRaw.includes(k))
 ) {
-  // cancelEngine should: cancel active unpaid/unaccepted order + clear conversation/session state
   return handleCancel({ ...ctx, text: raw });
 }
 
@@ -218,15 +242,6 @@ if (
     if (CANCEL_WORDS.some((k) => lowerRaw.includes(k))) {
       return handleCancel(ctx);
     }
-    
-// ✅ GLOBAL ESCAPE HATCH (cancel/reset works in ANY state)
-if (
-  RESET_WORDS.some((k) => lowerRaw.includes(k)) ||
-  CANCEL_WORDS.some((k) => lowerRaw.includes(k))
-) {
-  // cancelEngine should: cancel active unpaid/unaccepted order + clear conversation/session state
-  return handleCancel({ ...ctx, text: raw });
-}
 
     return handlePayment(ctx);
   }
