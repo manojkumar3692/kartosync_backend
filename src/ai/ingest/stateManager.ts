@@ -10,7 +10,7 @@ type StateRow = {
   updated_at?: string;
 };
 
-const STATE_TTL_MIN = Number(process.env.STATE_TTL_MIN || 1);
+const STATE_TTL_MIN = Number(process.env.STATE_TTL_MIN || 10);
 const STATE_TTL_MS = STATE_TTL_MIN * 60 * 1000;
 
 const VALID_STATES: ConversationState[] = [

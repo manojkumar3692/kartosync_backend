@@ -223,6 +223,43 @@ function parseUpsellReply(raw: string, _maxQty: number): number | null {
 }
 
 // ─────────────────────────────────────────────
+// Quantity question helpers (unit-aware)
+// ─────────────────────────────────────────────
+
+type BusinessVertical = "restaurant" | "grocery" | "salon" | "pharmacy" | "generic";
+
+function getQtyUnitLabel(vertical: BusinessVertical | undefined): string {
+  // ✅ You can tweak these words later per org if needed
+  switch (vertical) {
+    case "grocery":
+      return "kg";
+    case "restaurant":
+      return "plates";
+    case "salon":
+      return "services";
+    case "pharmacy":
+      return "packs";
+    default:
+      // generic / House of Eon → units (bottles, pieces, etc.)
+      return "units";
+  }
+}
+
+function buildQtyQuestion(
+  item: ProductRow,
+  vertical: BusinessVertical | undefined
+): string {
+  const name = item.display_name || item.canonical;
+  const variantPart = item.variant ? ` (${item.variant})` : "";
+  const unitLabel = getQtyUnitLabel(vertical);
+
+  // Grocery:  "How many kg of *Prawns - Small (Small)*?"
+  // Restaurant: "How many plates of *Chicken Biryani (Full)*?"
+  // Generic (House of Eon): "How many units of *RANK 50ml*?"
+  return `How many ${unitLabel} of *${name}${variantPart}*?`;
+}
+
+// ─────────────────────────────────────────────
 // 🆕 Helpers for "item 1 of 3" prefix
 // ─────────────────────────────────────────────
 
@@ -545,10 +582,7 @@ export async function handleCatalogFallbackFlow(
               used: true,
               kind: "order",
               order_id: null,
-              reply:
-                itemPrefix +
-                `How many *${item2.display_name || item2.canonical} (` +
-                `${item2.variant})*?`,
+              reply: itemPrefix + buildQtyQuestion(item2, vertical),
             };
           }
 
@@ -755,11 +789,7 @@ export async function handleCatalogFallbackFlow(
               used: true,
               kind: "order",
               order_id: null,
-              reply:
-                itemPrefix +
-                `How many *${item2.display_name || item2.canonical} (${
-                  item2.variant
-                })*?`,
+              reply: itemPrefix + buildQtyQuestion(item2, vertical),
             };
           }
 
@@ -900,9 +930,7 @@ export async function handleCatalogFallbackFlow(
       return {
         used: true,
         kind: "order",
-        reply: `${itemPrefix}How many *${v.display_name || v.canonical} (${
-          v.variant
-        })*?`,
+        reply: itemPrefix + buildQtyQuestion(v, vertical),
         order_id: null,
       };
     }
@@ -954,9 +982,7 @@ export async function handleCatalogFallbackFlow(
       return {
         used: true,
         kind: "order",
-        reply: `${itemPrefix}How many *${v.display_name || v.canonical} (${
-          v.variant
-        })*?`,
+        reply: itemPrefix + buildQtyQuestion(v, vertical),
         order_id: null,
       };
     }
@@ -974,9 +1000,7 @@ export async function handleCatalogFallbackFlow(
       return {
         used: true,
         kind: "order",
-        reply: `${itemPrefix}How many *${v.display_name || v.canonical} (${
-          v.variant
-        })*?`,
+        reply: itemPrefix + buildQtyQuestion(v, vertical),
         order_id: null,
       };
     }
@@ -1037,9 +1061,7 @@ export async function handleCatalogFallbackFlow(
         return {
           used: true,
           kind: "order",
-          reply:
-            `How many *${item.display_name || item.canonical} (` +
-            `${item.variant})*?`,
+          reply: buildQtyQuestion(item, vertical),
           order_id: null,
         };
       }
@@ -1168,9 +1190,7 @@ export async function handleCatalogFallbackFlow(
         return {
           used: true,
           kind: "order",
-          reply:
-            `How many *${item.display_name || item.canonical} (` +
-            `${item.variant})*?`,
+          reply: buildQtyQuestion(item, vertical),
           order_id: null,
         };
       }
@@ -1335,10 +1355,7 @@ export async function handleCatalogFallbackFlow(
       return {
         used: true,
         kind: "order",
-        reply:
-          itemPrefix +
-          `How many *${item.display_name || item.canonical} (` +
-          `${item.variant})*?`,
+        reply: itemPrefix + buildQtyQuestion(item, vertical),
         order_id: null,
       };
     }

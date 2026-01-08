@@ -12,6 +12,7 @@ type ServiceIntent =
 
 
   export type ServiceLane =
+  | "menu"
   | "opening_hours"
   | "delivery_now"
   | "delivery_area"
@@ -150,6 +151,183 @@ function buildStoreLocationReply(cfg: OrgServiceConfig): string {
   return lines.join("\n");
 }
 
+type ProductRow = {
+  id: string;
+  canonical: string;
+  display_name: string | null;
+  category: string | null;
+  unit: string | null;
+  default_unit: string | null;
+  price_per_unit: number | null;
+  active?: boolean | null;
+  is_active?: boolean | null;
+};
+
+async function handleMenuLane(
+  org_id: string,
+  cfg: OrgServiceConfig,
+  text?: string
+): Promise<string> {
+  const name = cfg.name || "our shop";
+
+  const { data: productsRaw, error } = await supa
+    .from("products")
+    .select(
+      "id, canonical, display_name, category, unit, default_unit, price_per_unit, active, is_active"
+    )
+    .eq("org_id", org_id)
+    .order("category", { ascending: true })
+    .order("canonical", { ascending: true })
+    .limit(200);
+
+  if (error) {
+    console.warn("[MENU][PRODUCT_FETCH_ERR]", error.message);
+  }
+
+  const products: ProductRow[] =
+    (productsRaw || []).filter((p) => p.active !== false && p.is_active !== false);
+
+  if (!products.length) {
+      return [
+        `📋 Menu is not configured yet for *${name}*.`,
+        `You can still send the item name with quantity, and the staff will confirm.`,
+        ``,
+        `For example: *item name 1*, *item name 2*, etc.`,
+      ].join("\n");
+  }
+
+  // Distinct categories for this org
+  const categories = Array.from(
+    new Set(
+      products
+        .map((p) => (p.category || "").trim())
+        .filter((c) => c.length > 0)
+    )
+  );
+
+  const lowerText = (text || "").toLowerCase();
+
+  // Try to detect if user mentioned a category explicitly
+  let matchedCategory: string | null = null;
+  for (const cat of categories) {
+    const lc = cat.toLowerCase();
+    if (lc.length >= 3 && lowerText.includes(lc)) {
+      matchedCategory = cat;
+      break;
+    }
+  }
+
+  // Helper: choose a nice example qty for a product
+  function computeExampleQty(p: ProductRow): string {
+    const rawUnit = (p.unit || p.default_unit || "").toLowerCase();
+    if (!rawUnit) return "1";
+
+    if (rawUnit.includes("kg")) return "1kg";
+    if (rawUnit.includes("g")) return "500g";
+    if (rawUnit.includes("ml")) return "1 " + rawUnit;
+    if (rawUnit.includes("l")) return "1 " + rawUnit;
+
+    // generic "qty" style
+    return "2";
+  }
+
+  // Helper: printable line for one product
+  function formatProductLine(p: ProductRow, idx?: number): string {
+    const label = p.display_name || p.canonical;
+    const price = p.price_per_unit != null ? ` – ₹${p.price_per_unit}` : "";
+    if (idx != null) {
+      return `${idx}) ${label}${price}`;
+    }
+    return `• ${label}${price}`;
+  }
+
+  // If user text matches a category -> show items from that category
+  if (matchedCategory) {
+    const inCat = products.filter(
+      (p) =>
+        (p.category || "").toLowerCase() === matchedCategory!.toLowerCase()
+    );
+
+    if (!inCat.length) {
+      // category detected but no products (edge case)
+      return (
+        `📋 *${matchedCategory}* items are not configured yet.\n` +
+        `You can still type the item you need, e.g. *${matchedCategory} 1kg*.`
+      );
+    }
+
+    const lines: string[] = [];
+    lines.push(`📋 *${matchedCategory}* items:`);
+
+    inCat.slice(0, 15).forEach((p, i) => {
+      lines.push(formatProductLine(p, i + 1));
+    });
+
+    const sample = inCat[0];
+    const sampleName = sample.display_name || sample.canonical;
+    const exampleQty = computeExampleQty(sample);
+
+    lines.push(
+      "",
+      `You can now type the item you want to order, for example:`,
+      `*${sampleName} ${exampleQty}*`
+    );
+
+    return lines.join("\n");
+  }
+
+  // No category detected in message:
+  // 1) If we have categories -> show category list
+  if (categories.length) {
+    const lines: string[] = [];
+    lines.push(`📋 *Here are our main categories:*`);
+
+    categories.forEach((cat, i) => {
+      lines.push(`${i + 1}) ${cat}`);
+    });
+
+    // Pick a sample category + product for examples
+    const sampleCat = categories[0];
+    const sampleProduct =
+      products.find(
+        (p) =>
+          (p.category || "").toLowerCase() === sampleCat.toLowerCase()
+      ) || products[0];
+
+    const sampleName = sampleProduct.display_name || sampleProduct.canonical;
+    const exampleQty = computeExampleQty(sampleProduct);
+
+    lines.push(
+      "",
+      `You can:`,
+      `- Ask for a category (e.g. *show ${sampleCat.toLowerCase()} items*).`,
+      `- Or directly type an item to order (e.g. *${sampleName} ${exampleQty}*).`
+    );
+
+    return lines.join("\n");
+  }
+
+  // 2) No categories at all -> flat product list
+  const lines: string[] = [];
+  lines.push(`📋 *Available items at ${name}:*`);
+
+  products.slice(0, 15).forEach((p, i) => {
+    lines.push(formatProductLine(p, i + 1));
+  });
+
+  const sample = products[0];
+  const sampleName = sample.display_name || sample.canonical;
+  const exampleQty = computeExampleQty(sample);
+
+  lines.push(
+    "",
+    `To order, simply type the item name and quantity, e.g. *${sampleName} ${exampleQty}*.`
+  );
+
+  return lines.join("\n");
+}
+
+
 function buildDeliveryNowReply(
   cfg: OrgServiceConfig,
   text: string
@@ -206,7 +384,7 @@ function buildDeliveryNowReply(
     "",
   );
   lines.push(
-    "To place an order, just send the item names (e.g. *2 Chicken Biryani, 1 Coke*) or type *menu*."
+    "To place an order, just send the item names with quantity (e.g. *2 item A, 1 item B*) or type *menu*."
   );
 
   return lines.join("\n");
@@ -350,6 +528,9 @@ export async function handleServiceLaneAndReply(
         break;
       case "store_location":
         reply = buildStoreLocationReply(cfg);
+        break;
+      case "menu":
+        reply = await handleMenuLane(org_id, cfg, text);
         break;
       case "delivery_time_specific":
         reply =

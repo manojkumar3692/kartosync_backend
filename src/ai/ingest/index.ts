@@ -110,7 +110,7 @@ const RESET_WORDS = [
   "fresh start",
 ];
 
-const BACK_WORDS = ["back", "go back", "menu", "main menu", "exit"];
+const BACK_WORDS = ["back", "go back", "exit"];
 
 const STATUS_WORDS = [
   "status",
@@ -685,6 +685,7 @@ if (
       console.log("[AI][ROUTED][ORDERING]", routed);
 
       const serviceLanes: ServiceLane[] = [
+        "menu",
         "opening_hours",
         "delivery_now",
         "delivery_area",
@@ -710,7 +711,21 @@ if (
           { raw, normalizedText: intentText }
         );
 
-        if (serviceReply) return serviceReply;
+        if (serviceReply) {
+          // 🧠 Important UX rule:
+          // If user asks for *menu* in the middle of ordering (item/variant/qty),
+          // treat next message as a fresh product selection.
+          if (routed.intent === "menu") {
+            await clearState(org_id, from_phone);
+            console.log("[AI][ORDERING][SERVICE_INTERRUPT][MENU_CLEAR_STATE]", {
+              org_id,
+              from_phone,
+              prevState: state,
+            });
+          }
+
+          return serviceReply;
+        }
       }
     } catch (e: any) {
       console.warn("[AI][ORDERING][SERVICE_ROUTER_ERR]", e?.message || e);
@@ -844,6 +859,7 @@ if (
     // MUST BE HERE — ONLY HERE
     if (routed) {
       const serviceLanes: ServiceLane[] = [
+        "menu",
         "opening_hours",
         "delivery_now",
         "delivery_area",
