@@ -1144,7 +1144,20 @@ export async function handleCatalogFallbackFlow(
 
     let num = parsePureNumber(raw);
 
-    // 3A) TEXT → FUZZY OPTION (e.g. type "egg" instead of "2")
+    // 🛑 3A) If user sent ONLY a number but we don't have a choice list,
+    //       do NOT fall back to global search (prevents random "I found multiple items" jokes).
+    if (num !== null && (!list || !Array.isArray(list) || list.length === 0)) {
+      return {
+        used: true,
+        kind: "order",
+        reply:
+          "I showed a numbered list earlier, but I don't have it in front of me now.\n" +
+          "Please type the item name again (for example: *Prawns Small 1kg*).",
+        order_id: null,
+      };
+    }
+
+    // 3B) TEXT → FUZZY OPTION (e.g. type "egg" instead of "2")
     if (num === null && raw && list && Array.isArray(list) && list.length > 0) {
       const opts = list.map((entry: any) => entry.canonical || String(entry));
       const idx = fuzzyChooseOption(raw, opts);
@@ -1153,7 +1166,6 @@ export async function handleCatalogFallbackFlow(
       }
     }
 
-    // If still no number → fall through to global search later
     if (num !== null && list && Array.isArray(list) && list.length > 0) {
       if (num < 1 || num > list.length) {
         return {
@@ -1165,6 +1177,25 @@ export async function handleCatalogFallbackFlow(
       }
 
       const entry = list[num - 1] as any;
+
+      // 🆕 FAST PATH: menu selection already points to a specific product/variant
+      if (entry.product_id) {
+        const variant = catalog.find((p) => p.id === entry.product_id);
+
+        if (variant) {
+          await saveTemp(org_id, from_phone, { item: variant, list: null });
+          await setState(org_id, from_phone, "ordering_qty");
+
+          return {
+            used: true,
+            kind: "order",
+            reply: itemPrefix + buildQtyQuestion(variant, vertical),
+            order_id: null,
+          };
+        }
+        // if somehow product not found, fall through to canonical-based logic
+      }
+
       const canonical = entry.canonical || entry;
 
       const variants = catalog.filter(
@@ -1220,9 +1251,30 @@ export async function handleCatalogFallbackFlow(
     // if num is still null → fallthrough to global search below (where we now handle queues)
   }
 
-  // ─────────────────────────────────────────────
+ // ─────────────────────────────────────────────
   // 4) GLOBAL MATCHING (idle or fallback)
   // ─────────────────────────────────────────────
+
+  // 🛑 If user sends ONLY a number here, they probably meant a previous numbered list.
+  // Avoid treating pure numbers as a fresh product search.
+  if (parsePureNumber(raw) !== null) {
+    await incAttempts(org_id, from_phone);
+    const attempts = await getAttempts(org_id, from_phone);
+
+    const extra =
+      attempts >= 2 ? `\n\nYou can type *back* to start again.` : "";
+
+    return {
+      used: true,
+      kind: "order",
+      order_id: null,
+      reply:
+        itemPrefix +
+        "Please type the item name instead of just a number.\n" +
+        "Example: *Prawns Small 1kg*." +
+        extra,
+    };
+  }
 
   // 🧠 Use normalized text so "biriayni" → "biryani", Tamil → English, etc.
   const searchText = normalizeCustomerText(raw || "");

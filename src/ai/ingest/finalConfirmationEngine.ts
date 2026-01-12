@@ -5,6 +5,7 @@ import type { IngestContext, IngestResult, ConversationState } from "./types";
 import { setState, clearState } from "./stateManager";
 import { resetAttempts } from "./attempts";
 import { emitNewOrder } from "../../routes/realtimeOrders";
+import { generateOrderCode } from "./orderCode";
 type CartLine = {
   product_id: string | number;
   name: string;
@@ -139,6 +140,7 @@ function formatCart(cart: CartLine[]): { text: string; total: number } {
   };
 }
 
+
 // ─────────────────────────────────────────────
 // Main handler
 // ─────────────────────────────────────────────
@@ -205,19 +207,20 @@ export async function handleFinalConfirmation(
     // 1) CONFIRM ORDER → create order in DB
     if (choice === 1) {
       const { text: cartText, total } = formatCart(cart);
+      const shortCode = await generateOrderCode(org_id);
 
       const orderPayload = {
         org_id,
         source_phone: from_phone,
         raw_text: ctx.text || "",
         items: cart,
-        // ✅ Customer must still choose payment / complete payment
-        status: "awaiting_customer_action",      
+        // ✅ Customer / patient must still complete next steps
+        status: "awaiting_customer_action",
         created_at: new Date().toISOString(),
         total_amount: total || null,
-        // optional but nice (since you already have these columns)
         payment_status: "unpaid",
-        payment_mode: null, // or omit if you want
+        payment_mode: null,
+        order_code: shortCode,
       };
 
       const { data: saved, error } = await supa
@@ -225,8 +228,6 @@ export async function handleFinalConfirmation(
         .insert(orderPayload as any)
         .select("id")
         .single();
-
-
 
       console.log("[FINAL_CONFIRM][INSERT]", { error, saved, orderPayload });
 
@@ -244,9 +245,11 @@ export async function handleFinalConfirmation(
       await clearCart(org_id, from_phone);
       await resetAttempts(org_id, from_phone);
 
-      // ✅ Restaurant-only: go to fulfillment choice
-      // ✅ Others: keep old address flow
+      // ✅ Decide next state based on business_type
       let nextState: ConversationState = "awaiting_address";
+      let isRestaurant = false;
+      let isClinic = false;
+
       try {
         const { data: orgRow } = await supa
           .from("orgs")
@@ -255,12 +258,39 @@ export async function handleFinalConfirmation(
           .maybeSingle();
 
         const t = (orgRow?.business_type || "").toLowerCase();
-        if (t.includes("restaurant")) nextState = "awaiting_fulfillment";
+        if (t.includes("restaurant")) {
+          isRestaurant = true;
+        } else if (t.includes("clinic")) {
+          isClinic = true;
+        }
       } catch (e) {
         console.warn("[FINAL_CONFIRM][VERTICAL_CHECK_ERR]", e);
       }
 
+      if (isRestaurant) {
+        nextState = "awaiting_fulfillment";
+      } else if (isClinic) {
+        nextState = "clinic_awaiting_patient_name";
+      }
+
       await setState(org_id, from_phone, nextState);
+
+      // 🧾 Follow-up message per vertical
+      let followUpMsg: string;
+
+      if (nextState === "awaiting_fulfillment") {
+        followUpMsg =
+          "How would you like to receive your order?\n" +
+          "1) Store Pickup\n" +
+          "2) Home Delivery\n\n" +
+          "Please type *1* or *2*.";
+      } else if (nextState === "clinic_awaiting_patient_name") {
+        followUpMsg =
+          "To book your appointment, please share the *patient name* " +
+          "(for example: *Vani Kumar*).";
+      } else {
+        followUpMsg = "📍 Please send your delivery address.";
+      }
 
       return {
         used: true,
@@ -270,12 +300,7 @@ export async function handleFinalConfirmation(
           "✅ *Order confirmed!*\n\n" +
           cartText +
           "\n\n" +
-          (nextState === "awaiting_fulfillment"
-            ? "How would you like to receive your order?\n" +
-              "1) Store Pickup\n" +
-              "2) Home Delivery\n\n" +
-              "Please type *1* or *2*."
-            : "📍 Please send your delivery address."),
+          followUpMsg,
       };
     }
 

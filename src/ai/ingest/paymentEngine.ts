@@ -5,6 +5,7 @@ import { IngestContext, IngestResult } from "./types";
 import { clearState, setState } from "./stateManager";
 import { emitNewOrder } from "../../routes/realtimeOrders";
 import { createRazorpayPaymentLink } from "../../payments/razorpay";
+import { getOrderDisplayId } from "./orderCode";
 
 const PAY_CASH = ["cash", "cod", "cash on delivery"];
 const PAY_CARD = ["card", "credit", "debit", "card on delivery"];
@@ -100,31 +101,64 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
     state_expected: "awaiting_payment",
   });
 
+  // 🆕 Load org-level payment settings
+  const { data: orgRow, error: orgErr } = await supa
+    .from("orgs")
+    .select(
+      "accept_only_cash, order_footer_message, payment_qr_url, payment_instructions"
+    )
+    .eq("id", org_id)
+    .maybeSingle();
+
+  if (orgErr) {
+    console.warn("[PAYMENT][ORG_FETCH_ERR]", orgErr);
+  }
+
+  const acceptOnlyCash = !!(orgRow as any)?.accept_only_cash;
+  const footerMessage =
+    ((orgRow as any)?.order_footer_message || "").trim() || null;
+
   let mode: PaymentMode | null = null;
 
-  // 1️⃣ NUMBER FIRST (your current UI: 1 = Cash, 2 = Online)
+  // 1️⃣ NUMBER FIRST (your UI: 1 = Cash, 2 = Online, 3 = UPI, 4 = Card)
   if (/^[1-4]$/.test(msg)) {
-    if (msg === "1") mode = "cash";
-    else if (msg === "2") mode = "online";
-    else if (msg === "3") mode = "upi";
-    else if (msg === "4") mode = "card";
+    if (msg === "1") {
+      mode = "cash";
+    } else if (!acceptOnlyCash && msg === "2") {
+      mode = "online";
+    } else if (!acceptOnlyCash && msg === "3") {
+      mode = "upi";
+    } else if (!acceptOnlyCash && msg === "4") {
+      mode = "card";
+    }
+    // If acceptOnlyCash = true and user typed 2/3/4 → mode stays null
   }
 
   // 2️⃣ TEXT SECOND
   if (!mode) {
     mode = detectMode(msg);
+
+    // If org is cash-only, disallow non-cash textual modes
+    if (acceptOnlyCash && mode && mode !== "cash") {
+      mode = null;
+    }
   }
 
   // 3️⃣ FALLBACK → ask cleanly again
   if (!mode) {
+    const reply = acceptOnlyCash
+      ? "💳 Please choose a payment method:\n" +
+        "1) Cash\n\n" +
+        "Please type *1* to confirm Cash on Delivery."
+      : "💳 Please choose a payment method:\n" +
+        "1) Cash\n" +
+        "2) Online Payment\n\n" +
+        "Or type: *cash* / *online* / *upi* / *card*.";
+
     return {
       used: true,
       kind: "payment",
-      reply:
-        "💳 Please choose a payment method:\n" +
-        "1) Cash\n" +
-        "2) Online Payment\n\n" +
-        "Or type: *cash* / *online* / *upi* / *card*.",
+      reply,
       order_id: null,
     };
   }
@@ -270,20 +304,17 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
   let qrUrl: string | null = null;
   let paymentNote: string | null = null;
 
-  if (isOnlineMode) {
-    const { data: orgRow, error: orgErr } = await supa
-      .from("orgs")
-      .select("payment_qr_url, payment_instructions")
-      .eq("id", org_id)
-      .maybeSingle();
-
-    console.log("[PAYMENT][ORG_ROW]", { orgErr, orgRow });
-
-    if (!orgErr && orgRow) {
-      qrUrl = (orgRow as any).payment_qr_url || null;
-      paymentNote = (orgRow as any).payment_instructions || null;
-    }
+  if (isOnlineMode && orgRow) {
+    qrUrl = (orgRow as any).payment_qr_url || null;
+    paymentNote = (orgRow as any).payment_instructions || null;
   }
+
+  console.log("[PAYMENT][MODE_FLAGS]", {
+    mode,
+    isOnlineMode,
+    qrUrl,
+    paymentNote,
+  });
 
   console.log("[PAYMENT][MODE_FLAGS]", {
     mode,
@@ -324,8 +355,14 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
     nextStepLine = "Payment mode saved for your next order.";
   } else if (!isOnlineMode) {
     // Cash / Card on delivery
-    nextStepLine =
-      `${etaLine}\n` + "📞 For any changes, just reply here with your message.";
+    if (footerMessage) {
+      // Use org-specific footer if configured in dashboard
+      nextStepLine = footerMessage;
+    } else {
+      nextStepLine =
+        `${etaLine}\n` +
+        "📞 For any changes, just reply here with your message.";
+    }
   } else {
     const payLink = (order as any)?.razorpay_payment_link_url || null;
 
@@ -356,6 +393,7 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
   if (!order?.id || !summaryBody) {
     const safeSummary = summaryBody || null;
     const payLink = (order as any)?.razorpay_payment_link_url || null;
+    const orderDisplayId = getOrderDisplayId(order);
     const resultFallback = {
       used: true as const,
       kind: "payment" as const,
@@ -363,8 +401,8 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
         `💳 Payment method saved: *${modeLabel}*.\n\n` +
         (safeSummary
           ? safeSummary + `\n\n${nextStepLine}`
-          : order?.id
-          ? `Your order (#${order.id}) is now being processed.\n\n${nextStepLine}`
+          : orderDisplayId
+          ? `Your order (#${orderDisplayId}) is now being processed.\n\n${nextStepLine}`
           : `Payment mode saved for your next order.`),
       order_id: order?.id || null,
       // 👇 Only non-null for online modes + QR configured
@@ -375,10 +413,12 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
     return resultFallback;
   }
   const payLink = (order as any)?.razorpay_payment_link_url || null;
+  const orderDisplayId = getOrderDisplayId(order);
+
   // Rich confirmation
   const reply =
     `💳 Payment method saved: *${modeLabel}*.\n\n` +
-    `🧾 *Order Summary (#${order.id})*\n` +
+    `🧾 *Order Summary (#${orderDisplayId})*\n` +
     `${summaryBody}\n` +
     totalLine +
     `${nextStepLine}`;
@@ -387,7 +427,7 @@ export async function handlePayment(ctx: IngestContext): Promise<IngestResult> {
     used: true as const,
     kind: "payment" as const,
     reply,
-    order_id: order.id || null,
+    order_id: orderDisplayId || null,
     // 👇 This is what your WABA layer will see and send as image
     image: isOnlineMode && !payLink && qrUrl ? qrUrl : null,
   };

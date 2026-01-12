@@ -22,7 +22,11 @@ export type ConversationState =
   | "ordering_upsell"     
   | "cart_edit_menu"
   | "awaiting_fulfillment"
-  | "awaiting_pickup_payment";
+  | "awaiting_pickup_payment"
+  // 👇 NEW clinic states
+  | "clinic_awaiting_patient_name"
+  | "clinic_awaiting_date"
+  | "clinic_awaiting_time";
 
 
   // make sure address is in Intent union

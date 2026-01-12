@@ -80,6 +80,10 @@ org.get("/settings", ensureAuth, async (req: any, res) => {
       payment_qr_url: data.payment_qr_url || null,
       payment_instructions: data.payment_instructions || "",
 
+      // 🆕 Payment mode / footer
+      accept_only_cash: !!data.accept_only_cash,
+      order_footer_message: data.order_footer_message || "",
+
       // 💱 Currency
       default_currency: data.default_currency || "AED",
 
@@ -103,7 +107,6 @@ org.get("/settings", ensureAuth, async (req: any, res) => {
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
-
 // ─────────────────────────────────────────────
 // POST /api/org/settings
 // Body: payment + currency + store location
@@ -118,6 +121,10 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
       store_address,
       store_lat,
       store_lng,
+
+      // 🆕 new fields
+      accept_only_cash,
+      order_footer_message,
     } = req.body || {};
 
     const patch: any = {};
@@ -134,6 +141,17 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
       payment_instructions === null
     ) {
       patch.payment_instructions = payment_instructions;
+    }
+
+    // 🆕 Payment mode / footer
+    if (typeof accept_only_cash === "boolean") {
+      patch.accept_only_cash = accept_only_cash;
+    }
+    if (
+      typeof order_footer_message === "string" ||
+      order_footer_message === null
+    ) {
+      patch.order_footer_message = order_footer_message;
     }
 
     // 💱 Currency
@@ -185,6 +203,8 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
         payment_enabled,
         payment_qr_url,
         payment_instructions,
+        accept_only_cash,
+        order_footer_message,
         default_currency,
         store_address,
         store_lat,
@@ -202,9 +222,14 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
       ok: true,
       id: data.id,
       name: data.name,
+
       payment_enabled: !!data.payment_enabled,
       payment_qr_url: data.payment_qr_url || null,
       payment_instructions: data.payment_instructions || "",
+
+      accept_only_cash: !!data.accept_only_cash,
+      order_footer_message: data.order_footer_message || "",
+
       default_currency: data.default_currency || "AED",
       store_address: data.store_address || "",
       store_lat:

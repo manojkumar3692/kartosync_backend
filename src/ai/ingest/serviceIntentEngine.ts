@@ -10,8 +10,7 @@ type ServiceIntent =
   | "store_location"
   | "none";
 
-
-  export type ServiceLane =
+export type ServiceLane =
   | "menu"
   | "opening_hours"
   | "delivery_now"
@@ -27,20 +26,41 @@ type OrgServiceConfig = {
   store_address_text?: string | null;
   delivery_free_km?: number | null;
   delivery_max_km?: number | null;
-  delivery_fee_type?: string | null; 
+  delivery_fee_type?: string | null;
   delivery_flat_fee?: number | null;
   delivery_per_km_fee?: number | null;
   faq_delivery_answer?: string | null;
   faq_opening_hours_answer?: string | null;
   faq_pricing_answer?: string | null;
   faq_delivery_area_answer?: string | null;
-  delivery_open_time?: string | null;  
-  delivery_close_time?: string | null;  
-  store_timezone?: string | null;      
+  delivery_open_time?: string | null;
+  delivery_close_time?: string | null;
+  store_timezone?: string | null;
   phone?: string | null;
   store_lat?: number | null;
-  store_lng?: number | null; 
+  store_lng?: number | null;
 };
+
+// ---------- NEW: menu context types for number-from-menu selector ----------
+type MenuContextMode = "category_items" | "flat_items" | "category_list";
+
+export type MenuContext = {
+  mode: MenuContextMode;
+  // for mode === "category_items"
+  category?: string;
+  // for modes that show items in a numbered list
+  product_ids?: string[];
+  // for mode === "category_list" (number selects category)
+  categories?: string[];
+};
+
+type MenuLaneResult = {
+  reply: string;
+  menuContext?: MenuContext;
+  // 🆕 items that correspond exactly to the numbered list we sent
+  menuItemsForSelector?: { product_id: string; canonical: string }[];
+};
+// -------------------------------------------------------------------------
 
 
 function buildDeliveryTimeSpecificReply(cfg: OrgServiceConfig, text: string): string {
@@ -75,7 +95,6 @@ function buildDeliveryTimeSpecificReply(cfg: OrgServiceConfig, text: string): st
 
   return lines.join("\n");
 }
-
 
 function parseHHMM(s?: string | null) {
   if (!s) return null;
@@ -122,8 +141,6 @@ function fmtHours(openHHMM: string | null, closeHHMM: string | null) {
   return `Today’s hours: *${o} – ${c}*`;
 }
 
-
-
 function buildStoreLocationReply(cfg: OrgServiceConfig): string {
   const name = cfg.name || "We";
   const addr = (cfg.store_address_text || "").trim();
@@ -156,6 +173,7 @@ type ProductRow = {
   canonical: string;
   display_name: string | null;
   category: string | null;
+  variant?: string | null;         
   unit: string | null;
   default_unit: string | null;
   price_per_unit: number | null;
@@ -163,17 +181,38 @@ type ProductRow = {
   is_active?: boolean | null;
 };
 
+// Normalize text and category for matching:
+// - remove apostrophes (men's -> mens)
+// - strip punctuation
+// - trim long trailing "s" (mens -> men, womens -> women)
+function normalizeForCategoryMatch(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/['’]/g, "")              // remove apostrophes
+    .replace(/[^a-z0-9\s]/g, " ")      // other punctuation -> space
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => {
+      if (w.length > 3 && w.endsWith("s")) {
+        return w.slice(0, -1);         // mens -> men, womens -> women
+      }
+      return w;
+    })
+    .join(" ");
+}
+
+// ---------- UPDATED: now returns MenuLaneResult (reply + context) ----------
 async function handleMenuLane(
   org_id: string,
   cfg: OrgServiceConfig,
   text?: string
-): Promise<string> {
+): Promise<MenuLaneResult> {
   const name = cfg.name || "our shop";
 
   const { data: productsRaw, error } = await supa
     .from("products")
     .select(
-      "id, canonical, display_name, category, unit, default_unit, price_per_unit, active, is_active"
+      "id, canonical, display_name, category, variant, unit, default_unit, price_per_unit, active, is_active"
     )
     .eq("org_id", org_id)
     .order("category", { ascending: true })
@@ -188,12 +227,16 @@ async function handleMenuLane(
     (productsRaw || []).filter((p) => p.active !== false && p.is_active !== false);
 
   if (!products.length) {
-      return [
+    return {
+      reply: [
         `📋 Menu is not configured yet for *${name}*.`,
         `You can still send the item name with quantity, and the staff will confirm.`,
         ``,
         `For example: *item name 1*, *item name 2*, etc.`,
-      ].join("\n");
+      ].join("\n"),
+      menuContext: undefined,
+      menuItemsForSelector: undefined,
+    };
   }
 
   // Distinct categories for this org
@@ -207,11 +250,20 @@ async function handleMenuLane(
 
   const lowerText = (text || "").toLowerCase();
 
+  const normalizedText = normalizeForCategoryMatch(text || "");
+  const textWords = normalizedText.split(/\s+/).filter(Boolean);
+  
   // Try to detect if user mentioned a category explicitly
   let matchedCategory: string | null = null;
+  
   for (const cat of categories) {
-    const lc = cat.toLowerCase();
-    if (lc.length >= 3 && lowerText.includes(lc)) {
+    const normCat = normalizeForCategoryMatch(cat); // e.g. "Men Perfume" -> "men perfume"
+    const catWords = normCat.split(/\s+/).filter(Boolean);
+    if (!catWords.length) continue;
+  
+    // ✅ All category words must appear as separate words
+    const allPresent = catWords.every((w) => textWords.includes(w));
+    if (allPresent) {
       matchedCategory = cat;
       break;
     }
@@ -233,8 +285,22 @@ async function handleMenuLane(
 
   // Helper: printable line for one product
   function formatProductLine(p: ProductRow, idx?: number): string {
-    const label = p.display_name || p.canonical;
-    const price = p.price_per_unit != null ? ` – ₹${p.price_per_unit}` : "";
+    const baseName = p.display_name || p.canonical;
+    const rawVariant = (p.variant || "").trim();
+  
+    // build label: include variant if present
+    let label = baseName;
+    if (rawVariant) {
+      // avoid double text like "Chicken 65 Biryani (Chicken 65 Biryani ...)"
+      const baseLower = baseName.toLowerCase();
+      const varLower = rawVariant.toLowerCase();
+      label =
+        baseLower.includes(varLower) ? baseName : `${baseName} (${rawVariant})`;
+    }
+  
+    const price =
+      p.price_per_unit != null ? ` – ₹${p.price_per_unit}` : "";
+  
     if (idx != null) {
       return `${idx}) ${label}${price}`;
     }
@@ -250,34 +316,55 @@ async function handleMenuLane(
 
     if (!inCat.length) {
       // category detected but no products (edge case)
-      return (
-        `📋 *${matchedCategory}* items are not configured yet.\n` +
-        `You can still type the item you need, e.g. *${matchedCategory} 1kg*.`
-      );
+      return {
+        reply:
+          `📋 *${matchedCategory}* items are not configured yet.\n` +
+          `You can still type the item you need, e.g. *${matchedCategory} 1kg*.`,
+        menuContext: {
+          mode: "category_items",
+          category: matchedCategory,
+          product_ids: [],
+        },
+      };
     }
+
+    const shownProducts = inCat.slice(0, 15);
 
     const lines: string[] = [];
     lines.push(`📋 *${matchedCategory}* items:`);
 
-    inCat.slice(0, 15).forEach((p, i) => {
+    shownProducts.forEach((p, i) => {
       lines.push(formatProductLine(p, i + 1));
     });
 
-    const sample = inCat[0];
+    const sample = shownProducts[0];
     const sampleName = sample.display_name || sample.canonical;
     const exampleQty = computeExampleQty(sample);
 
     lines.push(
       "",
-      `You can now type the item you want to order, for example:`,
+      `You can now *reply with the number* (e.g. *1*),`,
+      `or type the item you want to order, for example:`,
       `*${sampleName} ${exampleQty}*`
     );
 
-    return lines.join("\n");
+    return {
+      reply: lines.join("\n"),
+      menuContext: {
+        mode: "category_items",
+        category: matchedCategory,
+        product_ids: shownProducts.map((p) => p.id),
+      },
+      // 🆕 this is what ingest/index.ts will turn into temp_selected_items.list
+      menuItemsForSelector: shownProducts.map((p) => ({
+        product_id: p.id,
+        canonical: p.canonical,
+      })),
+    };
   }
 
   // No category detected in message:
-  // 1) If we have categories -> show category list
+  // 1) If we have categories -> show category list (numbers pick categories)
   if (categories.length) {
     const lines: string[] = [];
     lines.push(`📋 *Here are our main categories:*`);
@@ -304,28 +391,50 @@ async function handleMenuLane(
       `- Or directly type an item to order (e.g. *${sampleName} ${exampleQty}*).`
     );
 
-    return lines.join("\n");
+    return {
+      reply: lines.join("\n"),
+      menuContext: {
+        mode: "category_list",
+        categories,
+      },
+      menuItemsForSelector: undefined, // numbers do *not* select products here
+    };
   }
 
-  // 2) No categories at all -> flat product list
+  // 2) No categories at all -> flat product list (numbers pick products)
+  const shownProducts = products.slice(0, 15);
+
   const lines: string[] = [];
   lines.push(`📋 *Available items at ${name}:*`);
 
-  products.slice(0, 15).forEach((p, i) => {
+  shownProducts.forEach((p, i) => {
     lines.push(formatProductLine(p, i + 1));
   });
 
-  const sample = products[0];
+  const sample = shownProducts[0];
   const sampleName = sample.display_name || sample.canonical;
   const exampleQty = computeExampleQty(sample);
 
   lines.push(
     "",
-    `To order, simply type the item name and quantity, e.g. *${sampleName} ${exampleQty}*.`
+    `You can *reply with the number* (e.g. *1*)`,
+    `or type the item name and quantity, e.g. *${sampleName} ${exampleQty}*.`
   );
 
-  return lines.join("\n");
+  return {
+    reply: lines.join("\n"),
+    menuContext: {
+      mode: "flat_items",
+      product_ids: shownProducts.map((p) => p.id),
+    },
+    // 🆕 flat menu also supports 1/2/3 selector
+    menuItemsForSelector: shownProducts.map((p) => ({
+      product_id: p.id,
+      canonical: p.canonical,
+    })),
+  };
 }
+// -------------------------------------------------------------------------
 
 
 function buildDeliveryNowReply(
@@ -380,9 +489,7 @@ function buildDeliveryNowReply(
     }
   }
 
-  lines.push(
-    "",
-  );
+  lines.push("",);
   lines.push(
     "To place an order, just send the item names with quantity (e.g. *2 item A, 1 item B*) or type *menu*."
   );
@@ -473,8 +580,6 @@ function buildDeliveryAreaReply(cfg: OrgServiceConfig): string {
  * Main entry: returns an IngestResult if this looks like a service inquiry,
  * or null if we should continue with normal order flow.
  */
-
-
 export async function handleServiceLaneAndReply(
   org_id: string,
   lane: ServiceLane,
@@ -513,6 +618,9 @@ export async function handleServiceLaneAndReply(
 
     let reply: string | null = null;
 
+    // NEW: meta object we can enrich (especially for menu)
+    const meta: any = { lane };
+
     switch (lane) {
       case "delivery_now":
         reply = buildDeliveryNowReply(cfg, text);
@@ -529,15 +637,33 @@ export async function handleServiceLaneAndReply(
       case "store_location":
         reply = buildStoreLocationReply(cfg);
         break;
-      case "menu":
-        reply = await handleMenuLane(org_id, cfg, text);
-        break;
+        case "menu": {
+          const menuRes = await handleMenuLane(org_id, cfg, text);
+          reply = menuRes.reply;
+  
+          if (menuRes.menuContext) {
+            meta.menu = menuRes.menuContext;
+          }
+  
+          // 🆕 expose a simple array for ingest/index.ts
+          if (
+            menuRes.menuItemsForSelector &&
+            menuRes.menuItemsForSelector.length > 0
+          ) {
+            meta.menuItems = menuRes.menuItemsForSelector.map((m) => ({
+              product_id: m.product_id,
+              canonical: m.canonical,
+            }));
+          }
+  
+          break;
+        }
       case "delivery_time_specific":
         reply =
           "⏰ Delivery depends on our working hours.\n" +
-            buildOpeningHoursReply(cfg) +
+          buildOpeningHoursReply(cfg) +
           "\n\nTell me the exact time (ex: *12:00 AM*) and your area, I’ll confirm if delivery is possible.";
-          break;
+        break;
       case "contact": {
         const name = cfg.name || "We";
         const phone = (cfg.phone || "").trim();
@@ -555,7 +681,7 @@ export async function handleServiceLaneAndReply(
       kind: "service_inquiry",
       reply,
       order_id: null,
-      meta: { lane },
+      meta,
     };
   } catch (e: any) {
     console.warn("[SERVICE][ERR]", e?.message || e);

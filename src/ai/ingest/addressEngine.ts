@@ -48,6 +48,7 @@ type OrgDeliveryConfig = {
   delivery_fee_type: "flat" | "per_km" | null;
   delivery_flat_fee: number | null;
   delivery_per_km_fee: number | null;
+  accept_only_cash: boolean | null;
 };
 
 type OrderRow = {
@@ -92,7 +93,7 @@ async function getOrgConfig(org_id: string): Promise<OrgDeliveryConfig | null> {
   const { data, error } = await supa
     .from("orgs")
     .select(
-      "id, store_lat, store_lng, delivery_free_km, delivery_max_km, delivery_fee_type, delivery_flat_fee, delivery_per_km_fee"
+      "id, store_lat, store_lng, delivery_free_km, delivery_max_km, delivery_fee_type, delivery_flat_fee, delivery_per_km_fee, accept_only_cash"
     )
     .eq("id", org_id)
     .maybeSingle();
@@ -324,6 +325,25 @@ function formatFeeLine(fee: number | null | undefined): string {
   return `🚚 Delivery fee: *₹${fee.toFixed(0)}*`;
 }
 
+function buildPaymentPrompt(acceptOnlyCash: boolean | null | undefined) {
+  const onlyCash = !!acceptOnlyCash;
+
+  if (onlyCash) {
+    return (
+      "How would you like to pay?\n" +
+      "1) Cash\n\n" +
+      "Please type *1* to confirm Cash on Delivery."
+    );
+  }
+
+  return (
+    "How would you like to pay?\n" +
+    "1) Cash\n" +
+    "2) Online Payment\n\n" +
+    "Please type *1* or *2*."
+  );
+}
+
 // ─────────────────────────────────────────────
 // MAIN: Address Flow
 // ─────────────────────────────────────────────
@@ -458,7 +478,14 @@ export async function handleAddress(
       .update({
         shipping_address: addressText,
         delivery_address_text: addressText,
-        // we will fill lat/lng + fee in the next step
+
+        // 🔥 IMPORTANT: whenever address changes,
+        // clear old geo/fee so we don't reuse stale values
+        delivery_lat: null,
+        delivery_lng: null,
+        delivery_distance_km: null,
+        delivery_fee: null,
+        delivery_status: "pending_address",
       } as any)
       .eq("id", order.id);
 
@@ -563,6 +590,18 @@ export async function handleAddress(
             ? `${quote.maxKm.toFixed(1)} km`
             : "the allowed radius";
 
+        // 🔥 Clear any stored geo/fee so we don't keep re-using a bad location
+        await supa
+          .from("orders")
+          .update({
+            delivery_lat: null,
+            delivery_lng: null,
+            delivery_distance_km: null,
+            delivery_fee: null,
+            delivery_status: "pending_address",
+          } as any)
+          .eq("id", order.id);
+
         await setState(org_id, from_phone, "awaiting_address");
 
         return {
@@ -601,6 +640,8 @@ export async function handleAddress(
           ? `\n💰 Order total (items): *₹${totalNum.toFixed(0)}*`
           : "";
 
+          const orgCfg = await getOrgConfig(org_id);
+const payPrompt = buildPaymentPrompt(orgCfg?.accept_only_cash);
       // ✅ Restaurant: go to payment
       if (isRestaurant) {
         await setState(org_id, from_phone, "awaiting_payment");
@@ -615,10 +656,7 @@ export async function handleAddress(
             feeLine +
             totalLine +
             "\n\n" +
-            "How would you like to pay?\n" +
-            "1) Cash\n" +
-            "2) Online Payment\n\n" +
-            "Please type *1* or *2*.",
+            payPrompt,
           order_id: order.id,
         };
       }
@@ -636,10 +674,7 @@ export async function handleAddress(
           feeLine +
           totalLine +
           "\n\n" +
-          "How would you like to pay?\n" +
-          "1) Cash\n" +
-          "2) Online Payment\n\n" +
-          "Please type *1* or *2*.",
+          payPrompt,
         order_id: order.id,
       };
     }
@@ -711,6 +746,10 @@ export async function handleAddress(
           ? `\n📏 Distance from store: ~${distanceKm.toFixed(1)} km`
           : "";
 
+
+          const orgCfg = await getOrgConfig(org_id);
+const payPrompt = buildPaymentPrompt(orgCfg?.accept_only_cash);
+
       if (isRestaurant) {
         await setState(org_id, from_phone, "awaiting_payment");
         return {
@@ -720,15 +759,11 @@ export async function handleAddress(
             "✅ *Delivery details saved!*\n\n" +
             "📍 Delivery address:\n" +
             addr +
-            distanceLine +
             "\n\n" +
             feeLine +
             totalLine +
             "\n\n" +
-            "How would you like to pay?\n" +
-            "1) Cash\n" +
-            "2) Online Payment\n\n" +
-            "Please type *1* or *2*.",
+            payPrompt,
           order_id: order.id,
         };
       }
@@ -742,15 +777,11 @@ export async function handleAddress(
           "✅ *Delivery details saved!*\n\n" +
           "📍 Delivery address:\n" +
           addr +
-          distanceLine +
           "\n\n" +
           feeLine +
           totalLine +
           "\n\n" +
-          "How would you like to pay?\n" +
-          "1) Cash\n" +
-          "2) Online Payment\n\n" +
-          "Please type *1* or *2*.",
+          payPrompt,
         order_id: order.id,
       };
     }

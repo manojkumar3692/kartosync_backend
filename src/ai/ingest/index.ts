@@ -19,6 +19,8 @@ import { normalizeCustomerText } from "../lang/normalize";
 import { detectAndTranslate } from "../lang/detectTranslate";
 import { getAliasHints } from "../aliases";
 import { createRazorpayPaymentLink } from "../../payments/razorpay";
+import { isClinicOrg } from "./orgUtils";
+import { handleClinicStep } from "./clinicAppointmentEngine";
 
 console.log("🔥🔥 INGEST INDEX.TS RUNNING v999");
 
@@ -222,6 +224,18 @@ if (
 ) {
   return handleCancel({ ...ctx, text: raw });
 }
+
+ // ✅ CLINIC APPOINTMENT FLOW SHORT-CIRCUIT
+ const isClinic = await isClinicOrg(org_id);
+
+ if (
+   isClinic &&
+   (state === "clinic_awaiting_patient_name" ||
+     state === "clinic_awaiting_date" ||
+     state === "clinic_awaiting_time")
+ ) {
+   return handleClinicStep(ctx, state);
+ }
 
   // FULFILLMENT (restaurant)
   if (state === "awaiting_fulfillment") {
@@ -694,7 +708,7 @@ if (
         "contact",
         "delivery_time_specific",
       ];
-
+      
       if (
         routed &&
         routed.source !== "fallback" &&
@@ -704,26 +718,63 @@ if (
           intent: routed.intent,
           text: intentText,
         });
-
+      
         const serviceReply = await handleServiceLaneAndReply(
           org_id,
           routed.intent as ServiceLane,
           { raw, normalizedText: intentText }
         );
-
+      
         if (serviceReply) {
-          // 🧠 Important UX rule:
-          // If user asks for *menu* in the middle of ordering (item/variant/qty),
-          // treat next message as a fresh product selection.
           if (routed.intent === "menu") {
+            // Clear previous ordering state
             await clearState(org_id, from_phone);
-            console.log("[AI][ORDERING][SERVICE_INTERRUPT][MENU_CLEAR_STATE]", {
-              org_id,
-              from_phone,
-              prevState: state,
-            });
+      
+            // 🆕 Same behaviour as IDLE: store menu list and go to ordering_item
+            if (
+              serviceReply.meta &&
+              Array.isArray(serviceReply.meta.menuItems) &&
+              serviceReply.meta.menuItems.length > 0
+            ) {
+              try {
+                await supa.from("temp_selected_items").upsert({
+                  org_id,
+                  customer_phone: from_phone,
+                  updated_at: new Date().toISOString(),
+                  item: null,
+                  multi_item_queue: null,
+                  current_item_index: null,
+                  cart: null,
+                  list: serviceReply.meta.menuItems.map((m: any) => ({
+                    canonical: m.canonical,
+                    product_id: m.product_id, // 🆕 keep exact variant/product row
+                  })),
+                } as any);
+      
+                await setState(org_id, from_phone, "ordering_item" as ConversationState);
+      
+                console.log(
+                  "[AI][ORDERING][SERVICE_INTERRUPT][MENU_LIST_READY]",
+                  {
+                    org_id,
+                    from_phone,
+                    count: serviceReply.meta.menuItems.length,
+                  }
+                );
+              } catch (e: any) {
+                console.warn(
+                  "[AI][ORDERING][SERVICE_INTERRUPT][MENU_TEMP_ERR]",
+                  e?.message || e
+                );
+              }
+            } else {
+              console.log(
+                "[AI][ORDERING][SERVICE_INTERRUPT][MENU_NO_META]",
+                { org_id, from_phone }
+              );
+            }
           }
-
+      
           return serviceReply;
         }
       }
@@ -855,30 +906,68 @@ if (
         }
       );
     }
-    // 🔥 SERVICE HANDLING (IDLE)
-    // MUST BE HERE — ONLY HERE
-    if (routed) {
-      const serviceLanes: ServiceLane[] = [
-        "menu",
-        "opening_hours",
-        "delivery_now",
-        "delivery_area",
-        "store_location",
-        "pricing_generic",
-        "contact",
-        "delivery_time_specific",
-      ];
+// 🔥 SERVICE HANDLING (IDLE)
+// MUST BE HERE — ONLY HERE
+if (routed) {
+  const serviceLanes: ServiceLane[] = [
+    "menu",
+    "opening_hours",
+    "delivery_now",
+    "delivery_area",
+    "store_location",
+    "pricing_generic",
+    "contact",
+    "delivery_time_specific",
+  ];
 
-      if (serviceLanes.includes(routed.intent as ServiceLane)) {
-        const serviceReply = await handleServiceLaneAndReply(
-          org_id,
-          routed.intent as ServiceLane,
-          { raw, normalizedText: idleIntentText }
-        );
+  if (serviceLanes.includes(routed.intent as ServiceLane)) {
+    const serviceReply = await handleServiceLaneAndReply(
+      org_id,
+      routed.intent as ServiceLane,
+      { raw, normalizedText: idleIntentText }
+    );
 
-        if (serviceReply) return serviceReply;
+    if (serviceReply) {
+      // 🆕 SPECIAL: menu → prepare list for numeric selection (1,2,3,...)
+      if (
+        routed.intent === "menu" &&
+        serviceReply.meta &&
+        Array.isArray(serviceReply.meta.menuItems) &&
+        serviceReply.meta.menuItems.length > 0
+      ) {
+        try {
+          // Store menu list into temp_selected_items
+          await supa.from("temp_selected_items").upsert({
+            org_id,
+            customer_phone: from_phone, // keep same as orderLegacyEngine
+            updated_at: new Date().toISOString(),
+            item: null,
+            multi_item_queue: null,
+            current_item_index: null,
+            cart: null,
+            list: serviceReply.meta.menuItems.map((m: any) => ({
+              canonical: m.canonical,
+              product_id: m.product_id,  // 🆕 keep exact variant row
+            })),
+          } as any);
+
+          // Let the next message ("1"/"2"/text") go through ordering_item flow
+          await setState(org_id, from_phone, "ordering_item" as ConversationState);
+
+          console.log("[AI][MENU][SET_ORDERING_ITEM_FROM_SERVICE]", {
+            org_id,
+            from_phone,
+            count: serviceReply.meta.menuItems.length,
+          });
+        } catch (e: any) {
+          console.warn("[AI][MENU][TEMP_UPSERT_ERR]", e?.message || e);
+        }
       }
+
+      return serviceReply;
     }
+  }
+}
   } catch (e: any) {
     console.warn("[AI][ROUTER][ERR]", e?.message || e);
   }
