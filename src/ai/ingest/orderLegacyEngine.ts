@@ -12,8 +12,6 @@ import { fuzzyChooseOption } from "./fuzzyOption";
 import { normalizeCustomerText } from "../lang/normalize";
 import { buildConfirmMenuForReply } from "./finalConfirmationEngine";
 
-
-
 // temp_selected_items row
 type TempRow = {
   org_id: string;
@@ -226,10 +224,15 @@ function parseUpsellReply(raw: string, _maxQty: number): number | null {
 // Quantity question helpers (unit-aware)
 // ─────────────────────────────────────────────
 
-type BusinessVertical = "restaurant" | "grocery" | "salon" | "pharmacy" | "generic";
+type BusinessVertical =
+  | "restaurant"
+  | "grocery"
+  | "salon"
+  | "pharmacy"
+  | "generic"
+  | "clinic";
 
 function getQtyUnitLabel(vertical: BusinessVertical | undefined): string {
-  // ✅ You can tweak these words later per org if needed
   switch (vertical) {
     case "grocery":
       return "kg";
@@ -239,8 +242,10 @@ function getQtyUnitLabel(vertical: BusinessVertical | undefined): string {
       return "services";
     case "pharmacy":
       return "packs";
+    case "clinic":
+      return "appointments";
     default:
-      // generic / House of Eon → units (bottles, pieces, etc.)
+      // generic / perfumes, etc.
       return "units";
   }
 }
@@ -300,6 +305,7 @@ export async function handleCatalogFallbackFlow(
   const { org_id, from_phone, text, vertical } = ctx;
   let raw = (text || "").trim();
   const lowerRaw = raw.toLowerCase();
+  const isClinic = vertical === "clinic";
 
   // Prefer AI-normalized text (from intent) for catalog matching.
   // This is usually English + cleaned (e.g. "bro oru biriyani kodunga" → "give me a biryani").
@@ -317,7 +323,7 @@ export async function handleCatalogFallbackFlow(
   // clear it so a fresh order doesn't show "2 of 2" from an old conversation.
   const possibleStale = await getTemp(org_id, from_phone);
 
-    // 🛟 RECOVERY: if state was lost but temp has an upsell context,
+  // 🛟 RECOVERY: if state was lost but temp has an upsell context,
   // force the flow back into ordering_upsell so "1/0/skip" works.
   if (state === "idle") {
     const tmp = await getTemp(org_id, from_phone);
@@ -330,7 +336,6 @@ export async function handleCatalogFallbackFlow(
       return handleCatalogFallbackFlow(ctx, "ordering_upsell" as any);
     }
   }
-
 
   if (
     state === "idle" &&
@@ -682,7 +687,7 @@ export async function handleCatalogFallbackFlow(
       used: true,
       kind: "order",
       order_id: null,
-      reply: buildConfirmMenuForReply(newCart),
+      reply: buildConfirmMenuForReply(newCart, { clinic: isClinic }),
     };
   }
 
@@ -846,7 +851,7 @@ export async function handleCatalogFallbackFlow(
 
     await setState(org_id, from_phone, "confirming_order");
     await resetAttempts(org_id, from_phone);
-    
+
     // rebuild cart summary (same as ordering_qty confirm block)
     const lines = newCart.map((li: any, idx: number) => {
       const lineTotal =
@@ -861,21 +866,21 @@ export async function handleCatalogFallbackFlow(
         li.qty
       }${pricePart}`;
     });
-    
+
     const total = newCart.reduce((sum: number, li: any) => {
       if (typeof li.price === "number" && typeof li.qty === "number") {
         return sum + li.price * li.qty;
       }
       return sum;
     }, 0);
-    
+
     const totalLine = total > 0 ? `\n\n💰 Total: ${total}` : "";
-    
+
     return {
       used: true,
       kind: "order",
       order_id: null,
-  reply: buildConfirmMenuForReply(newCart),
+      reply: buildConfirmMenuForReply(newCart, { clinic: isClinic }),
     };
   }
 
@@ -1251,7 +1256,7 @@ export async function handleCatalogFallbackFlow(
     // if num is still null → fallthrough to global search below (where we now handle queues)
   }
 
- // ─────────────────────────────────────────────
+  // ─────────────────────────────────────────────
   // 4) GLOBAL MATCHING (idle or fallback)
   // ─────────────────────────────────────────────
 
@@ -1361,7 +1366,9 @@ export async function handleCatalogFallbackFlow(
           used: true,
           kind: "order",
           order_id: null,
-          reply: unavailableMsg + buildConfirmMenuForReply(cart),
+          reply:
+            unavailableMsg +
+            buildConfirmMenuForReply(cart, { clinic: isClinic }),
         };
       }
       // Even if no cart, clear any stale multi-item context to avoid leaking into next order
@@ -1401,6 +1408,44 @@ export async function handleCatalogFallbackFlow(
     if (variants.length === 1) {
       const item = variants[0];
 
+      // 🆕 CLINIC: skip quantity step, assume qty = 1 and go straight to confirm
+      if (vertical === "clinic") {
+        const row = await getTemp(org_id, from_phone);
+        const existingCart = Array.isArray(row?.cart) ? row!.cart! : [];
+
+        const newCart = [
+          ...existingCart,
+          {
+            product_id: item.id,
+            name: item.display_name || item.canonical,
+            variant: item.variant,
+            qty: 1,
+            price: item.price_per_unit,
+          },
+        ];
+
+        await saveTemp(org_id, from_phone, {
+          cart: newCart,
+          item: null,
+          list: null,
+          multi_item_queue: null,
+          current_item_index: null,
+        });
+
+        await setState(org_id, from_phone, "confirming_order");
+        await resetAttempts(org_id, from_phone);
+
+        return {
+          used: true,
+          kind: "order",
+          order_id: null,
+          reply: buildConfirmMenuForReply(newCart, {
+            clinic: vertical === "clinic",
+          }),
+        };
+      }
+
+      // 🔁 Non-clinic: keep old behaviour (ask quantity)
       await saveTemp(org_id, from_phone, { item, list: null });
       await setState(org_id, from_phone, "ordering_qty");
 
@@ -1427,7 +1472,9 @@ export async function handleCatalogFallbackFlow(
     return {
       used: true,
       kind: "order",
-      reply: `Choose a variant for *${canonical}*:\n${variantLines}\n\nPlease reply with the number.`,
+      reply:
+        `Choose a variant for *${canonical}*:\n` +
+        `${variantLines}\n\nPlease reply with the number.`,
       order_id: null,
     };
   }

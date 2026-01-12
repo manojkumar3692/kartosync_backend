@@ -75,6 +75,57 @@ const PENDING_FULFILLMENT_STATUSES = [
 
 const normalizePhone = (p: string) => (p || "").replace(/[^\d]/g, "");
 
+function looksLikePatientName(raw: string): boolean {
+  const t = (raw || "").trim();
+  if (!t) return false;
+
+  const lower = t.toLowerCase();
+
+  // Reject pure numbers
+  if (/^\d+$/.test(t)) return false;
+
+  // Reject things that look like dates
+  if (/\d{1,2}\/\d{1,2}/.test(t)) return false;
+  if (lower.includes("today") || lower.includes("tomorrow")) return false;
+
+  // ❌ Reject obvious clinic / booking words
+  const clinicWords = [
+    "book",
+    "appointment",
+    "appoitment", // common typo
+    "doctor",
+    "dentist",
+    "consultation",
+    "consult",
+    "timing",
+    "timings",
+    "time",
+    "slot",
+    "fees",
+    "fee",
+    "charges",
+    "status",
+    "order",
+    "menu",
+  ];
+
+  if (clinicWords.some((w) => lower.includes(w))) {
+    return false;
+  }
+
+  // Very short / obvious non-names
+  if (t.length < 2) return false;
+  if (["hi", "hello", "hey", "ok", "thanks", "thank you"].includes(lower)) {
+    return false;
+  }
+
+  // Limit to a small number of words (e.g. "Vani", "Vani Kumar")
+  const parts = t.split(/\s+/);
+  if (parts.length > 4) return false;
+
+  return true;
+}
+
 async function getLastIntentEvent(
   orgId: string,
   customerPhone: string,
@@ -154,11 +205,62 @@ async function getOrgVertical(org_id: string): Promise<Vertical> {
     .maybeSingle();
 
   const t = (data?.business_type || "").toLowerCase();
+
   if (t.includes("restaurant")) return "restaurant";
   if (t.includes("grocery")) return "grocery";
   if (t.includes("salon")) return "salon";
   if (t.includes("pharmacy")) return "pharmacy";
+  if (t.includes("clinic") || t.includes("dental")) return "clinic";
+
   return "generic";
+}
+
+// 🩺 Infer clinic booking step from the latest open order for this org + phone
+async function inferClinicStepFromOrder(
+  org_id: string,
+  phone: string
+): Promise<ConversationState | null> {
+  const phoneKey = normalizePhone(phone);
+
+  const { data, error } = await supa
+    .from("orders")
+    .select(
+      "id, status, appointment_patient_name, appointment_date, appointment_slot_start, appointment_status"
+    )
+    .eq("org_id", org_id)
+    .eq("source_phone", phoneKey)
+    .in("status", ["draft", "pending", "awaiting_customer_action"] as any)
+    // 🔑 Only treat rows with no final appointment_status as “open clinic flow”
+    .is("appointment_status", null)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.warn("[CLINIC][INFER_STEP][DB_ERR]", error.message || error);
+    return null;
+  }
+
+  const order: any = data;
+  if (!order) return null;
+
+  // No patient name yet → we are at the "name" step
+  if (!order.appointment_patient_name) {
+    return "clinic_awaiting_patient_name";
+  }
+
+  // Name present, but no date → "date" step
+  if (!order.appointment_date) {
+    return "clinic_awaiting_date";
+  }
+
+  // Date present, but no time slot → "time" step
+  if (!order.appointment_slot_start) {
+    return "clinic_awaiting_time";
+  }
+
+  // Everything set → no active clinic step
+  return null;
 }
 
 export async function ingestCoreFromMessage(
@@ -169,40 +271,40 @@ export async function ingestCoreFromMessage(
   const lowerRaw = raw.toLowerCase();
   const { state, expired } = await getState(org_id, from_phone);
   console.log("[AI][INGEST][PRE]", { org_id, from_phone, text, state });
-
+  
   // ✅ SESSION EXPIRED MESSAGE
-if (expired) {
-  const ttl = Number(process.env.STATE_TTL_MIN || 15);
-
-  return {
-    used: true,
-    kind: "smalltalk",
-    order_id: null,
-    reply:
-      `⏱️ No activity for ${ttl} minutes, so I restarted your session.\n` +
-      `Please type the product name again to start fresh 😊`,
-  };
-}
-
+  if (expired) {
+    const ttl = Number(process.env.STATE_TTL_MIN || 15);
+  
+    return {
+      used: true,
+      kind: "smalltalk",
+      order_id: null,
+      reply:
+        `⏱️ No activity for ${ttl} minutes, so I restarted your session.\n` +
+        `Please type the product name again to start fresh 😊`,
+    };
+  }
+  
   // ------------------------------------------------------
   // MANUAL MODE CHECK
   // ------------------------------------------------------
   try {
     const phoneKey = normalizePhone(from_phone);
-
+  
     const { data: cust, error: custErr } = await supa
       .from("org_customer_settings")
       .select("manual_mode, manual_mode_until")
       .eq("org_id", org_id)
       .eq("customer_phone", phoneKey)
       .maybeSingle();
-
+  
     if (!custErr && cust?.manual_mode) {
       const until = cust.manual_mode_until
         ? new Date(cust.manual_mode_until).getTime()
         : null;
       const now = Date.now();
-
+  
       if (!until || until > now) {
         return {
           used: false,
@@ -215,27 +317,130 @@ if (expired) {
   } catch (e) {
     console.warn("[AI][MANUAL_MODE_CHECK][ERR]", e);
   }
+  
+  // 🔍 Detect clinic org *before* global escape hatch
+  const isClinic = await isClinicOrg(org_id);
+  
+  // ✅ GLOBAL ESCAPE HATCH
+  // 👉 For NON-clinic orgs, keep current behaviour (cancel = cancel order).
+  // 👉 For clinic orgs, we let clinicAppointmentEngine handle cancel/reset.
+  if (
+    !isClinic &&
+    (
+      RESET_WORDS.some((k) => lowerRaw.includes(k)) ||
+      CANCEL_WORDS.some((k) => lowerRaw.includes(k)) ||
+      BACK_WORDS.some((k) => lowerRaw === k || lowerRaw.includes(k))
+    )
+  ) {
+    return handleCancel({ ...ctx, text: raw });
+  }
+  
+  // ✅ CLINIC APPOINTMENT FLOW SHORT-CIRCUIT
+  if (
+    isClinic &&
+    (
+      state === "clinic_awaiting_patient_name" ||
+      state === "clinic_awaiting_date" ||
+      state === "clinic_awaiting_time" ||
+      state === "clinic_awaiting_confirmation" ||
+      state === "clinic_awaiting_specific_date"
+    )
+  ) {
+    return handleClinicStep(ctx, state);
+  }
 
-// ✅ GLOBAL ESCAPE HATCH (works in ANY state)
-if (
-  RESET_WORDS.some((k) => lowerRaw.includes(k)) ||
-  CANCEL_WORDS.some((k) => lowerRaw.includes(k)) ||
-  BACK_WORDS.some((k) => lowerRaw === k || lowerRaw.includes(k))
-) {
-  return handleCancel({ ...ctx, text: raw });
+// 🩺 Clinic fallback / recovery when state appears idle
+// Uses last intent + orders table to decide which step we're actually in
+if (isClinic && state === "idle") {
+  try {
+    // 🔹 Detect plain greeting here so we DON'T hijack "hi" with date questions
+    const tokens = lowerRaw.split(/\s+/).filter(Boolean);
+    const isPureGreetingForClinic =
+      GREETING_WORDS.some((w) => lowerRaw === w) ||
+      (tokens.length > 0 &&
+        tokens.length <= 3 &&
+        GREETING_WORDS.includes(tokens[0]) &&
+        tokens.slice(1).every((t) => GREETING_FILLERS.includes(t)));
+
+    if (isPureGreetingForClinic) {
+      console.log("[CLINIC][FALLBACK][SKIP_GREETING]", {
+        org_id,
+        from_phone,
+        text: raw,
+      });
+      // Let the normal greeting handler below take over
+    } else {
+      const phoneKey = normalizePhone(from_phone);
+      const prev = await getLastIntentEvent(org_id, phoneKey, 0); // latest logged intent
+
+      // Only run this fallback when the last decided intent was to start booking
+      if (prev?.decided_intent === "clinic_start_booking") {
+        let canResume = true;
+
+        // ⏱️ TTL guard – don't resume if too old
+        if (prev.created_at) {
+          const prevTs = new Date(prev.created_at).getTime();
+          const ttlMs = Number(process.env.STATE_TTL_MIN || 15) * 60 * 1000;
+          const nowTs = Date.now();
+
+          if (nowTs - prevTs > ttlMs) {
+            console.log("[CLINIC][FALLBACK][INTENT_TOO_OLD]", {
+              org_id,
+              from_phone,
+              prevCreatedAt: prev.created_at,
+            });
+            canResume = false;
+          }
+        }
+
+        if (canResume) {
+          // Figure out which clinic step we are actually at, based on the latest order
+          const inferred = await inferClinicStepFromOrder(org_id, from_phone);
+
+          // If we couldn't infer, keep normal flow (might be just timings / fees questions)
+          if (!inferred) {
+            console.log("[CLINIC][FALLBACK][NO_INFERRED_STEP]", {
+              org_id,
+              from_phone,
+              text: raw,
+            });
+          } else if (
+            inferred === "clinic_awaiting_patient_name" &&
+            looksLikePatientName(raw)
+          ) {
+            console.log("[CLINIC][FALLBACK_PATIENT_NAME]", {
+              org_id,
+              from_phone,
+              text: raw,
+            });
+
+            // Treat this as patient name
+            return handleClinicStep(
+              { ...ctx, text: raw },
+              "clinic_awaiting_patient_name"
+            );
+          } else if (
+            inferred === "clinic_awaiting_date" ||
+            inferred === "clinic_awaiting_time" ||
+            inferred === "clinic_awaiting_confirmation"
+          ) {
+            console.log("[CLINIC][FALLBACK_FLOW_STEP]", {
+              org_id,
+              from_phone,
+              inferred,
+              text: raw,
+            });
+
+            // For date/time/confirmation, just pass through as that inferred step
+            return handleClinicStep(ctx, inferred);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[CLINIC][FALLBACK_FLOW_ERR]", e);
+  }
 }
-
- // ✅ CLINIC APPOINTMENT FLOW SHORT-CIRCUIT
- const isClinic = await isClinicOrg(org_id);
-
- if (
-   isClinic &&
-   (state === "clinic_awaiting_patient_name" ||
-     state === "clinic_awaiting_date" ||
-     state === "clinic_awaiting_time")
- ) {
-   return handleClinicStep(ctx, state);
- }
 
   // FULFILLMENT (restaurant)
   if (state === "awaiting_fulfillment") {
@@ -638,6 +843,27 @@ if (
 
   // CANCEL
   if (CANCEL_WORDS.some((k) => lowerRaw.includes(k))) {
+    // 🩺 Clinic safeguard:
+    // If this is a clinic org, we're idle, and the user just says "cancel",
+    // don't cancel the appointment in DB. Just reset the chat session.
+    if (
+      isClinic &&
+      state === "idle" &&
+      (lowerRaw === "cancel" || lowerRaw === "cancel.")
+    ) {
+      await clearState(org_id, from_phone);
+
+      return {
+        used: true,
+        kind: "smalltalk",
+        order_id: null,
+        reply:
+          "Okay, I’ve reset this chat, but your existing appointment is unchanged.\n" +
+          'You can type *book appointment* to make a new booking, or contact the clinic if you want to change this appointment.',
+      };
+    }
+
+    // default behaviour (non-clinic, or explicit cancel phrases)
     return handleCancel(ctx);
   }
 
@@ -707,8 +933,11 @@ if (
         "pricing_generic",
         "contact",
         "delivery_time_specific",
+        "clinic_doctor_availability",
+        "clinic_consultation_fee",
+        "clinic_start_booking",
       ];
-      
+
       if (
         routed &&
         routed.source !== "fallback" &&
@@ -718,18 +947,18 @@ if (
           intent: routed.intent,
           text: intentText,
         });
-      
+
         const serviceReply = await handleServiceLaneAndReply(
           org_id,
           routed.intent as ServiceLane,
           { raw, normalizedText: intentText }
         );
-      
+
         if (serviceReply) {
           if (routed.intent === "menu") {
             // Clear previous ordering state
             await clearState(org_id, from_phone);
-      
+
             // 🆕 Same behaviour as IDLE: store menu list and go to ordering_item
             if (
               serviceReply.meta &&
@@ -750,9 +979,13 @@ if (
                     product_id: m.product_id, // 🆕 keep exact variant/product row
                   })),
                 } as any);
-      
-                await setState(org_id, from_phone, "ordering_item" as ConversationState);
-      
+
+                await setState(
+                  org_id,
+                  from_phone,
+                  "ordering_item" as ConversationState
+                );
+
                 console.log(
                   "[AI][ORDERING][SERVICE_INTERRUPT][MENU_LIST_READY]",
                   {
@@ -768,13 +1001,13 @@ if (
                 );
               }
             } else {
-              console.log(
-                "[AI][ORDERING][SERVICE_INTERRUPT][MENU_NO_META]",
-                { org_id, from_phone }
-              );
+              console.log("[AI][ORDERING][SERVICE_INTERRUPT][MENU_NO_META]", {
+                org_id,
+                from_phone,
+              });
             }
           }
-      
+
           return serviceReply;
         }
       }
@@ -824,12 +1057,25 @@ if (
 
   const vertical = await getOrgVertical(org_id);
   const phoneKey = from_phone.replace(/[^\d]/g, "");
+ // 🔹 Load clinic display name (for clinic vertical only)
+let clinicName: string | null = null;
 
-  // ------------------------------------------------------
-  // 🔒 SERVICE SHORT-CIRCUIT (MUST RUN BEFORE parseIntent)
-  // ------------------------------------------------------
+if (vertical === "clinic") {
+  try {
+    const { data: orgRow } = await supa
+      .from("orgs")
+      .select("name")
+      .eq("id", org_id)
+      .maybeSingle();
 
+    clinicName = (orgRow as any)?.name || null;
+  } catch (e) {
+    console.warn("[ORG][LOAD_CLINIC_NAME_ERR]", e);
+  }
+}
+  // ------------------------------------------------------
   // Greetings (only if it's basically just a greeting)
+  // ------------------------------------------------------
   const tokens = lowerRaw.split(/\s+/).filter(Boolean);
 
   const isPureGreeting =
@@ -840,13 +1086,22 @@ if (
       tokens.slice(1).every((t) => GREETING_FILLERS.includes(t)));
 
   if (isPureGreeting) {
+    const effectiveClinicName = clinicName || "the clinic";
+    const clinicGreeting =
+    `👋 Hello! I’m your assistant for *${effectiveClinicName}*.\n` +
+    "I can help you *book appointments*, check *doctor availability*, *timings*, *consultation fees* and location.\n" +
+    'You can type something like *"book appointment"* or *"consultation charges"*.';
+
+
+    const genericGreeting =
+      "👋 Hello! I’m your Human-AI assistant — here to take your order smoothly.\n" +
+      "You can ask for anything or just send item names directly.\n" +
+      "To restart at any time, type back or cancel.";
+
     return {
       used: true,
       kind: "greeting",
-      reply:
-        "👋 Hello! I’m your Human-AI assistant — here to take your order smoothly.\n" +
-        "You can ask for anything or just send item names directly.\n" +
-        "To restart at any time, type back or cancel.",
+      reply: vertical === "clinic" ? clinicGreeting : genericGreeting,
       order_id: null,
     };
   }
@@ -906,68 +1161,94 @@ if (
         }
       );
     }
-// 🔥 SERVICE HANDLING (IDLE)
-// MUST BE HERE — ONLY HERE
-if (routed) {
-  const serviceLanes: ServiceLane[] = [
-    "menu",
-    "opening_hours",
-    "delivery_now",
-    "delivery_area",
-    "store_location",
-    "pricing_generic",
-    "contact",
-    "delivery_time_specific",
-  ];
+    // 🔥 SERVICE HANDLING (IDLE)
+    // MUST BE HERE — ONLY HERE
+    if (routed) {
+      const serviceLanes: ServiceLane[] = [
+        "menu",
+        "opening_hours",
+        "delivery_now",
+        "delivery_area",
+        "store_location",
+        "pricing_generic",
+        "contact",
+        "delivery_time_specific",
+        "clinic_doctor_availability",
+        "clinic_consultation_fee",
+        "clinic_start_booking",
+      ];
 
-  if (serviceLanes.includes(routed.intent as ServiceLane)) {
-    const serviceReply = await handleServiceLaneAndReply(
-      org_id,
-      routed.intent as ServiceLane,
-      { raw, normalizedText: idleIntentText }
-    );
+      if (serviceLanes.includes(routed.intent as ServiceLane)) {
+        const serviceReply = await handleServiceLaneAndReply(
+          org_id,
+          routed.intent as ServiceLane,
+          { raw, normalizedText: idleIntentText }
+        );
 
-    if (serviceReply) {
-      // 🆕 SPECIAL: menu → prepare list for numeric selection (1,2,3,...)
-      if (
-        routed.intent === "menu" &&
-        serviceReply.meta &&
-        Array.isArray(serviceReply.meta.menuItems) &&
-        serviceReply.meta.menuItems.length > 0
-      ) {
-        try {
-          // Store menu list into temp_selected_items
-          await supa.from("temp_selected_items").upsert({
-            org_id,
-            customer_phone: from_phone, // keep same as orderLegacyEngine
-            updated_at: new Date().toISOString(),
-            item: null,
-            multi_item_queue: null,
-            current_item_index: null,
-            cart: null,
-            list: serviceReply.meta.menuItems.map((m: any) => ({
-              canonical: m.canonical,
-              product_id: m.product_id,  // 🆕 keep exact variant row
-            })),
-          } as any);
+        if (serviceReply) {
+          // 🆕 SPECIAL: menu → prepare list for numeric selection (1,2,3,...)
+          if (
+            routed.intent === "menu" &&
+            serviceReply.meta &&
+            Array.isArray(serviceReply.meta.menuItems) &&
+            serviceReply.meta.menuItems.length > 0
+          ) {
+            try {
+              // Store menu list into temp_selected_items
+              await supa.from("temp_selected_items").upsert({
+                org_id,
+                customer_phone: from_phone, // keep same as orderLegacyEngine
+                updated_at: new Date().toISOString(),
+                item: null,
+                multi_item_queue: null,
+                current_item_index: null,
+                cart: null,
+                list: serviceReply.meta.menuItems.map((m: any) => ({
+                  canonical: m.canonical,
+                  product_id: m.product_id, // 🆕 keep exact variant row
+                })),
+              } as any);
 
-          // Let the next message ("1"/"2"/text") go through ordering_item flow
-          await setState(org_id, from_phone, "ordering_item" as ConversationState);
+              // Let the next message ("1"/"2"/text") go through ordering_item flow
+              await setState(
+                org_id,
+                from_phone,
+                "ordering_item" as ConversationState
+              );
 
-          console.log("[AI][MENU][SET_ORDERING_ITEM_FROM_SERVICE]", {
-            org_id,
-            from_phone,
-            count: serviceReply.meta.menuItems.length,
-          });
-        } catch (e: any) {
-          console.warn("[AI][MENU][TEMP_UPSERT_ERR]", e?.message || e);
+              console.log("[AI][MENU][SET_ORDERING_ITEM_FROM_SERVICE]", {
+                org_id,
+                from_phone,
+                count: serviceReply.meta.menuItems.length,
+              });
+            } catch (e: any) {
+              console.warn("[AI][MENU][TEMP_UPSERT_ERR]", e?.message || e);
+            }
+          }
+
+          // 🆕 SPECIAL: clinic_start_booking → move to clinic_awaiting_patient_name
+          if (routed.intent === "clinic_start_booking") {
+            console.log("[CLINIC][BOOKING_START]", {
+              org_id,
+              from_phone,
+            });
+
+            await setState(org_id, from_phone, "clinic_awaiting_patient_name");
+
+            return {
+              used: true,
+              kind: "service_inquiry",
+              order_id: null,
+              reply:
+                `Sure, I can help you book an appointment at *Lotus Dental Clinic*.\n` +
+                `First, please share the *patient name* (for example: *Vani Kumar*).`,
+            };
+          }
+
+          return serviceReply;
         }
       }
-
-      return serviceReply;
     }
-  }
-}
   } catch (e: any) {
     console.warn("[AI][ROUTER][ERR]", e?.message || e);
   }
@@ -1072,5 +1353,25 @@ if (routed) {
 
   console.log("[AI][INGEST][INTENT][IDLE]", { vertical, state, intent });
 
-  return handleCatalogFlow({ ...ctx, intent, vertical }, "idle");
+  const result = await handleCatalogFlow({ ...ctx, intent, vertical }, "idle");
+
+  if (
+    vertical === "clinic" &&
+    result &&
+    typeof result.reply === "string" &&
+    result.reply.includes("Here are some items from today's menu")
+  ) {
+    // soft rewrite to clinic language
+    const rewritten = result.reply
+      .replace("I couldn't find that item.\n", "")
+      .replace("Here are some items from today's menu:", "Here are some *common treatments & services* we offer:")
+      .replace("Please type the item name again.", "Please type the *treatment / service* name, or say *book appointment*.");
+  
+    return {
+      ...result,
+      reply: rewritten.trim(),
+    };
+  }
+
+  return result;
 }

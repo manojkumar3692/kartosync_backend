@@ -15,33 +15,43 @@ const STATE_TTL_MS = STATE_TTL_MIN * 60 * 1000;
 
 const VALID_STATES: ConversationState[] = [
   "idle",
+
+  // Ordering flow
   "ordering_item",
   "ordering_variant",
   "ordering_qty",
   "ordering_upsell",
 
+  // Cart / confirmation flow
   "confirming_order",
   "cart_edit_menu",
   "cart_edit_item",
   "cart_edit_qty",
   "cart_remove_item",
 
+  // Fulfillment / address
   "awaiting_fulfillment",
   "awaiting_address",
   "awaiting_location_pin",
   "address_confirm_confirm",
 
+  // Payment
   "awaiting_payment",
   "awaiting_payment_proof",
+  "awaiting_pickup_payment",
 
+  // Generic / misc
   "building_order",
   "agent",
-
   "order_finalised",
   "status",
   "cancel",
-  "awaiting_pickup_payment",
-  "awaiting_fulfillment",
+
+  // 🩺 Clinic flow (ADD THESE)
+  "clinic_awaiting_patient_name",
+  "clinic_awaiting_date",
+  "clinic_awaiting_time",
+  "clinic_awaiting_confirmation",
 ];
 
 function asState(s: string | null | undefined): ConversationState {

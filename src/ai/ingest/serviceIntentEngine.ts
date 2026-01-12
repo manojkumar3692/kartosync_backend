@@ -18,7 +18,10 @@ export type ServiceLane =
   | "delivery_time_specific"
   | "store_location"
   | "pricing_generic"
-  | "contact";
+  | "contact"
+  | "clinic_doctor_availability"
+  | "clinic_consultation_fee"
+  | "clinic_start_booking";
 
 type OrgServiceConfig = {
   name?: string | null;
@@ -672,6 +675,69 @@ export async function handleServiceLaneAndReply(
           : `📞 Please ask the staff here for the contact number.`;
         break;
       }
+      case "clinic_doctor_availability": {
+        const name = cfg.name || "the clinic";
+        const tz = cfg.store_timezone || "Asia/Kolkata";
+        const openT = cfg.delivery_open_time ?? null;
+        const closeT = cfg.delivery_close_time ?? null;
+
+        const hoursLine = fmtHours(openT, closeT);
+        const st = isOpenNowInTz(tz, openT, closeT);
+
+        const lines: string[] = [];
+
+        if (st.hasHours) {
+          if (st.isOpen) {
+            lines.push(`✅ Yes, *${name}* is open now.`);
+          } else {
+            lines.push(`❌ *${name}* is closed right now.`);
+          }
+        } else {
+          lines.push(`🩺 Doctor timings are based on the clinic schedule.`);
+        }
+
+        if (hoursLine) {
+          lines.push(hoursLine);
+        }
+
+        lines.push(
+          "",
+          "You can say *book appointment* to check the next available slot."
+        );
+
+        reply = lines.join("\n");
+        break;
+      }
+
+      case "clinic_consultation_fee": {
+        // Prefer org-configured FAQ if present
+        const custom = (cfg.faq_pricing_answer || "").trim();
+
+        if (custom) {
+          reply = custom;
+        } else {
+          const name = cfg.name || "The clinic";
+          reply =
+            `${name} has different fees based on treatment.\n` +
+            "General consultation charges will be confirmed by the reception team.\n\n" +
+            "You can still book an appointment here, and they’ll share exact charges when they confirm.";
+        }
+
+        break;
+      }
+
+      case "clinic_start_booking": {
+        const clinicName = cfg.name || "the clinic";
+
+        reply =
+          `Sure, I can help you book an appointment at *${clinicName}*.\n` +
+          "First, please share the *patient name* (for example: *Vani Kumar*).";
+
+        // We don’t change state here – index.ts will set state to
+        // clinic_awaiting_patient_name after seeing this lane.
+        break;
+      }
+
       default:
         return null;
     }

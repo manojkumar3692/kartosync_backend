@@ -10,7 +10,8 @@ export type Vertical =
   | "grocery"
   | "salon"
   | "pharmacy"
-  | "generic";
+  | "generic"
+  | "clinic";
 
 export type IntentType =
   | "add_item"
@@ -329,7 +330,8 @@ function quickRuleDetect(
     };
   }
 
-  const { state } = opts;
+  const { state, vertical } = opts;
+  const v = vertical; // keep simple, already typed as Vertical
 
   // 🔹 Delivery / “are you open now?” kind of questions
   if (containsAny(normalizedText, DELIVERY_NOW_KEYWORDS)) {
@@ -479,7 +481,9 @@ function quickRuleDetect(
 
   // Single-word / short item names: e.g. "coke", "biriyani", "shampoo"
   // In idle/cart-building states, we treat this as add_item with qty=1.
+  // ❌ But we *disable* this for clinics so "Vani" / patient names are NOT treated as items.
   if (
+    v !== "clinic" &&                              // 🔴 key line: skip this rule for clinic
     normalizedText.length >= 2 &&
     normalizedText.length <= 40 &&
     !normalizedText.includes(" ") &&

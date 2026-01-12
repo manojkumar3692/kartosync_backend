@@ -14,12 +14,15 @@ export type IntentLane =
   | "pricing_generic"
   | "store_location"
   | "contact"
+  | "clinic_doctor_availability"
+  | "clinic_consultation_fee"
+  | "clinic_start_booking"
   | "human_help"
   | "unknown";
 
 export type RouteResult = {
   intent: IntentLane;
-  confidence: number;              // 0..1
+  confidence: number; // 0..1
   source: "override" | "rules" | "ai" | "fallback";
   reply?: string | null;
   entities?: Record<string, any>;
@@ -31,19 +34,38 @@ const openai =
     : null;
 
 function norm(t: string) {
-        return (t || "")
-          .toLowerCase()
-          .replace(/[?.!,]/g, "")   // ✅ remove punctuation
-          .replace(/\s+/g, " ")
-          .trim();
-      }
+  return (t || "")
+    .toLowerCase()
+    .replace(/[?.!,]/g, "") // ✅ remove punctuation
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Small helper: fetch org business_type once per route call
+async function getOrgBusinessType(orgId: string): Promise<string> {
+  try {
+    const { data, error } = await supa
+      .from("orgs")
+      .select("business_type")
+      .eq("id", orgId)
+      .maybeSingle();
+
+    if (error) {
+      console.warn("[INTENT_ROUTER][ORG_BT_ERR]", error.message);
+      return "";
+    }
+    return (data?.business_type || "").toLowerCase();
+  } catch (e: any) {
+    console.warn("[INTENT_ROUTER][ORG_BT_EX]", e?.message || String(e));
+    return "";
+  }
+}
 
 /** -------------------- OVERRIDES -------------------- */
 async function tryOverrides(
   orgId: string,
   normalizedText: string
 ): Promise<RouteResult | null> {
-
   const { data: rows, error } = await supa
     .from("org_intent_overrides")
     .select("id, pattern, match_type, intent, is_active")
@@ -51,12 +73,11 @@ async function tryOverrides(
     .eq("is_active", true)
     .limit(200);
 
-  // 🔥 THIS IS THE LOG YOU MEANT
   console.log("[AI][OVERRIDE][CANDIDATES]", {
     orgId,
     normalizedText,
     total: rows?.length || 0,
-    rows: (rows || []).map(r => ({
+    rows: (rows || []).map((r) => ({
       id: r.id,
       pattern: r.pattern,
       intent: r.intent,
@@ -77,7 +98,9 @@ async function tryOverrides(
     if (r.match_type === "exact") ok = txt === pat;
     else if (r.match_type === "contains") ok = txt.includes(pat);
     else if (r.match_type === "regex") {
-      try { ok = new RegExp(pat, "i").test(txt); } catch {}
+      try {
+        ok = new RegExp(pat, "i").test(txt);
+      } catch {}
     }
 
     if (ok) {
@@ -88,7 +111,7 @@ async function tryOverrides(
       });
 
       return {
-        intent: r.intent,
+        intent: r.intent as IntentLane,
         confidence: 0.98,
         source: "override",
       };
@@ -99,11 +122,62 @@ async function tryOverrides(
 }
 
 /** -------------------- RULES -------------------- */
-function ruleRoute(normalizedText: string): RouteResult | null {
+function ruleRoute(
+  normalizedText: string,
+  businessType?: string
+): RouteResult | null {
   const t = normalizedText;
+  const bt = (businessType || "").toLowerCase();
+
+  // 🩺 CLINIC-SPECIFIC RULES (run *first* for clinic orgs)
+  if (bt.includes("clinic")) {
+    // doctor availability
+    if (
+      /doctor available|doctor there|is (the )?doctor (free|there|available)|can i see (the )?doctor/i.test(
+        t
+      )
+    ) {
+      return {
+        intent: "clinic_doctor_availability",
+        confidence: 0.9,
+        source: "rules",
+      };
+    }
+
+    // consultation fee/charges
+    if (
+      /consultation (fee|fees|charge|charges)|checkup charge|doctor fee|doctor fees/i.test(
+        t
+      )
+    ) {
+      return {
+        intent: "clinic_consultation_fee",
+        confidence: 0.9,
+        source: "rules",
+      };
+    }
+
+    // start booking / appointment
+    if (
+      /book.*appointment|appointment.*book|need appointment|doctor appointment|see doctor|can i get.*appointment/i.test(
+        t
+      )
+    ) {
+      return {
+        intent: "clinic_start_booking",
+        confidence: 0.9,
+        source: "rules",
+      };
+    }
+  }
 
   // MENU
-  if (t.includes("menu") || t.includes("price list") || t.includes("show menu") || t.includes("send menu")) {
+  if (
+    t.includes("menu") ||
+    t.includes("price list") ||
+    t.includes("show menu") ||
+    t.includes("send menu")
+  ) {
     return { intent: "menu", confidence: 0.95, source: "rules" };
   }
 
@@ -133,7 +207,7 @@ function ruleRoute(normalizedText: string): RouteResult | null {
     t.includes("call") ||
     t.includes("how to reach you") ||
     t.includes("how can i contact") ||
-    t.includes("number?")
+    t.includes("number ")
   ) {
     return { intent: "contact", confidence: 0.92, source: "rules" };
   }
@@ -153,35 +227,68 @@ function ruleRoute(normalizedText: string): RouteResult | null {
 
   // DELIVERY time-specific (12am etc)
   const hasTime =
-  /\b\d{1,2}(:\d{2})?\s?(am|pm)\b/i.test(t) ||   // 12am, 12:30 pm
-  /\b\d{1,2}\b/.test(t) && (t.includes("night") || t.includes("tonight")) || // 12 + night/tonight
-  t.includes("midnight");
+    /\b\d{1,2}(:\d{2})?\s?(am|pm)\b/i.test(t) || // 12am, 12:30 pm
+    (/\b\d{1,2}\b/.test(t) &&
+      (t.includes("night") || t.includes("tonight"))) ||
+    t.includes("midnight");
 
-if ((t.includes("delivery") || t.includes("deliver")) && hasTime) {
-  return { intent: "delivery_time_specific", confidence: 0.80, source: "rules" };
-}
+  if ((t.includes("delivery") || t.includes("deliver")) && hasTime) {
+    return {
+      intent: "delivery_time_specific",
+      confidence: 0.8,
+      source: "rules",
+    };
+  }
 
   // DELIVERY now
-  if ((t.includes("deliver") || t.includes("delivery")) && (t.includes("now") || t.includes("today") || t.includes("available"))) {
+  if (
+    (t.includes("deliver") || t.includes("delivery")) &&
+    (t.includes("now") || t.includes("today") || t.includes("available"))
+  ) {
     return { intent: "delivery_now", confidence: 0.86, source: "rules" };
   }
 
-  if ((t.includes("delivery") || t.includes("deliver")) && (t.includes("what time") || t.includes("delivery time") || t.includes("when"))) {
-    return { intent: "delivery_now", confidence: 0.70, source: "rules" }; // or human_help
+  if (
+    (t.includes("delivery") || t.includes("deliver")) &&
+    (t.includes("what time") ||
+      t.includes("delivery time") ||
+      t.includes("when"))
+  ) {
+    return {
+      intent: "delivery_now",
+      confidence: 0.7,
+      source: "rules",
+    }; // or human_help
   }
 
   // DELIVERY area
-  if ((t.includes("deliver to") || t.includes("deliver in") || t.includes("delivery to") || t.includes("delivery in"))) {
+  if (
+    t.includes("deliver to") ||
+    t.includes("deliver in") ||
+    t.includes("delivery to") ||
+    t.includes("delivery in")
+  ) {
     return { intent: "delivery_area", confidence: 0.82, source: "rules" };
   }
 
   // PRICING generic
-  if (t.includes("price") || t.includes("how much") || t.includes("rate card") || t.includes("ratecard")) {
+  if (
+    t.includes("price") ||
+    t.includes("how much") ||
+    t.includes("rate card") ||
+    t.includes("ratecard")
+  ) {
     return { intent: "pricing_generic", confidence: 0.75, source: "rules" };
   }
 
   // If it's clearly a question but unknown intent → human_help
-  if (t.endsWith("?") || t.startsWith("where") || t.startsWith("how") || t.startsWith("when") || t.startsWith("what")) {
+  if (
+    t.startsWith("where") ||
+    t.startsWith("how") ||
+    t.startsWith("when") ||
+    t.startsWith("what") ||
+    t.includes(" ?")
+  ) {
     return { intent: "human_help", confidence: 0.55, source: "rules" };
   }
 
@@ -192,10 +299,9 @@ if ((t.includes("delivery") || t.includes("deliver")) && hasTime) {
 async function aiRoute(normalizedText: string): Promise<RouteResult | null> {
   if (!openai) return null;
 
-  // Keep it super small + deterministic
   const prompt = `
 Classify the user's message into one intent from:
-order, menu, opening_hours, delivery_now, delivery_area, delivery_time_specific, pricing_generic, store_location, contact, human_help, unknown
+order, menu, opening_hours, delivery_now, delivery_area, delivery_time_specific, pricing_generic, store_location, contact, clinic_doctor_availability, clinic_consultation_fee, clinic_start_booking, human_help, unknown
 
 Return ONLY minified JSON:
 {"intent":"...","confidence":0.0}
@@ -223,10 +329,9 @@ ${normalizedText}
 }
 
 /** -------------------- LEARNING: auto-create overrides on “correction” -------------------- */
-// Called when we *detect* misroute (you will wire this from ingestCore when user says “no I asked …”)
 export async function learnOverride(params: {
   orgId: string;
-  normalizedText: string;      // the text that was misrouted (previous message)
+  normalizedText: string; // the text that was misrouted (previous message)
   correctedIntent: IntentLane;
   createdBy?: "system" | "admin";
 }) {
@@ -260,8 +365,8 @@ export async function learnOverride(params: {
       is_active: true,
       hits: 0,
     })
-    .select(); // 🔥 IMPORTANT
-  
+    .select();
+
   console.log("[AI][LEARN][OVERRIDE_INSERT]", {
     ok: !ins.error,
     error: ins.error?.message || null,
@@ -269,46 +374,30 @@ export async function learnOverride(params: {
     rows: ins.data || [],
   });
 
-
   const check = await supa
-  .from("org_intent_overrides")
-  .select("*")
-  .eq("org_id", orgId);
+    .from("org_intent_overrides")
+    .select("*")
+    .eq("org_id", orgId);
 
-console.log("[AI][LEARN][POST_INSERT_CHECK]", check.data, check.error);
-
-  // const check = await supa
-  //   .from("org_intent_overrides")
-  //   .select("id, pattern, match_type, intent, is_active, created_at")
-  //   .eq("org_id", orgId)
-  //   .eq("pattern", pattern)
-  //   .order("created_at", { ascending: false })
-  //   .limit(5);
-
-  // console.log("[AI][LEARN][OVERRIDE_DB_CHECK]", {
-  //   rows: check.data || [],
-  //   error: check.error?.message || null,
-  // });
+  console.log("[AI][LEARN][POST_INSERT_CHECK]", check.data, check.error);
 
   const canRead = await supa
-  .from("org_intent_overrides")
-  .select("id, org_id, pattern, intent, is_active, created_at")
-  .eq("org_id", orgId)
-  .order("created_at", { ascending: false })
-  .limit(5);
+    .from("org_intent_overrides")
+    .select("id, org_id, pattern, intent, is_active, created_at")
+    .eq("org_id", orgId)
+    .order("created_at", { ascending: false })
+    .limit(5);
 
-console.log("[AI][LEARN][OVERRIDE_CAN_READ_AFTER_INSERT]", {
-  rows: canRead.data || [],
-  error: canRead.error
-    ? {
-        message: canRead.error.message,
-        code: (canRead.error as any).code,
-        details: (canRead.error as any).details,
-      }
-    : null,
-});
-
- 
+  console.log("[AI][LEARN][OVERRIDE_CAN_READ_AFTER_INSERT]", {
+    rows: canRead.data || [],
+    error: canRead.error
+      ? {
+          message: canRead.error.message,
+          code: (canRead.error as any).code,
+          details: (canRead.error as any).details,
+        }
+      : null,
+  });
 }
 
 /** -------------------- PUBLIC ROUTER -------------------- */
@@ -322,6 +411,9 @@ export async function routeIntent(params: {
   const { orgId, customerPhone, rawText, normalizedText, state } = params;
   const txt = norm(normalizedText || rawText);
 
+  // 🔎 get org vertical (for clinic vs restaurant behavior)
+  const businessType = await getOrgBusinessType(orgId);
+
   // 1) overrides
   const ov = await tryOverrides(orgId, txt);
   if (ov) {
@@ -330,8 +422,8 @@ export async function routeIntent(params: {
   }
 
   // 2) rules
-  const rr = ruleRoute(txt);
-  if (rr && rr.confidence >= 0.70) {
+  const rr = ruleRoute(txt, businessType);
+  if (rr && rr.confidence >= 0.7) {
     await logEvent(orgId, customerPhone, rawText, txt, rr, state);
     return rr;
   }
@@ -346,7 +438,7 @@ export async function routeIntent(params: {
   // 4) fallback
   const fb: RouteResult = {
     intent: "human_help",
-    confidence: 0.40,
+    confidence: 0.4,
     source: "fallback",
   };
   await logEvent(orgId, customerPhone, rawText, txt, fb, state);

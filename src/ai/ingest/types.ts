@@ -26,7 +26,9 @@ export type ConversationState =
   // 👇 NEW clinic states
   | "clinic_awaiting_patient_name"
   | "clinic_awaiting_date"
-  | "clinic_awaiting_time";
+  | "clinic_awaiting_time"
+  | "clinic_awaiting_confirmation"
+  | "clinic_awaiting_specific_date"
 
 
   // make sure address is in Intent union
@@ -76,7 +78,7 @@ export interface IngestContext {
   vertical?:any
 }
 
-type IntentLane =
+export type IntentLane =
   | "order"
   | "menu"
   | "opening_hours"
@@ -86,6 +88,9 @@ type IntentLane =
   | "pricing_generic"
   | "store_location"
   | "contact"
+  | "clinic_doctor_availability"
+  | "clinic_consultation_fee"
+  | "clinic_start_booking"
   | "human_help"
   | "unknown";
 

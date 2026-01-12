@@ -6,6 +6,7 @@ import { setState, clearState } from "./stateManager";
 import { resetAttempts } from "./attempts";
 import { emitNewOrder } from "../../routes/realtimeOrders";
 import { generateOrderCode } from "./orderCode";
+
 type CartLine = {
   product_id: string | number;
   name: string;
@@ -39,6 +40,19 @@ function buildConfirmMenu(cart: CartLine[]): string {
   );
 }
 
+// 🆕 Clinic-specific confirm menu
+function buildConfirmMenuClinic(cart: CartLine[]): string {
+  const { text: cartText } = formatCart(cart);
+  return (
+    "📝 Your selected service(s):\n" +
+    cartText +
+    "\n\n" +
+    "1) Confirm booking\n" +
+    "2) Edit details\n\n" +
+    "Please reply with the number."
+  );
+}
+
 function buildEditMenu(cart: CartLine[]): string {
   const { text: cartText } = formatCart(cart);
   return (
@@ -55,8 +69,14 @@ function buildEditMenu(cart: CartLine[]): string {
   );
 }
 
-export function buildConfirmMenuForReply(cart: any[]): string {
-  return buildConfirmMenu(cart as CartLine[]);
+// 🆕 Used by order engine / clinic flows
+export function buildConfirmMenuForReply(
+  cart: any[],
+  opts?: { clinic?: boolean }
+): string {
+  return opts?.clinic
+    ? buildConfirmMenuClinic(cart as CartLine[])
+    : buildConfirmMenu(cart as CartLine[]);
 }
 
 async function getTemp(
@@ -140,7 +160,6 @@ function formatCart(cart: CartLine[]): { text: string; total: number } {
   };
 }
 
-
 // ─────────────────────────────────────────────
 // Main handler
 // ─────────────────────────────────────────────
@@ -174,6 +193,29 @@ export async function handleFinalConfirmation(
   // 1) CONFIRMATION MENU (state === confirming_order)
   // ─────────────────────────────────────────────
   if (state === "confirming_order") {
+    // 🆕 Detect vertical once (restaurant vs clinic)
+    let isRestaurant = false;
+    let isClinic = false;
+    let clinicName: string | null = null;
+
+    try {
+      const { data: orgRow } = await supa
+        .from("orgs")
+        .select("business_type, name")
+        .eq("id", org_id)
+        .maybeSingle();
+
+      const t = (orgRow?.business_type || "").toLowerCase();
+      if (t.includes("restaurant")) {
+        isRestaurant = true;
+      } else if (t.includes("clinic")) {
+        isClinic = true;
+        clinicName = orgRow?.name || null;
+      }
+    } catch (e) {
+      console.warn("[FINAL_CONFIRM][VERTICAL_CHECK_ERR]", e);
+    }
+
     // NUMBER FIRST
     let choice: number | null = null;
     if (/^[1-2]$/.test(lower)) {
@@ -199,7 +241,7 @@ export async function handleFinalConfirmation(
       return {
         used: true,
         kind: "order",
-        reply: buildConfirmMenu(cart),
+        reply: buildConfirmMenuForReply(cart, { clinic: isClinic }),
         order_id: null,
       };
     }
@@ -247,25 +289,6 @@ export async function handleFinalConfirmation(
 
       // ✅ Decide next state based on business_type
       let nextState: ConversationState = "awaiting_address";
-      let isRestaurant = false;
-      let isClinic = false;
-
-      try {
-        const { data: orgRow } = await supa
-          .from("orgs")
-          .select("business_type")
-          .eq("id", org_id)
-          .maybeSingle();
-
-        const t = (orgRow?.business_type || "").toLowerCase();
-        if (t.includes("restaurant")) {
-          isRestaurant = true;
-        } else if (t.includes("clinic")) {
-          isClinic = true;
-        }
-      } catch (e) {
-        console.warn("[FINAL_CONFIRM][VERTICAL_CHECK_ERR]", e);
-      }
 
       if (isRestaurant) {
         nextState = "awaiting_fulfillment";
@@ -285,22 +308,24 @@ export async function handleFinalConfirmation(
           "2) Home Delivery\n\n" +
           "Please type *1* or *2*.";
       } else if (nextState === "clinic_awaiting_patient_name") {
+        const nameForText = clinicName || "the clinic";
         followUpMsg =
-          "To book your appointment, please share the *patient name* " +
+          `To book your appointment at *${nameForText}*, please share the *patient name* ` +
           "(for example: *Vani Kumar*).";
       } else {
         followUpMsg = "📍 Please send your delivery address.";
       }
 
+      // 🆕 Header: clinic → "Service captured", others → "Order confirmed"
+      const header = isClinic
+        ? "✅ *Service captured!*\n\n"
+        : "✅ *Order confirmed!*\n\n";
+
       return {
         used: true,
         kind: "order",
         order_id: saved.id,
-        reply:
-          "✅ *Order confirmed!*\n\n" +
-          cartText +
-          "\n\n" +
-          followUpMsg,
+        reply: header + cartText + "\n\n" + followUpMsg,
       };
     }
 
@@ -554,8 +579,6 @@ export async function handleFinalConfirmation(
     });
     await setState(org_id, from_phone, "confirming_order");
 
-    const { text: cartText } = formatCart(newCart);
-
     return {
       used: true,
       kind: "order",
@@ -604,22 +627,18 @@ export async function handleFinalConfirmation(
 
     await setState(org_id, from_phone, "confirming_order");
 
-    const { text: cartText } = formatCart(newCart);
-
     return {
       used: true,
       kind: "order",
       reply:
         `🗑️ Removed *${removed.name}${
           removed.variant ? ` (${removed.variant})` : ""
-        }* from your cart.\n\n` +
-        buildConfirmMenu(newCart as any),
+        }* from your cart.\n\n` + buildConfirmMenu(newCart as any),
       order_id: null,
     };
   }
 
   // Fallback (should rarely hit)
-  const { text: cartText } = formatCart(cart);
   await setState(org_id, from_phone, "confirming_order");
 
   return {

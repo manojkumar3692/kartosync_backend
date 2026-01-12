@@ -4,6 +4,7 @@ import { supa } from "../../db";
 import { IngestContext, IngestResult } from "./types";
 import { clearState } from "./stateManager";
 import { resetAttempts } from "./attempts";
+import { isClinicOrg } from "./orgUtils"; // 🆕 added
 
 const CANCELLABLE = [
   "awaiting_customer_action",
@@ -28,6 +29,18 @@ async function clearTempCart(org_id: string, from_phone: string) {
   } as any);
 }
 
+// Small helper just for nice DD-MM-YYYY display
+function formatDisplayDateFromIso(iso?: string | null): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  return `${dd}-${mm}-${yyyy}`;
+}
+
 export async function handleCancel(
   ctx: IngestContext
 ): Promise<IngestResult> {
@@ -40,7 +53,9 @@ export async function handleCancel(
 
   const { data: order } = await supa
     .from("orders")
-    .select("id, status, created_at")
+    .select(
+      "id, status, created_at, appointment_date, appointment_slot_label, appointment_status"
+    )
     .eq("org_id", org_id)
     .eq("source_phone", phoneKey)
     .in("status", CANCELLABLE as any)
@@ -48,20 +63,20 @@ export async function handleCancel(
     .limit(1)
     .maybeSingle();
 
-    if (!order) {
-      await clearState(org_id, from_phone);
-      await clearTempCart(org_id, from_phone);
-      await resetAttempts(org_id, from_phone);
-  
-      return {
-        used: true,
-        kind: "cancel",
-        reply:
-          "✅ Done — I cleared the current flow.\n" +
-          "You can start a new order by typing an item name.",
-        order_id: null,
-      };
-    }
+  if (!order) {
+    await clearState(org_id, from_phone);
+    await clearTempCart(org_id, from_phone);
+    await resetAttempts(org_id, from_phone);
+
+    return {
+      used: true,
+      kind: "cancel",
+      reply:
+        "✅ Done — I cleared the current flow.\n" +
+        "You can start a new order by typing an item name.",
+      order_id: null,
+    };
+  }
 
   // ─────────────────────────────────────────────
   // Check if order is cancellable
@@ -78,28 +93,55 @@ export async function handleCancel(
   }
 
   // ─────────────────────────────────────────────
-  // Update DB → cancel order
+  // Update DB → cancel order (incl. clinic appointment)
   // ─────────────────────────────────────────────
+  const clinic = await isClinicOrg(org_id); // 🆕 check vertical
+
+  const updatePayload: any = {
+    status: "cancelled",
+    cancelled_at: new Date().toISOString(),
+    payment_status: "unpaid",
+  };
+
+  if (clinic) {
+    // 🩺 only for clinic orgs, close appointment too
+    updatePayload.appointment_status = "cancelled";
+  }
+
   await supa
     .from("orders")
-    .update({
-      status: "cancelled",
-      cancelled_at: new Date().toISOString(),
-      payment_status: "unpaid",
-    })
+    .update(updatePayload)
     .eq("id", order.id);
 
-     // ✅ clear ALL flow state + temp cart so user can restart cleanly
+  // ✅ clear ALL flow state + temp cart so user can restart cleanly
   await clearState(org_id, from_phone);
   await clearTempCart(org_id, from_phone);
   await resetAttempts(org_id, from_phone);
 
+  // ─────────────────────────────────────────────
+  // Build reply (clinic vs other)
+  // ─────────────────────────────────────────────
+  let reply: string;
+
+  if (clinic) {
+    const displayDate = formatDisplayDateFromIso(order.appointment_date);
+    const slotLabel = order.appointment_slot_label || null;
+
+    reply =
+      "🛑 Your appointment has been *cancelled*.\n" +
+      (displayDate ? `🗓 Date: *${displayDate}*\n` : "") +
+      (slotLabel ? `⏰ Time: *${slotLabel}*\n` : "") +
+      "\nIf you want to book again, just type *book appointment*.";
+  } else {
+    reply =
+      `🛑 Your order #${order.id} has been *cancelled*.\n` +
+      `If you want to order again, just type the item name.`;
+  }
+
   return {
     used: true,
     kind: "cancel",
-    reply:
-      `🛑 Your order #${order.id} has been *cancelled*.\n` +
-      `If you want to order again, just type the item name.`,
+    reply,
     order_id: order.id,
   };
 }
