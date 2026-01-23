@@ -3,13 +3,16 @@ import { supa } from "../../db";
 import { IngestContext, IngestResult } from "./types";
 import { setState, clearState } from "./stateManager";
 import { detectMetaIntent } from "./metaIntent";
-import { createRazorpayPaymentLink } from "../../payments/razorpay";
+
 /**
  * We store the user's choice in orders.delivery_type:
  * - "pickup" | "delivery"
  *
  * For pickup: we ignore delivery fee/address in downstream usage,
  * but we do NOT delete it (safe + auditable).
+ *
+ * ✅ This engine ONLY handles fulfillment selection + moving to next state.
+ * ✅ Payment decisions happen in paymentEngine (or later steps).
  */
 
 type FulfillmentChoice = "pickup" | "delivery";
@@ -43,8 +46,22 @@ function detectFulfillmentChoice(raw: string): FulfillmentChoice | null {
   ];
 
   // tamil-ish common words (romanized)
-  const pickupTa = ["pickup venum", "pickup", "takeaway", "take away", "eduthutu varen", "eduthu varen"];
-  const deliveryTa = ["delivery venum", "veetuku anupu", "veetukku anupu", "anupu", "home delivery", "delivery"];
+  const pickupTa = [
+    "pickup venum",
+    "pickup",
+    "takeaway",
+    "take away",
+    "eduthutu varen",
+    "eduthu varen",
+  ];
+  const deliveryTa = [
+    "delivery venum",
+    "veetuku anupu",
+    "veetukku anupu",
+    "anupu",
+    "home delivery",
+    "delivery",
+  ];
 
   if ([...pickupWords, ...pickupTa].some((k) => msg.includes(k))) return "pickup";
   if ([...deliveryWords, ...deliveryTa].some((k) => msg.includes(k))) return "delivery";
@@ -55,7 +72,9 @@ function detectFulfillmentChoice(raw: string): FulfillmentChoice | null {
 async function getLatestActiveOrder(org_id: string, from_phone: string) {
   const { data, error } = await supa
     .from("orders")
-    .select("id, total_amount, items, delivery_fee, delivery_type, status, created_at, payment_status")
+    .select(
+      "id, total_amount, items, delivery_fee, delivery_type, status, created_at, payment_status"
+    )
     .eq("org_id", org_id)
     .eq("source_phone", from_phone)
     .in("status", ["awaiting_customer_action", "awaiting_store_action", "accepted"])
@@ -67,31 +86,25 @@ async function getLatestActiveOrder(org_id: string, from_phone: string) {
   return data || null;
 }
 
-async function getOrgStoreInfo(org_id: string) {
-  // Add these columns in orgs when you are ready:
-  // store_address, store_phone, store_hours, store_maps_url
+async function getOrgConfig(org_id: string) {
+  // ✅ Keep this lightweight. We only need to know if org accepts ONLY cash.
+  // If this column doesn't exist yet, it will come as undefined -> treated as false.
   const { data, error } = await supa
     .from("orgs")
-    .select("id, name, store_address, store_phone, store_hours, store_maps_url")
+    .select("id, name, accept_only_cash")
     .eq("id", org_id)
     .maybeSingle();
 
-  console.log("[FULFILL][ORG_STORE_INFO]", { data, error });
+  console.log("[FULFILL][ORG_CFG]", { data, error });
   return data || null;
-}
-
-function safeInr(amount: any): number {
-  const n = Number(amount);
-  if (!Number.isFinite(n) || n <= 0) return 0;
-  return Math.round(n); // whole rupees for link simplicity
 }
 
 export async function handleFulfillment(ctx: IngestContext): Promise<IngestResult> {
   const { org_id, from_phone, text } = ctx;
 
-  // Only for restaurant
-  const isRestaurant = ctx.vertical === "restaurant";
-  if (!isRestaurant) {
+  // Only for restaurant + grocery (as per your freeze)
+  const allowed = ctx.vertical === "restaurant" || ctx.vertical === "grocery";
+  if (!allowed) {
     return { used: false, kind: "order", reply: "", order_id: null };
   }
 
@@ -99,6 +112,7 @@ export async function handleFulfillment(ctx: IngestContext): Promise<IngestResul
 
   // Meta intents (back/reset/agent)
   const meta = detectMetaIntent(rawText);
+
   if (meta === "reset") {
     await clearState(org_id, from_phone);
     return {
@@ -120,8 +134,6 @@ export async function handleFulfillment(ctx: IngestContext): Promise<IngestResul
   }
 
   if (meta === "back") {
-    // If you want: go back to address step for delivery cases.
-    // But you told “don’t change flow”, so we keep it simple:
     await setState(org_id, from_phone, "awaiting_fulfillment");
     return {
       used: true,
@@ -153,7 +165,7 @@ export async function handleFulfillment(ctx: IngestContext): Promise<IngestResul
   }
 
   const order = await getLatestActiveOrder(org_id, from_phone);
-    if (!order?.id) {
+  if (!order?.id) {
     await clearState(org_id, from_phone);
     return {
       used: true,
@@ -166,111 +178,51 @@ export async function handleFulfillment(ctx: IngestContext): Promise<IngestResul
   // Persist delivery_type on order
   await supa.from("orders").update({ delivery_type: choice }).eq("id", order.id);
 
-  // If Home Delivery → continue existing flow to payment selection
+  // Home Delivery → address step
   if (choice === "delivery") {
     await setState(org_id, from_phone, "awaiting_address");
     return {
       used: true,
       kind: "order",
       order_id: order.id,
-      reply:
-        "✅ *Delivery selected!*\n\n" +
-        "📍 Please send your delivery address.",
+      reply: "✅ *Delivery selected!*\n\n📍 Please send your delivery address.",
     };
   }
 
-  // Pickup → generate Razorpay link + tell store info
-  // For pickup we can set delivery_fee to 0 (optional, keeps totals clean)
+  // Pickup → next step depends on org payment capability
+  // Optional: keep totals clean for pickup
   await supa.from("orders").update({ delivery_fee: 0 }).eq("id", order.id);
 
-  const store = await getOrgStoreInfo(org_id);
+  const orgCfg = await getOrgConfig(org_id);
+  const acceptOnlyCash = Boolean((orgCfg as any)?.accept_only_cash);
 
-  const amount = safeInr(order.total_amount ?? 0);
-  const pl = await createRazorpayPaymentLink({
-    org_id,
-    order_id: order.id,
-    amount_inr: amount,
-    customer_phone: from_phone,
-  });
-  
-  const payUrl = pl?.short_url || null;
-  const payLinkId = pl?.id || null;
-
-  // Save link details (create these columns when ready)
-  // orders.payment_link_url, orders.payment_provider, orders.payment_provider_ref, orders.payment_status
-  if (payUrl) {
-    await supa.from("orders").update({
-      payment_mode: "online",
-      payment_status: "unpaid",
-      payment_provider: "razorpay",
-      razorpay_payment_link_id: payLinkId,
-      razorpay_payment_link_url: payUrl,
-    } as any).eq("id", order.id);
-  } else {
-    // If link creation fails, still don’t break flow
-    await supa
-      .from("orders")
-      .update({
-        payment_mode: "online",
-        payment_status: "pending",
-      } as any)
-      .eq("id", order.id);
-  }
-
-  // After sending link, we stay in a state waiting for webhook to mark paid.
-  // You can add this state later if you want: "awaiting_pickup_payment"
-  await setState(org_id, from_phone, "awaiting_pickup_payment" as any);
-  
-  const storeName = store?.name ? `*${store.name}*` : "our store";
-  const storeAddr = store?.store_address ? store.store_address : "Store address will be shared after payment.";
-  const storePhone = store?.store_phone ? store.store_phone : "";
-  const storeHours = store?.store_hours ? store.store_hours : "";
-  const maps = store?.store_maps_url ? store.store_maps_url : "";
-
-  const linkLine = payUrl
-  ? `🔗 *Pay here to confirm pickup:* ${payUrl}\n\n`
-  : "🔗 Payment link is being generated. You’ll receive it shortly.\n\n";
-
-  const storeBlock =
-    `🏪 Pickup from: ${storeName}\n` +
-    `📍 ${storeAddr}\n` +
-    (maps ? `🗺️ ${maps}\n` : "") +
-    (storePhone ? `📞 ${storePhone}\n` : "") +
-    (storeHours ? `⏰ Open till: ${storeHours}\n` : "");
-
-    // ✅ Build order summary (MISSING PART)
-const summaryLines: string[] = [];
-if (order.items && Array.isArray(order.items)) {
-  for (const it of order.items) {
-    const name = it?.name || "Item";
-    const variant = it?.variant ? ` (${it.variant})` : "";
-    const qty = Number(it?.qty) || 0;
-    const price = Number(it?.price) || 0;
-
-    if (qty > 0) {
-      summaryLines.push(
-        `• ${name}${variant} x ${qty} — ₹${qty * price}`
-      );
-    }
-  }
-}
-
-const summaryText =
-  summaryLines.length > 0
-    ? summaryLines.join("\n") + `\n\n💰 Total: *₹${amount}*`
-    : "";
-
+  // ✅ If org accepts ONLY cash → go to a simple cash confirmation state
+  // NOTE: You must handle this state in ingest/index.ts (similar to awaiting_payment)
+  // If you don't want a new state, you can set awaiting_payment and let paymentEngine show "Cash only".
+  if (acceptOnlyCash) {
+    await setState(org_id, from_phone, "awaiting_cash_confirmation" as any);
     return {
       used: true,
       kind: "order",
       order_id: order.id,
       reply:
         "✅ *Store Pickup selected!*\n\n" +
-        "🧾 *Order Summary*\n" +
-        summaryText +
-        "\n\n💳 *Online payment only for pickup.*\n" +
-        "Please pay using this link:\n" +
-        `*${payUrl}*\n\n` +
-        "After payment, send the screenshot / transaction id here (or type *paid*).",
+        "💵 This store accepts *Cash only*.\n" +
+        "Please reply *OK* to confirm. (You can pay at pickup.)",
     };
+  }
+
+  // ✅ Otherwise continue with existing payment flow
+  await setState(org_id, from_phone, "awaiting_payment");
+  return {
+    used: true,
+    kind: "order",
+    order_id: order.id,
+    reply:
+      "✅ *Store Pickup selected!*\n\n" +
+      "How would you like to pay?\n" +
+      "1) Cash\n" +
+      "2) Online Payment\n\n" +
+      "Please type *1* or *2*.",
+  };
 }

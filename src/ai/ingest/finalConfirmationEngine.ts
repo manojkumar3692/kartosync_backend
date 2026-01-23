@@ -426,20 +426,34 @@ export async function handleFinalConfirmation(
       };
     }
 
-    // 1) Add another item
-    if (choice === 1) {
-      await setState(org_id, from_phone, "idle");
-      return {
-        used: true,
-        kind: "order",
-        order_id: null,
-        reply:
-          "Got it 👍\n" +
-          "Type the item name to add (e.g. *Chicken Biryani*).\n\n" +
-          "Current cart:\n" +
-          cartText,
-      };
-    }
+  // 1) Add another item
+  if (choice === 1) {
+    await setState(org_id, from_phone, "idle");
+
+    // 🔹 Pick a smart example from current cart (org-agnostic)
+    const firstLine = cart[0];
+    const exampleName = firstLine
+      ? firstLine.variant
+        ? `${firstLine.name} (${firstLine.variant})`
+        : firstLine.name
+      : null;
+
+    const exampleLine = exampleName
+      ? `Type the item name to add (e.g. *${exampleName}*).\n`
+      : "Type the item name to add.\n";
+
+    return {
+      used: true,
+      kind: "order",
+      order_id: null,
+      reply:
+        "Got it 👍\n" +
+        exampleLine +
+        "\n" +
+        "Current cart:\n" +
+        cartText,
+    };
+  }
 
     // 2) Change qty → reuse existing flow
     if (choice === 2) {

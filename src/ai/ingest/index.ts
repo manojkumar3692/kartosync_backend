@@ -221,7 +221,6 @@ async function inferClinicStepFromOrder(
   phone: string
 ): Promise<ConversationState | null> {
   const phoneKey = normalizePhone(phone);
-
   const { data, error } = await supa
     .from("orders")
     .select(
@@ -810,7 +809,7 @@ if (isClinic && state === "idle") {
     const vertical = await getOrgVertical(org_id);
 
     if (
-      vertical === "restaurant" &&
+      ["restaurant", "grocery", "pharmacy"].includes(vertical) &&
       res?.order_id &&
       typeof res.reply === "string" &&
       res.reply.includes("✅ *Order confirmed!*")
@@ -1057,22 +1056,23 @@ if (isClinic && state === "idle") {
 
   const vertical = await getOrgVertical(org_id);
   const phoneKey = from_phone.replace(/[^\d]/g, "");
- // 🔹 Load clinic display name (for clinic vertical only)
-let clinicName: string | null = null;
-
-if (vertical === "clinic") {
+  
+  // Load org display name once (clinic + store + grocery + anyone)
+  let orgDisplayName: string = "this business";
+  
   try {
     const { data: orgRow } = await supa
       .from("orgs")
       .select("name")
       .eq("id", org_id)
       .maybeSingle();
-
-    clinicName = (orgRow as any)?.name || null;
+  
+    if (orgRow?.name) {
+      orgDisplayName = orgRow.name.trim();
+    }
   } catch (e) {
-    console.warn("[ORG][LOAD_CLINIC_NAME_ERR]", e);
+    console.warn("[ORG][LOAD_ORG_NAME_ERR]", e);
   }
-}
   // ------------------------------------------------------
   // Greetings (only if it's basically just a greeting)
   // ------------------------------------------------------
@@ -1085,26 +1085,33 @@ if (vertical === "clinic") {
       GREETING_WORDS.includes(tokens[0]) &&
       tokens.slice(1).every((t) => GREETING_FILLERS.includes(t)));
 
-  if (isPureGreeting) {
-    const effectiveClinicName = clinicName || "the clinic";
-    const clinicGreeting =
-    `👋 Hello! I’m your assistant for *${effectiveClinicName}*.\n` +
-    "I can help you *book appointments*, check *doctor availability*, *timings*, *consultation fees* and location.\n" +
-    'You can type something like *"book appointment"* or *"consultation charges"*.';
-
-
-    const genericGreeting =
-      "👋 Hello! I’m your Human-AI assistant — here to take your order smoothly.\n" +
-      "You can ask for anything or just send item names directly.\n" +
-      "To restart at any time, type back or cancel.";
-
-    return {
-      used: true,
-      kind: "greeting",
-      reply: vertical === "clinic" ? clinicGreeting : genericGreeting,
-      order_id: null,
-    };
-  }
+      if (isPureGreeting) {
+        if (vertical === "clinic") {
+          return {
+            used: true,
+            kind: "greeting",
+            order_id: null,
+            reply:
+              `👋 Hello! I’m your assistant for *${orgDisplayName}*.\n` +
+              "I can help you *book appointments*, check *doctor availability*, *timings*, and *consultation fees*.\n\n" +
+              "Type *book appointment* to begin.\n" +
+              "🔁 Type *cancel* anytime to reset.",
+          };
+        }
+      
+        return {
+          used: true,
+          kind: "greeting",
+          order_id: null,
+          reply:
+`👋 Welcome to *${orgDisplayName}*.\n` +
+      "I’m your WhatsApp assistant to help you place and manage your orders.\n\n" +
+      "🛒 *To place an order*: Do you have fish/chicken/mutton, like you normally WhatsApp the shop.\n" +
+      "📋 *To see the menu / price list*: type *menu*.\n\n" +
+      "🔁 At any time you can type *cancel* to clear the current order and start again from the beginning,\n" +
+      "or type *back* to go one step up if you feel stuck."
+        };
+      }
 
   // Smalltalk
   if (
