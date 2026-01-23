@@ -52,6 +52,7 @@ const VALID_STATES: ConversationState[] = [
   "clinic_awaiting_date",
   "clinic_awaiting_time",
   "clinic_awaiting_confirmation",
+  "awaiting_delivery_slot"
 ];
 
 function asState(s: string | null | undefined): ConversationState {

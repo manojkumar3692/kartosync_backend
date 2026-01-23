@@ -450,7 +450,7 @@ if (isClinic && state === "idle") {
   }
 
   // ADDRESS
-  if (state === "awaiting_address" || state === "awaiting_location_pin") {
+  if (state === "awaiting_address" || state === "awaiting_location_pin" ||  state === "awaiting_delivery_slot" ) {
     return handleAddress(ctx, state);
   }
 

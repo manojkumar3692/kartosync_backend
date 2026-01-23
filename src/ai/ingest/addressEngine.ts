@@ -2,9 +2,10 @@
 import { supa } from "../../db";
 import { IngestContext, IngestResult, ConversationState } from "./types";
 import { setState, clearState } from "./stateManager";
-import axios from "axios"; // ⬅️ NEW
-import { detectMetaIntent } from "./metaIntent"; // ⬅️ NEW
-import { getAttempts, incAttempts, resetAttempts } from "./attempts"; // ⬅️ NEW
+import axios from "axios";
+import { detectMetaIntent } from "./metaIntent";
+import { getAttempts, incAttempts, resetAttempts } from "./attempts";
+
 // ─────────────────────────────────────────────
 // Address heuristic (same as your old version)
 // ─────────────────────────────────────────────
@@ -38,7 +39,6 @@ function looksLikeAddress(text: string): boolean {
 // ─────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────
-
 type OrgDeliveryConfig = {
   id: string;
   store_lat: number | null;
@@ -49,6 +49,15 @@ type OrgDeliveryConfig = {
   delivery_flat_fee: number | null;
   delivery_per_km_fee: number | null;
   accept_only_cash: boolean | null;
+
+  delivery_open_time?: string | null; // "11:00:00"
+  delivery_close_time?: string | null; // "23:00:00"
+  store_timezone?: string | null; // "Asia/Kolkata"
+
+  delivery_slot_enabled?: boolean | null;
+  delivery_slot_interval_min?: number | null; // default 30
+  delivery_slot_prep_min?: number | null; // default 45
+  delivery_slot_capacity?: number | null; // default 10
 };
 
 type OrderRow = {
@@ -63,63 +72,40 @@ type OrderRow = {
 // ─────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────
-
-async function getLatestPendingOrder(
-  org_id: string,
-  from_phone: string
-): Promise<OrderRow | null> {
-  const { data, error } = await supa
+async function getLatestPendingOrder(org_id: string, from_phone: string) {
+  const { data } = await supa
     .from("orders")
-    .select(
-      "id, total_amount, delivery_address_text, delivery_fee, delivery_lat, delivery_lng"
-    )
+    .select("id, total_amount, delivery_address_text, delivery_fee, delivery_lat, delivery_lng")
     .eq("org_id", org_id)
     .eq("source_phone", from_phone)
-    .in("status", [
-      "awaiting_customer_action",
-      "awaiting_store_action",
-      "accepted",
-    ] as any)
+    .in("status", ["awaiting_customer_action", "awaiting_store_action", "accepted"] as any)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
-
-  console.log("[ADDR][FIND_PENDING]", { data, error });
 
   return (data as OrderRow) || null;
 }
 
 async function getOrgConfig(org_id: string): Promise<OrgDeliveryConfig | null> {
-  const { data, error } = await supa
+  const { data } = await supa
     .from("orgs")
     .select(
-      "id, store_lat, store_lng, delivery_free_km, delivery_max_km, delivery_fee_type, delivery_flat_fee, delivery_per_km_fee, accept_only_cash"
+      "id, store_lat, store_lng, delivery_free_km, delivery_max_km, delivery_fee_type, delivery_flat_fee, delivery_per_km_fee, accept_only_cash, delivery_slot_enabled, delivery_open_time, delivery_close_time, store_timezone, delivery_slot_interval_min, delivery_slot_prep_min, delivery_slot_capacity"
     )
     .eq("id", org_id)
     .maybeSingle();
 
-  console.log("[ADDR][ORG_CONFIG]", { data, error });
-
   return (data as OrgDeliveryConfig) || null;
 }
 
-function haversineKm(
-  lat1: number,
-  lon1: number,
-  lat2: number,
-  lon2: number
-): number {
+function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number) {
   const toRad = (v: number) => (v * Math.PI) / 180;
-  const R = 6371; // km
-
+  const R = 6371;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
   const a =
     Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
 
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
@@ -143,10 +129,6 @@ type DeliveryQuote =
       reason: "missing_coords" | "too_far" | "no_config";
     };
 
-/**
- * Compute distance + fee based on org config.
- * NOTE: This expects BOTH store + customer coords to be present.
- */
 async function computeDeliveryQuote(
   org_id: string,
   customerLat: number | null,
@@ -167,18 +149,10 @@ async function computeDeliveryQuote(
   const storeLat = cfg.store_lat;
   const storeLng = cfg.store_lng;
 
-  const freeKm =
-    cfg.delivery_free_km != null ? Number(cfg.delivery_free_km) : 0;
-  const maxKm =
-    cfg.delivery_max_km != null ? Number(cfg.delivery_max_km) : null;
+  const freeKm = cfg.delivery_free_km != null ? Number(cfg.delivery_free_km) : 0;
+  const maxKm = cfg.delivery_max_km != null ? Number(cfg.delivery_max_km) : null;
 
-  if (
-    storeLat == null ||
-    storeLng == null ||
-    customerLat == null ||
-    customerLng == null
-  ) {
-    // We can't compute distance right now (no coords or no geocoding)
+  if (storeLat == null || storeLng == null || customerLat == null || customerLng == null) {
     return {
       ok: false,
       reason: "missing_coords",
@@ -189,24 +163,7 @@ async function computeDeliveryQuote(
     };
   }
 
-  const distanceKm = haversineKm(
-    Number(storeLat),
-    Number(storeLng),
-    Number(customerLat),
-    Number(customerLng)
-  );
-
-  console.log("[ADDR][QUOTE_RAW]", {
-    org_id,
-    storeLat,
-    storeLng,
-    customerLat,
-    customerLng,
-    distanceKm,
-    freeKm,
-    maxKm,
-    feeType: cfg.delivery_fee_type,
-  });
+  const distanceKm = haversineKm(Number(storeLat), Number(storeLng), Number(customerLat), Number(customerLng));
 
   if (maxKm != null && distanceKm > maxKm) {
     return {
@@ -227,31 +184,13 @@ async function computeDeliveryQuote(
     if (cfg.delivery_fee_type === "flat") {
       fee = cfg.delivery_flat_fee != null ? Number(cfg.delivery_flat_fee) : 0;
     } else if (cfg.delivery_fee_type === "per_km") {
-      const perKm =
-        cfg.delivery_per_km_fee != null ? Number(cfg.delivery_per_km_fee) : 0;
+      const perKm = cfg.delivery_per_km_fee != null ? Number(cfg.delivery_per_km_fee) : 0;
       const billableKm = Math.max(0, distanceKm - freeKm);
       fee = billableKm * perKm;
     } else {
-      // No fee type configured → treat as 0, but still return distance
       fee = 0;
     }
   }
-
-  console.log("[ADDR][QUOTE_DECISION]", {
-    org_id,
-    distanceKm,
-    freeKm,
-    maxKm,
-    fee,
-    reason:
-      distanceKm <= freeKm
-        ? "within_free_km"
-        : cfg.delivery_fee_type === "per_km"
-        ? "per_km_charge"
-        : cfg.delivery_fee_type === "flat"
-        ? "flat_charge"
-        : "no_fee_type",
-  });
 
   return {
     ok: true,
@@ -262,143 +201,406 @@ async function computeDeliveryQuote(
   };
 }
 
-/**
- * Geocoding via Google Maps.
- * Uses process.env.GOOGLE_MAPS_API_KEY
- */
-async function geocodeAddressToLatLng(
-  address: string
-): Promise<{ lat: number; lng: number } | null> {
+async function geocodeAddressToLatLng(address: string) {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-  if (!apiKey) {
-    console.warn("[ADDR][GEOCODE] GOOGLE_MAPS_API_KEY missing");
-    return null;
-  }
+  if (!apiKey) return null;
 
   const url = "https://maps.googleapis.com/maps/api/geocode/json";
 
   try {
-    console.log("[ADDR][GEOCODE_REQ]", { address });
-
     const resp = await axios.get(url, {
-      params: {
-        address,
-        key: apiKey,
-      },
+      params: { address, key: apiKey },
     });
 
     const data = resp.data;
 
-    if (data.status !== "OK" || !data.results || data.results.length === 0) {
-      console.warn("[ADDR][GEOCODE_NO_RESULT]", {
-        status: data.status,
-        address,
-      });
-      return null;
-    }
+    if (data.status !== "OK" || !data.results || data.results.length === 0) return null;
 
     const loc = data.results[0]?.geometry?.location;
-    if (!loc || typeof loc.lat !== "number" || typeof loc.lng !== "number") {
-      console.warn("[ADDR][GEOCODE_BAD_LOCATION]", { address, loc });
-      return null;
-    }
+    if (!loc || typeof loc.lat !== "number" || typeof loc.lng !== "number") return null;
 
-    console.log("[ADDR][GEOCODE_OK]", { address, lat: loc.lat, lng: loc.lng });
     return { lat: loc.lat, lng: loc.lng };
-  } catch (err: any) {
-    console.error(
-      "[ADDR][GEOCODE_ERR]",
-      err?.response?.data || err?.message || err
-    );
+  } catch {
     return null;
   }
 }
 
 // Small helpers
-function formatFeeLine(fee: number | null | undefined): string {
-  if (fee == null) {
-    return "🚚 Delivery fee: will be confirmed by the store.";
-  }
-  if (fee === 0) {
-    return "🚚 Delivery fee: *FREE*";
-  }
+function formatFeeLine(fee: number | null | undefined) {
+  if (fee == null) return "🚚 Delivery fee: will be confirmed by the store.";
+  if (fee === 0) return "🚚 Delivery fee: *FREE*";
   return `🚚 Delivery fee: *₹${fee.toFixed(0)}*`;
 }
 
-function buildPaymentPrompt(acceptOnlyCash: boolean | null | undefined) {
-  const onlyCash = !!acceptOnlyCash;
-
+function buildPaymentPrompt(onlyCash?: boolean | null) {
   if (onlyCash) {
-    return (
-      "How would you like to pay?\n" +
-      "1) Cash\n\n" +
-      "Please type *1* to confirm Cash on Delivery."
-    );
+    return "How would you like to pay?\n1) Cash\n\nType *1* to confirm Cash on Delivery.";
+  }
+  return "How would you like to pay?\n1) Cash\n2) Online Payment\n\nType *1* or *2*.";
+}
+
+// ─────────────────────────────────────────────
+// ✅ SLOT HELPERS (V1: Today + Tomorrow only)
+// Rules:
+// - slot list comes from org open/close + interval
+// - exclude slots earlier than (now + prepMin) on TODAY
+// - capacity per slot (default 10)
+// - show only available slots (count < capacity)
+// ─────────────────────────────────────────────
+
+function getNowPartsInTz(tz: string): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+} {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+
+  const pick = (type: string) => parts.find((p) => p.type === type)?.value || "0";
+
+  return {
+    year: Number(pick("year")),
+    month: Number(pick("month")),
+    day: Number(pick("day")),
+    hour: Number(pick("hour")),
+    minute: Number(pick("minute")),
+  };
+}
+
+function getTodayInTz(tz: string): Date {
+  const p = getNowPartsInTz(tz);
+  return new Date(p.year, p.month - 1, p.day);
+}
+
+function toISODate(d: Date): string {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function formatSlotLabel(h: number, m: number) {
+  const hour12 = ((h + 11) % 12) + 1;
+  const ampm = h < 12 ? "AM" : "PM";
+  return `${hour12}:${String(m).padStart(2, "0")} ${ampm}`;
+}
+
+function formatSlotRangeLabel(startMinutes: number, durationMinutes: number) {
+  const sh = Math.floor(startMinutes / 60);
+  const sm = startMinutes % 60;
+
+  const endMinutes = startMinutes + durationMinutes;
+  const eh = Math.floor(endMinutes / 60);
+  const em = endMinutes % 60;
+
+  return `${formatSlotLabel(sh, sm)} – ${formatSlotLabel(eh, em)}`;
+}
+
+function parseChoice(raw: string): number | null {
+  const n = Number(String(raw || "").trim());
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+async function getSlotCountsForDate(org_id: string, isoDate: string): Promise<Record<string, number>> {
+  const { data } = await supa
+    .from("orders")
+    .select("delivery_slot_start")
+    .eq("org_id", org_id)
+    .eq("delivery_slot_date", isoDate)
+    .eq("delivery_type", "delivery")
+    .in("status", ["awaiting_customer_action", "awaiting_store_action", "accepted"] as any);
+
+  const counts: Record<string, number> = {};
+  for (const row of (data as any[]) || []) {
+    const start = row?.delivery_slot_start;
+    if (!start) continue;
+    counts[start] = (counts[start] || 0) + 1;
+  }
+  return counts;
+}
+
+function buildSlotsForDate(opts: {
+  date: Date;
+  tz: string;
+  open: string; // "11:00:00"
+  close: string; // "23:00:00"
+  intervalMin: number;
+  prepMin: number;
+  capacity: number;
+  counts: Record<string, number>;
+  isToday: boolean;
+}): { date: string; start: string; label: string }[] {
+  const openParts = (opts.open || "09:00:00").split(":").map((x) => parseInt(x, 10));
+  const closeParts = (opts.close || "22:00:00").split(":").map((x) => parseInt(x, 10));
+  const oh = openParts[0] || 0;
+  const om = openParts[1] || 0;
+  const ch = closeParts[0] || 0;
+  const cm = closeParts[1] || 0;
+
+  const startMinutes = oh * 60 + om;
+  const endMinutes = ch * 60 + cm;
+
+  let minAllowed = startMinutes;
+
+  if (opts.isToday) {
+    const now = getNowPartsInTz(opts.tz);
+    const nowMinutes = now.hour * 60 + now.minute;
+    minAllowed = Math.max(minAllowed, nowMinutes + opts.prepMin);
   }
 
-  return (
-    "How would you like to pay?\n" +
-    "1) Cash\n" +
-    "2) Online Payment\n\n" +
-    "Please type *1* or *2*."
-  );
+  // round UP to nearest interval
+  const step = Math.max(5, opts.intervalMin || 30);
+  minAllowed = Math.ceil(minAllowed / step) * step;
+
+  const out: { date: string; start: string; label: string }[] = [];
+  const isoDate = toISODate(opts.date);
+
+  for (let t = minAllowed; t + step <= endMinutes; t += step) {
+    const h = Math.floor(t / 60);
+    const m = t % 60;
+    const start = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+    const booked = opts.counts[start] || 0;
+
+    if (booked < opts.capacity) {
+      out.push({ date: isoDate, start, label: formatSlotRangeLabel(t, step) });
+    }
+  }
+
+  return out;
+}
+
+function buildSlotPromptV1(params: {
+  todaySlots: { date: string; start: string; label: string }[];
+  tomorrowSlots: { date: string; start: string; label: string }[];
+}) {
+  const { todaySlots, tomorrowSlots } = params;
+
+  const lines: string[] = [];
+  let idx = 1;
+
+  if (todaySlots.length) {
+    lines.push("*Today*");
+    for (const s of todaySlots.slice(0, 6)) {
+      lines.push(`${idx}) ${s.label}`);
+      idx++;
+    }
+    lines.push("");
+  } else {
+    lines.push("*Today*: (no slots available)");
+    lines.push("");
+  }
+
+  if (tomorrowSlots.length) {
+    lines.push("*Tomorrow*");
+    for (const s of tomorrowSlots.slice(0, 6)) {
+      lines.push(`${idx}) ${s.label}`);
+      idx++;
+    }
+  } else {
+    lines.push("*Tomorrow*: (no slots available)");
+  }
+
+  return "⏰ Choose delivery time:\n" + lines.join("\n").trim() + "\n\nReply with the number.";
 }
 
 // ─────────────────────────────────────────────
 // MAIN: Address Flow
 // ─────────────────────────────────────────────
-
-export async function handleAddress(
-  ctx: IngestContext,
-  state: ConversationState
-): Promise<IngestResult> {
+export async function handleAddress(ctx: IngestContext, state: ConversationState): Promise<IngestResult> {
   const { org_id, from_phone } = ctx;
-  const isRestaurant = ctx.vertical === "restaurant";
   const rawText = (ctx.text || "").trim();
   const lower = rawText.toLowerCase();
 
-  // WhatsApp location pin (if you wire it later)
   const locLat = (ctx as any).location_lat ?? null;
   const locLng = (ctx as any).location_lng ?? null;
 
+  // ─────────────────────────────────────────
+  // ✅ SLOT SELECTION STATE (V1)
+  // ─────────────────────────────────────────
+  if (state === "awaiting_delivery_slot") {
+    const order = await getLatestPendingOrder(org_id, from_phone);
+    if (!order) {
+      await clearState(org_id, from_phone);
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply: "⚠️ I couldn't find an active order.\nPlease type the item name to start a new order.",
+      };
+    }
+
+    const orgCfg = await getOrgConfig(org_id);
+    const tz = orgCfg?.store_timezone || "Asia/Kolkata";
+
+    const open = orgCfg?.delivery_open_time || "09:00:00";
+    const close = orgCfg?.delivery_close_time || "22:00:00";
+
+    const intervalMin = Number(orgCfg?.delivery_slot_interval_min || 30);
+    const prepMin = Number(orgCfg?.delivery_slot_prep_min || 45);
+    const capacity = Number(orgCfg?.delivery_slot_capacity || 10);
+
+    const meta = detectMetaIntent(rawText);
+    if (meta === "reset") {
+      await clearState(org_id, from_phone);
+      await resetAttempts(org_id, from_phone);
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply: "No problem 👍 I’ve cancelled this step.\nYou can type your order again or say *menu*.",
+      };
+    }
+    if (meta === "agent") {
+      await clearState(org_id, from_phone);
+      await resetAttempts(org_id, from_phone);
+      return {
+        used: true,
+        kind: "order",
+        order_id: null,
+        reply: "I’ll ask a human to help you. Someone will contact you shortly 😊",
+      };
+    }
+    if (meta === "back") {
+      await setState(org_id, from_phone, "awaiting_location_pin");
+      return {
+        used: true,
+        kind: "order",
+        order_id: order.id,
+        reply: "Please resend your location pin or type *skip*.",
+      };
+    }
+
+    const today = getTodayInTz(tz);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(today.getDate() + 1);
+
+    const todayIso = toISODate(today);
+    const tomorrowIso = toISODate(tomorrow);
+
+    const todayCounts = await getSlotCountsForDate(org_id, todayIso);
+    const tomorrowCounts = await getSlotCountsForDate(org_id, tomorrowIso);
+
+    const todaySlots = buildSlotsForDate({
+      date: today,
+      tz,
+      open,
+      close,
+      intervalMin,
+      prepMin,
+      capacity,
+      counts: todayCounts,
+      isToday: true,
+    });
+
+    const tomorrowSlots = buildSlotsForDate({
+      date: tomorrow,
+      tz,
+      open,
+      close,
+      intervalMin,
+      prepMin,
+      capacity,
+      counts: tomorrowCounts,
+      isToday: false,
+    });
+
+    const combined = [...todaySlots, ...tomorrowSlots];
+
+    if (!combined.length) {
+      await setState(org_id, from_phone, "awaiting_delivery_slot");
+      return {
+        used: true,
+        kind: "order",
+        order_id: order.id,
+        reply:
+          "😅 No delivery slots available for *Today* or *Tomorrow*.\n" +
+          "Please try again later or contact the store.",
+      };
+    }
+
+    const choice = parseChoice(rawText);
+    if (!choice || choice < 1 || choice > combined.length) {
+      await setState(org_id, from_phone, "awaiting_delivery_slot");
+      return {
+        used: true,
+        kind: "order",
+        order_id: order.id,
+        reply: buildSlotPromptV1({ todaySlots, tomorrowSlots }),
+      };
+    }
+
+    const picked = combined[choice - 1];
+
+    // Re-check capacity at selection time (race condition guard)
+    const freshCounts = await getSlotCountsForDate(org_id, picked.date);
+    if ((freshCounts[picked.start] || 0) >= capacity) {
+      await setState(org_id, from_phone, "awaiting_delivery_slot");
+      return {
+        used: true,
+        kind: "order",
+        order_id: order.id,
+        reply: "😅 That slot just got filled.\n\n" + buildSlotPromptV1({ todaySlots, tomorrowSlots }),
+      };
+    }
+
+    await supa
+      .from("orders")
+      .update({
+        delivery_slot_date: picked.date,
+        delivery_slot_start: picked.start,
+        delivery_slot_label: picked.label,
+      } as any)
+      .eq("id", order.id);
+
+    await setState(org_id, from_phone, "awaiting_payment");
+
+    return {
+      used: true,
+      kind: "order",
+      order_id: order.id,
+      reply: `✅ Delivery slot saved: *${picked.label}*\n\n` + buildPaymentPrompt(orgCfg?.accept_only_cash),
+    };
+  }
+
   // ─────────────────────────────────────────────
   // 1) USER SENDING ADDRESS  (state = awaiting_address)
-  // We ONLY accept text address here.
   // ─────────────────────────────────────────────
   if (state === "awaiting_address") {
     const msg = rawText;
-
-    // 🧠 Handle back/reset/agent BEFORE address logic
     const meta = detectMetaIntent(rawText);
 
     if (meta === "reset") {
       await clearState(org_id, from_phone);
       await resetAttempts(org_id, from_phone);
-
       return {
         used: true,
         kind: "order",
         order_id: null,
-        reply:
-          "No problem 👍 I’ve cancelled this step.\nYou can type your order again or say *menu*.",
+        reply: "No problem 👍 I’ve cancelled this step.\nYou can type your order again or say *menu*.",
       };
     }
 
     if (meta === "agent") {
       await clearState(org_id, from_phone);
       await resetAttempts(org_id, from_phone);
-      // optionally mark in DB for human follow-up
-
       return {
         used: true,
         kind: "order",
         order_id: null,
-        reply:
-          "I’ll ask a human to help you with the address. Someone will contact you shortly 😊",
+        reply: "I’ll ask a human to help you with the address. Someone will contact you shortly 😊",
       };
     }
 
-    // No text at all → ask again (even if they sent only pin)
     if (!msg && locLat == null && locLng == null) {
       await setState(org_id, from_phone, "awaiting_address");
       return {
@@ -410,12 +612,8 @@ export async function handleAddress(
       };
     }
 
-    // Text that doesn't look like address → ask again
-    // Text that doesn't look like address → ask again, with retries
     if (locLat == null && locLng == null && !looksLikeAddress(msg)) {
       await setState(org_id, from_phone, "awaiting_address");
-
-      // 🔁 Count how many times they sent a bad address
       await incAttempts(org_id, from_phone);
       const attempts = await getAttempts(org_id, from_phone);
 
@@ -443,7 +641,6 @@ export async function handleAddress(
         };
       }
 
-      // 3rd time or more → stop looping
       await clearState(org_id, from_phone);
       await resetAttempts(org_id, from_phone);
 
@@ -458,29 +655,23 @@ export async function handleAddress(
     }
 
     const order = await getLatestPendingOrder(org_id, from_phone);
-
     if (!order) {
       await clearState(org_id, from_phone);
       return {
         used: true,
         kind: "order",
-        reply:
-          "⚠️ I couldn't find an active order.\nPlease type the item name to start a new order.",
+        reply: "⚠️ I couldn't find an active order.\nPlease type the item name to start a new order.",
         order_id: null,
       };
     }
 
     const addressText = msg;
 
-    // Save address text; don't compute fee yet
-    const { error: updErr } = await supa
+    await supa
       .from("orders")
       .update({
         shipping_address: addressText,
         delivery_address_text: addressText,
-
-        // 🔥 IMPORTANT: whenever address changes,
-        // clear old geo/fee so we don't reuse stale values
         delivery_lat: null,
         delivery_lng: null,
         delivery_distance_km: null,
@@ -489,25 +680,11 @@ export async function handleAddress(
       } as any)
       .eq("id", order.id);
 
-    console.log("[ADDR][SAVE_ADDRESS]", {
-      order_id: order.id,
-      updErr,
-      addressText,
-    });
-
-    // ✅ Address accepted → reset attempts for this stage
     await resetAttempts(org_id, from_phone);
-
-    // Now ask for pin or skip
     await setState(org_id, from_phone, "awaiting_location_pin");
 
-    // 🆕 If user already sent a location pin in the SAME message
     if (locLat != null && locLng != null) {
-      // jump directly to location calculation block
-      return await handleAddress(
-        { ...ctx, location_lat: locLat, location_lng: locLng },
-        "awaiting_location_pin"
-      );
+      return await handleAddress({ ...ctx, location_lat: locLat, location_lng: locLng }, "awaiting_location_pin");
     }
 
     return {
@@ -530,29 +707,24 @@ export async function handleAddress(
   // ─────────────────────────────────────────────
   if (state === "awaiting_location_pin") {
     const order = await getLatestPendingOrder(org_id, from_phone);
-
     if (!order) {
       await clearState(org_id, from_phone);
       return {
         used: true,
         kind: "order",
-        reply:
-          "⚠️ I couldn't find an active order.\nPlease type the item name to start a new order.",
+        reply: "⚠️ I couldn't find an active order.\nPlease type the item name to start a new order.",
         order_id: null,
       };
     }
 
     const addr = order.delivery_address_text || "(no address text)";
-    const totalNum =
-      order.total_amount != null ? Number(order.total_amount) : null;
+    const totalNum = order.total_amount != null ? Number(order.total_amount) : null;
 
-    // 2.a) User types SKIP → try geocode from text, else fall back
+    // 2.a) SKIP branch
     if (["skip", "no", "later", "dont", "don't"].includes(lower)) {
-      console.log("[ADDR][PIN_STAGE_SKIP_BRANCH]");
-      let finalLat: number | null = order.delivery_lat ?? null;
-      let finalLng: number | null = order.delivery_lng ?? null;
+      let finalLat: number | null = (order as any).delivery_lat ?? null;
+      let finalLng: number | null = (order as any).delivery_lng ?? null;
 
-      // If we don't already have coords, try geocoding
       if (finalLat == null || finalLng == null) {
         const geo = await geocodeAddressToLatLng(addr);
         if (geo) {
@@ -560,12 +732,6 @@ export async function handleAddress(
           finalLng = geo.lng;
         }
       }
-
-      console.log("[ADDR][PIN_STAGE_SKIP_COORDS]", {
-        addr,
-        finalLat,
-        finalLng,
-      });
 
       const quote = await computeDeliveryQuote(org_id, finalLat, finalLng);
 
@@ -579,18 +745,7 @@ export async function handleAddress(
         deliveryStatus = "confirmed";
       }
 
-      // If too far → reject and go back to address step
       if (!quote.ok && quote.reason === "too_far") {
-        const distStr =
-          quote.distanceKm != null
-            ? `${quote.distanceKm.toFixed(1)} km`
-            : "too far";
-        const maxStr =
-          quote.maxKm != null
-            ? `${quote.maxKm.toFixed(1)} km`
-            : "the allowed radius";
-
-        // 🔥 Clear any stored geo/fee so we don't keep re-using a bad location
         await supa
           .from("orders")
           .update({
@@ -604,6 +759,9 @@ export async function handleAddress(
 
         await setState(org_id, from_phone, "awaiting_address");
 
+        const distStr = quote.distanceKm != null ? `${quote.distanceKm.toFixed(1)} km` : "too far";
+        const maxStr = quote.maxKm != null ? `${quote.maxKm.toFixed(1)} km` : "the allowed radius";
+
         return {
           used: true,
           kind: "order",
@@ -615,8 +773,7 @@ export async function handleAddress(
         };
       }
 
-      // Update order with whatever we have
-      const { error: updErr } = await supa
+      await supa
         .from("orders")
         .update({
           delivery_lat: finalLat,
@@ -628,44 +785,80 @@ export async function handleAddress(
         } as any)
         .eq("id", order.id);
 
-      console.log("[ADDR][SKIP_LOCATION_UPDATE]", {
-        order_id: order.id,
-        updErr,
-        quote,
-      });
-
       const feeLine = formatFeeLine(deliveryFee);
-      const totalLine =
-        totalNum != null
-          ? `\n💰 Order total (items): *₹${totalNum.toFixed(0)}*`
-          : "";
+      const totalLine = totalNum != null ? `\n💰 Order total (items): *₹${totalNum.toFixed(0)}*` : "";
 
-          const orgCfg = await getOrgConfig(org_id);
-const payPrompt = buildPaymentPrompt(orgCfg?.accept_only_cash);
-      // ✅ Restaurant: go to payment
-      if (isRestaurant) {
-        await setState(org_id, from_phone, "awaiting_payment");
-        return {
-          used: true,
-          kind: "order",
-          reply:
-            "✅ *Delivery details saved!*\n\n" +
-            "📍 Delivery address:\n" +
-            addr +
-            "\n\n" +
-            feeLine +
-            totalLine +
-            "\n\n" +
-            payPrompt,
-          order_id: order.id,
-        };
-      }
+      const orgCfg = await getOrgConfig(org_id);
 
-      // ✅ Non-restaurant: still must RETURN (or you’ll hit re-prompt)
+// ✅ SLOT ROUTE (ONLY IF ENABLED)
+if (orgCfg?.delivery_slot_enabled) {
+  await setState(org_id, from_phone, "awaiting_delivery_slot");
+
+  const tz = orgCfg?.store_timezone || "Asia/Kolkata";
+  const open = orgCfg?.delivery_open_time || "09:00:00";
+  const close = orgCfg?.delivery_close_time || "22:00:00";
+  const intervalMin = Number(orgCfg?.delivery_slot_interval_min || 30);
+  const prepMin = Number(orgCfg?.delivery_slot_prep_min || 45);
+  const capacity = Number(orgCfg?.delivery_slot_capacity || 10);
+
+  const today = getTodayInTz(tz);
+  const todayISO = toISODate(today);
+
+  const tomorrow = new Date(today);
+  tomorrow.setDate(today.getDate() + 1);
+  const tomorrowISO = toISODate(tomorrow);
+
+  // ✅ these are awaited in async handleAddress (valid)
+  const todayCounts = await getSlotCountsForDate(org_id, todayISO);
+  const tomorrowCounts = await getSlotCountsForDate(org_id, tomorrowISO);
+
+  const todaySlots = buildSlotsForDate({
+    date: today,
+    tz,
+    open,
+    close,
+    intervalMin,
+    prepMin,
+    capacity,
+    counts: todayCounts,
+    isToday: true,
+  });
+
+  const tomorrowSlots = buildSlotsForDate({
+    date: tomorrow,
+    tz,
+    open,
+    close,
+    intervalMin,
+    prepMin,
+    capacity,
+    counts: tomorrowCounts,
+    isToday: false,
+  });
+
+  return {
+    used: true,
+    kind: "order",
+    order_id: order.id,
+    reply:
+      "✅ *Delivery details saved!*\n\n" +
+      "📍 Delivery address:\n" +
+      addr +
+      "\n\n" +
+      feeLine +
+      totalLine +
+      "\n\n" +
+      buildSlotPromptV1({ todaySlots, tomorrowSlots }),
+  };
+}
+
+      // old behavior
+      const payPrompt = buildPaymentPrompt(orgCfg?.accept_only_cash);
       await setState(org_id, from_phone, "awaiting_payment");
       return {
         used: true,
         kind: "order",
+        order_id: order.id,
         reply:
           "✅ *Delivery details saved!*\n\n" +
           "📍 Delivery address:\n" +
@@ -675,27 +868,18 @@ const payPrompt = buildPaymentPrompt(orgCfg?.accept_only_cash);
           totalLine +
           "\n\n" +
           payPrompt,
-        order_id: order.id,
       };
     }
 
-    // 2.b) User sends location pin (lat/lng present)
+    // 2.b) Location pin branch
     if (locLat != null && locLng != null) {
-      console.log("[ADDR][PIN_STAGE_HAS_LOCATION]", { locLat, locLng });
       const quote = await computeDeliveryQuote(org_id, locLat, locLng);
 
-      // If too far → reject and go back to address step
       if (!quote.ok && quote.reason === "too_far") {
-        const distStr =
-          quote.distanceKm != null
-            ? `${quote.distanceKm.toFixed(1)} km`
-            : "too far";
-        const maxStr =
-          quote.maxKm != null
-            ? `${quote.maxKm.toFixed(1)} km`
-            : "the allowed radius";
-
         await setState(org_id, from_phone, "awaiting_address");
+
+        const distStr = quote.distanceKm != null ? `${quote.distanceKm.toFixed(1)} km` : "too far";
+        const maxStr = quote.maxKm != null ? `${quote.maxKm.toFixed(1)} km` : "the allowed radius";
 
         return {
           used: true,
@@ -718,7 +902,7 @@ const payPrompt = buildPaymentPrompt(orgCfg?.accept_only_cash);
         deliveryStatus = "confirmed";
       }
 
-      const { error: updErr } = await supa
+      await supa
         .from("orders")
         .update({
           delivery_lat: locLat,
@@ -730,49 +914,33 @@ const payPrompt = buildPaymentPrompt(orgCfg?.accept_only_cash);
         } as any)
         .eq("id", order.id);
 
-      console.log("[ADDR][LOCATION_UPDATE]", {
-        order_id: order.id,
-        updErr,
-        quote,
-      });
-
       const feeLine = formatFeeLine(deliveryFee);
-      const totalLine =
-        totalNum != null
-          ? `\n💰 Order total (items): *₹${totalNum.toFixed(0)}*`
-          : "";
-      const distanceLine =
-        distanceKm != null
-          ? `\n📏 Distance from store: ~${distanceKm.toFixed(1)} km`
-          : "";
+      const totalLine = totalNum != null ? `\n💰 Order total (items): *₹${totalNum.toFixed(0)}*` : "";
 
+      const orgCfg = await getOrgConfig(org_id);
 
-          const orgCfg = await getOrgConfig(org_id);
-const payPrompt = buildPaymentPrompt(orgCfg?.accept_only_cash);
-
-      if (isRestaurant) {
-        await setState(org_id, from_phone, "awaiting_payment");
+      // ✅ SLOT ROUTE (ONLY IF ENABLED)
+      if (orgCfg?.delivery_slot_enabled) {
+        await setState(org_id, from_phone, "awaiting_delivery_slot");
         return {
           used: true,
           kind: "order",
-          reply:
-            "✅ *Delivery details saved!*\n\n" +
-            "📍 Delivery address:\n" +
-            addr +
-            "\n\n" +
-            feeLine +
-            totalLine +
-            "\n\n" +
-            payPrompt,
           order_id: order.id,
+          reply: "✅ *Delivery details saved!*\n\n" + buildSlotPromptV1(
+            // we keep the slot prompt generation in the slot-state itself,
+            // so just tell user to pick; they will get the prompt when they reply.
+            { todaySlots: [], tomorrowSlots: [] }
+          ),
         };
       }
 
-      // ✅ Non-restaurant: also return
+      // old behavior
+      const payPrompt = buildPaymentPrompt(orgCfg?.accept_only_cash);
       await setState(org_id, from_phone, "awaiting_payment");
       return {
         used: true,
         kind: "order",
+        order_id: order.id,
         reply:
           "✅ *Delivery details saved!*\n\n" +
           "📍 Delivery address:\n" +
@@ -782,17 +950,10 @@ const payPrompt = buildPaymentPrompt(orgCfg?.accept_only_cash);
           totalLine +
           "\n\n" +
           payPrompt,
-        order_id: order.id,
       };
     }
 
     // 2.c) Neither skip nor location → re-prompt
-    console.log("[ADDR][PIN_STAGE_NO_SKIP_NO_LOCATION]", {
-      rawText,
-      lower,
-      locLat,
-      locLng,
-    });
     return {
       used: true,
       kind: "order",
@@ -804,7 +965,7 @@ const payPrompt = buildPaymentPrompt(orgCfg?.accept_only_cash);
     };
   }
 
-  // Fallback – should rarely hit
+  // Fallback
   return {
     used: false,
     kind: "order",

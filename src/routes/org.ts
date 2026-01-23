@@ -53,7 +53,7 @@ org.post("/map-wa", ensureAuth, async (req: any, res) => {
 
 // ─────────────────────────────────────────────
 // GET /api/org/settings
-// Returns payment + currency + store location settings for current org
+// Returns payment + currency + store location + delivery slot settings
 // ─────────────────────────────────────────────
 org.get("/settings", ensureAuth, async (req: any, res) => {
   try {
@@ -69,6 +69,14 @@ org.get("/settings", ensureAuth, async (req: any, res) => {
         .status(404)
         .json({ ok: false, error: "org_not_found_or_no_settings" });
     }
+
+    // helper: normalize numeric columns that might come as string
+    const numOrNull = (v: any): number | null => {
+      if (v === null || v === undefined || v === "") return null;
+      if (typeof v === "number") return Number.isFinite(v) ? v : null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
 
     return res.json({
       ok: true,
@@ -89,31 +97,38 @@ org.get("/settings", ensureAuth, async (req: any, res) => {
 
       // 📍 Store location (used by addressEngine + deliveryEngine)
       store_address: data.store_address || "",
-      store_lat:
-        typeof data.store_lat === "number" || data.store_lat === null
-          ? data.store_lat
-          : data.store_lat != null
-          ? Number(data.store_lat)
-          : null,
-      store_lng:
-        typeof data.store_lng === "number" || data.store_lng === null
-          ? data.store_lng
-          : data.store_lng != null
-          ? Number(data.store_lng)
-          : null,
+      store_lat: numOrNull(data.store_lat),
+      store_lng: numOrNull(data.store_lng),
+
+      // 🕒 Store timings / timezone (used by slot + FAQ logic)
+      delivery_open_time: data.delivery_open_time || null, // "11:00:00"
+      delivery_close_time: data.delivery_close_time || null, // "23:00:00"
+      store_timezone: data.store_timezone || "Asia/Kolkata",
+
+      // ✅ Delivery slots (enable/disable + params)
+      delivery_slot_enabled: !!data.delivery_slot_enabled,
+      delivery_slot_interval_min:
+        numOrNull(data.delivery_slot_interval_min) ?? 30,
+      delivery_slot_prep_min: numOrNull(data.delivery_slot_prep_min) ?? 45,
+      delivery_slot_capacity: numOrNull(data.delivery_slot_capacity) ?? 10,
+
+      // optional JSON config if you want to expose it
+      delivery_slots_json: data.delivery_slots_json || null,
     });
   } catch (e: any) {
     console.error("[ORG][settings GET] fatal:", e?.message || e);
     return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
+
 // ─────────────────────────────────────────────
 // POST /api/org/settings
-// Body: payment + currency + store location
+// Body: payment + currency + store location + delivery slot settings
 // ─────────────────────────────────────────────
 org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
   try {
     const {
+      // existing
       payment_enabled,
       payment_qr_url,
       payment_instructions,
@@ -122,12 +137,34 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
       store_lat,
       store_lng,
 
-      // 🆕 new fields
+      // 🆕 existing fields
       accept_only_cash,
       order_footer_message,
+
+      // 🕒 timings / timezone
+      delivery_open_time,
+      delivery_close_time,
+      store_timezone,
+
+      // ✅ delivery slots
+      delivery_slot_enabled,
+      delivery_slot_interval_min,
+      delivery_slot_prep_min,
+      delivery_slot_capacity,
+      delivery_slots_json,
     } = req.body || {};
 
     const patch: any = {};
+
+    const numOrIgnore = (v: any): number | null | undefined => {
+      // undefined => ignore (don’t touch DB)
+      // null => set null
+      if (v === undefined) return undefined;
+      if (v === null || v === "") return null;
+      const n = Number(v);
+      if (!Number.isFinite(n)) return undefined;
+      return n;
+    };
 
     // 💳 Payments
     if (typeof payment_enabled === "boolean") {
@@ -165,26 +202,44 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
     }
 
     // 📍 Store lat/lng (normalize to number | null, ignore bad values)
-    if (store_lat !== undefined) {
-      if (store_lat === null || store_lat === "") {
-        patch.store_lat = null;
-      } else {
-        const latNum = Number(store_lat);
-        if (!Number.isNaN(latNum)) {
-          patch.store_lat = latNum;
-        }
-      }
+    const latNum = numOrIgnore(store_lat);
+    if (latNum !== undefined) patch.store_lat = latNum;
+
+    const lngNum = numOrIgnore(store_lng);
+    if (lngNum !== undefined) patch.store_lng = lngNum;
+
+    // 🕒 timings / timezone
+    if (typeof delivery_open_time === "string" || delivery_open_time === null) {
+      patch.delivery_open_time = delivery_open_time;
+    }
+    if (
+      typeof delivery_close_time === "string" ||
+      delivery_close_time === null
+    ) {
+      patch.delivery_close_time = delivery_close_time;
+    }
+    if (typeof store_timezone === "string" || store_timezone === null) {
+      patch.store_timezone = store_timezone;
     }
 
-    if (store_lng !== undefined) {
-      if (store_lng === null || store_lng === "") {
-        patch.store_lng = null;
-      } else {
-        const lngNum = Number(store_lng);
-        if (!Number.isNaN(lngNum)) {
-          patch.store_lng = lngNum;
-        }
-      }
+    // ✅ slot enable/disable
+    if (typeof delivery_slot_enabled === "boolean") {
+      patch.delivery_slot_enabled = delivery_slot_enabled;
+    }
+
+    // ✅ slot params
+    const intervalNum = numOrIgnore(delivery_slot_interval_min);
+    if (intervalNum !== undefined) patch.delivery_slot_interval_min = intervalNum;
+
+    const prepNum = numOrIgnore(delivery_slot_prep_min);
+    if (prepNum !== undefined) patch.delivery_slot_prep_min = prepNum;
+
+    const capNum = numOrIgnore(delivery_slot_capacity);
+    if (capNum !== undefined) patch.delivery_slot_capacity = capNum;
+
+    // optional JSON config
+    if (typeof delivery_slots_json === "string" || delivery_slots_json === null) {
+      patch.delivery_slots_json = delivery_slots_json;
     }
 
     // Nothing to update
@@ -200,15 +255,28 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
         `
         id,
         name,
+
         payment_enabled,
         payment_qr_url,
         payment_instructions,
         accept_only_cash,
         order_footer_message,
         default_currency,
+
         store_address,
         store_lat,
-        store_lng
+        store_lng,
+
+        delivery_open_time,
+        delivery_close_time,
+        store_timezone,
+
+        delivery_slot_enabled,
+        delivery_slot_interval_min,
+        delivery_slot_prep_min,
+        delivery_slot_capacity,
+
+        delivery_slots_json
       `
       )
       .single();
@@ -217,6 +285,13 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
       console.error("[ORG][settings POST] error:", error?.message);
       return res.status(500).json({ ok: false, error: "update_failed" });
     }
+
+    const numOrNull = (v: any): number | null => {
+      if (v === null || v === undefined || v === "") return null;
+      if (typeof v === "number") return Number.isFinite(v) ? v : null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
 
     return res.json({
       ok: true,
@@ -232,18 +307,20 @@ org.post("/settings", ensureAuth, express.json(), async (req: any, res) => {
 
       default_currency: data.default_currency || "AED",
       store_address: data.store_address || "",
-      store_lat:
-        typeof data.store_lat === "number" || data.store_lat === null
-          ? data.store_lat
-          : data.store_lat != null
-          ? Number(data.store_lat)
-          : null,
-      store_lng:
-        typeof data.store_lng === "number" || data.store_lng === null
-          ? data.store_lng
-          : data.store_lng != null
-          ? Number(data.store_lng)
-          : null,
+      store_lat: numOrNull((data as any).store_lat),
+      store_lng: numOrNull((data as any).store_lng),
+
+      delivery_open_time: (data as any).delivery_open_time || null,
+      delivery_close_time: (data as any).delivery_close_time || null,
+      store_timezone: (data as any).store_timezone || "Asia/Kolkata",
+
+      delivery_slot_enabled: !!(data as any).delivery_slot_enabled,
+      delivery_slot_interval_min:
+        numOrNull((data as any).delivery_slot_interval_min) ?? 30,
+      delivery_slot_prep_min: numOrNull((data as any).delivery_slot_prep_min) ?? 45,
+      delivery_slot_capacity: numOrNull((data as any).delivery_slot_capacity) ?? 10,
+
+      delivery_slots_json: (data as any).delivery_slots_json || null,
     });
   } catch (e: any) {
     console.error("[ORG][settings POST] fatal:", e?.message || e);
